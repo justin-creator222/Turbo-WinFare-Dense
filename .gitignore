@@ -1,0 +1,32 @@
+# Build output
+build/
+bin/
+*.exe
+*.dll
+*.a
+*.lib
+*.spv
+*.pdb
+*.obj
+*.o
+
+# Model weights and bundles (Strict: NEVER commit weights)
+*.g4dense
+*.gturbo
+*.safetensors
+*.bin
+*.gguf
+*.tmp
+*.pt
+*.onnx
+
+# Python environment & cache
+.venv/
+__pycache__/
+*.pyc
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
