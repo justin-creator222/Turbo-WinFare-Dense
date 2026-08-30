@@ -9,13 +9,20 @@ namespace g4dense {
 
 enum class KVDType {
     FP16 = 0,
-    INT8 = 1
+    INT8 = 1,
+    FP32 = 2
 };
 
 struct KVCacheConfig {
     uint32_t num_layers{60};
     uint32_t num_kv_heads{16};
     uint32_t head_dim{256};
+    // Full-attention layers carry their own geometry (512 / 4 on the 31B vs 256 / 16
+    // sliding), so a slot sized from the sliding values alone is the wrong size for them.
+    // It happens to be larger on this model, which is why the mismatch was harmless; it
+    // would silently overflow on a model where the full-attention slot is bigger.
+    uint32_t global_kv_heads{4};
+    uint32_t global_head_dim{512};
     uint32_t sliding_window{1024};
     uint32_t max_context{8192};
     uint64_t global_layer_mask{0};
@@ -28,6 +35,14 @@ public:
     ~KVCacheManager();
 
     void initialize();
+
+    // Zeroes every layer's K/V (and INT8 scales) and rewinds the write position.
+    //
+    // There was no way to do this at all, and ForwardRunner::generate() never tried: a second
+    // generate() on the same runner restarted positions at 0 while the buffers still held the
+    // previous conversation's keys and values, so attention over `position + 1` slots read a
+    // mixture of both. Call this at the start of every independent generation.
+    void reset();
 
     // Ring-buffer physical slot computation
     uint32_t physical_slot(uint32_t layer_idx, uint32_t logical_pos) const;

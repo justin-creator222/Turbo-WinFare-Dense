@@ -218,6 +218,138 @@ void HTTPServer::handle_client(uintptr_t client_socket) {
         return;
     }
 
+    // ---- Endpoints the GUI calls that previously returned 404 -----------------------
+    //
+    // gui/app.js calls nine endpoints; only telemetry, switch_tier and the /v1 pair existed,
+    // so six 404'd. The visible symptom was a sidebar showing hardcoded HTML placeholders
+    // instead of the engine's resolved values, and inert Stop / model-management controls.
+
+    // GET  /api/config -- the engine's RESOLVED configuration, not the HTML defaults.
+    // POST /api/config -- apply what can change live; report what needs a reload.
+    if (req.path == "/api/config") {
+        auto r = current_runner();
+        if (req.method == "GET") {
+            std::lock_guard<std::mutex> guard(config_mutex_);
+            std::ostringstream js;
+            js << "{\"config\":{"
+               << "\"temperature\":" << config_.temperature
+               << ",\"top_p\":" << config_.top_p
+               << ",\"top_k\":" << config_.top_k
+               << ",\"max_tokens\":" << config_.max_tokens
+               << ",\"slots\":" << (r ? 4 : 0)
+               << ",\"eviction_policy\":\"LRU\""
+               << ",\"context_len\":" << config_.context_len
+               // Bounded by ATTN_MAX_SPAN: full-attention layers stage their whole score span
+               // in groupshared, so the GUI must not offer a context the kernel cannot serve.
+               << ",\"context_max\":" << ForwardRunner::kAttentionMaxSpan
+               << ",\"tier\":" << (r ? r->active_tier_id() : config_.active_tier_id)
+               << "}}";
+            send_http_response(client_socket, 200, "application/json", js.str(), false);
+            return;
+        }
+        if (req.method == "POST") {
+            try {
+                JsonValue root = JsonValue::parse(req.body);
+                bool requires_reload = false;
+                {
+                    std::lock_guard<std::mutex> guard(config_mutex_);
+                    if (root.has("temperature")) config_.temperature = static_cast<float>(root.at("temperature", "body").as_double("temperature"));
+                    if (root.has("top_p"))       config_.top_p = static_cast<float>(root.at("top_p", "body").as_double("top_p"));
+                    if (root.has("top_k"))       config_.top_k = static_cast<int>(root.at("top_k", "body").as_uint32("top_k"));
+                    if (root.has("max_tokens"))  config_.max_tokens = static_cast<int>(root.at("max_tokens", "body").as_uint32("max_tokens"));
+                    // Slots and context are fixed at initialize(); saying so is what stops the
+                    // GUI from appearing to apply a change that did nothing.
+                    if (root.has("context_len")) {
+                        int want = static_cast<int>(root.at("context_len", "body").as_uint32("context_len"));
+                        if (want != config_.context_len) requires_reload = true;
+                    }
+                    if (root.has("slots")) requires_reload = true;
+                }
+                send_http_response(client_socket, 200, "application/json",
+                                   std::string("{\"requires_reload\":") + (requires_reload ? "true" : "false") + "}", false);
+            } catch (const std::exception&) {
+                send_http_response(client_socket, 400, "application/json", "{\"error\":\"invalid config body\"}", false);
+            }
+            return;
+        }
+    }
+
+    // GET /api/models -- only containers that actually PARSE, across every search root.
+    // An existence check is not enough: a truncated or stale file would be offered and then
+    // fail at load.
+    if (req.path == "/api/models" && req.method == "GET") {
+        auto r = current_runner();
+        std::string active = r ? r->container_path() : std::string{};
+        std::error_code ec;
+        std::ostringstream js;
+        js << "{\"models\":[";
+        bool first = true;
+        for (const auto& root : bundle_search_roots()) {
+            if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) continue;
+            for (const auto& entry : fs::directory_iterator(root, ec)) {
+                if (ec) break;
+                const auto& p = entry.path();
+                if (p.extension() != ".g4dense") continue;
+                if (!bundle_loads(p.string())) continue;
+                fs::path canon_a = fs::weakly_canonical(p, ec);
+                fs::path canon_b = active.empty() ? fs::path{} : fs::weakly_canonical(fs::path(active), ec);
+                if (!first) js << ",";
+                first = false;
+                js << "{\"path\":\"";
+                for (char c : p.string()) { if (c == '\\') js << "\\\\"; else js << c; }
+                js << "\",\"name\":\"" << p.filename().string() << "\""
+                   << ",\"is_active\":" << ((!active.empty() && canon_a == canon_b) ? "true" : "false")
+                   << "}";
+            }
+        }
+        js << "]}";
+        send_http_response(client_socket, 200, "application/json", js.str(), false);
+        return;
+    }
+
+    // POST /api/load_model, /api/unload_model -- swap_runner() already validates and
+    // initializes the new container BEFORE releasing the old one, so a bad path cannot
+    // destroy a working model.
+    if ((req.path == "/api/load_model" || req.path == "/api/unload_model") && req.method == "POST") {
+        const bool load = (req.path == "/api/load_model");
+        std::string path;
+        if (load) {
+            try {
+                JsonValue root = JsonValue::parse(req.body);
+                path = root.at("path", "body").as_string("path");
+            } catch (const std::exception&) {
+                send_http_response(client_socket, 400, "application/json", "{\"error\":\"missing path\"}", false);
+                return;
+            }
+        }
+        std::string error;
+        if (swap_runner(path, load, error)) {
+            send_http_response(client_socket, 200, "application/json", "{\"status\":\"ok\"}", false);
+        } else {
+            std::ostringstream js;
+            js << "{\"error\":\"";
+            for (char c : error) { if (c == '"' || c == '\\') js << '\\'; js << c; }
+            js << "\"}";
+            send_http_response(client_socket, 503, "application/json", js.str(), false);
+        }
+        return;
+    }
+
+    // POST /api/clear_cache -- drop the layer streamer's resident slots.
+    if (req.path == "/api/clear_cache" && req.method == "POST") {
+        auto r = current_runner();
+        if (r) r->clear_layer_cache();
+        send_http_response(client_socket, 200, "application/json", "{\"status\":\"ok\"}", false);
+        return;
+    }
+
+    // POST /api/stop -- generate() polls this flag between tokens.
+    if (req.path == "/api/stop" && req.method == "POST") {
+        cancel_generation_ = true;
+        send_http_response(client_socket, 200, "application/json", "{\"status\":\"stopping\"}", false);
+        return;
+    }
+
     // Static Web GUI files
     std::string file_path = "gui" + req.path;
     if (req.path == "/" || req.path.empty()) {
@@ -299,25 +431,45 @@ void HTTPServer::handle_chat_completion(uintptr_t client, const HttpRequest& req
     gen_opts.max_tokens = chat_req.max_tokens;
     gen_opts.sampling = chat_req.sampling;
 
+    // Render the parsed conversation through the Gemma 4 turn template.
+    //
+    // This used to pass `req.body` -- the raw HTTP JSON payload -- straight in as the prompt,
+    // so the model was fed `{"model":...,"messages":[...]}` as literal text and never saw the
+    // user's question at all. Rendering here also preserves multi-turn history, which a
+    // single-string prompt cannot.
+    std::vector<Tokenizer::ChatMessage> tmpl_messages;
+    tmpl_messages.reserve(chat_req.messages.size());
+    for (const auto& [role, content] : chat_req.messages) {
+        tmpl_messages.push_back(Tokenizer::ChatMessage{role, content});
+    }
+    std::string chat_prompt = r->tokenizer()
+                                  ? r->tokenizer()->apply_chat_template(tmpl_messages)
+                                  : std::string{};
+    // generate() would otherwise wrap it a second time.
+    gen_opts.use_chat_template = false;
+
+    // A fresh generation clears any pending stop left over from the previous one.
+    cancel_generation_ = false;
+
     if (chat_req.stream) {
         send_http_headers(client, 200, "text/event-stream");
         std::string role_chunk = render_chunk(id, chat_req.model, created, "", true);
         send_raw(client, role_chunk);
 
-        r->generate(req.body, gen_opts, [&](uint32_t, const std::string& piece) {
+        r->generate(chat_prompt, gen_opts, [&](uint32_t, const std::string& piece) {
             std::string sse_chunk = render_chunk(id, chat_req.model, created, piece, false);
             return send_raw(client, sse_chunk);
-        });
+        }, &cancel_generation_);
 
         std::string finish_chunk = render_final_chunk(id, chat_req.model, created, StopReason::Eos);
         send_raw(client, finish_chunk);
         send_raw(client, "data: [DONE]\n\n");
     } else {
         std::string full_response;
-        r->generate(req.body, gen_opts, [&](uint32_t, const std::string& piece) {
+        r->generate(chat_prompt, gen_opts, [&](uint32_t, const std::string& piece) {
             full_response += piece;
             return true;
-        });
+        }, &cancel_generation_);
 
         GenerationResult res;
         res.text = full_response;

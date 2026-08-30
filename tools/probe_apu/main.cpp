@@ -106,15 +106,30 @@ struct ProbeResults {
     };
     std::vector<CoopMatrixTuple> coop_matrix_tuples;
 
-    // UMA Zero-Copy
+    // UMA Zero-Copy Checksum
     bool uma_zero_copy_passed = false;
     uint64_t uma_test_bytes = 0;
     double uma_checksum_time_ms = 0.0;
     double uma_bandwidth_gbs = 0.0;
 
-    // Storage Benchmarks
+    // GPU Heap Bandwidth & Staging Upload (R0.2)
+    double heap0_read_bandwidth_gbs = 0.0;
+    double heap1_read_bandwidth_gbs = 0.0;
+    double heap2_read_bandwidth_gbs = 0.0;
+    double staging_heap1_to_heap0_gbs = 0.0;
+    double staging_heap2_to_heap0_gbs = 0.0;
+
+    // Storage Benchmarks (R0.1)
     double storage_buffered_cold_gbs = 0.0;
     double storage_buffered_warm_gbs = 0.0;
+    double storage_warm_256mb_gbs = 0.0;
+    double storage_warm_1gb_gbs = 0.0;
+    double storage_warm_4gb_1mb_gbs = 0.0;
+    double storage_warm_4gb_4mb_gbs = 0.0;
+    double storage_warm_4gb_16mb_gbs = 0.0;
+    double storage_warm_4gb_seqscan_16mb_gbs = 0.0;
+    double storage_warm_4gb_mmap_gbs = 0.0;
+
     double storage_unbuffered_qd1_gbs = 0.0;
     double storage_unbuffered_qd4_gbs = 0.0;
     double storage_unbuffered_qd8_gbs = 0.0;
@@ -169,6 +184,8 @@ static PFN_vkCmdBindPipeline g_vkCmdBindPipeline = nullptr;
 static PFN_vkCmdBindDescriptorSets g_vkCmdBindDescriptorSets = nullptr;
 static PFN_vkCmdPushConstants g_vkCmdPushConstants = nullptr;
 static PFN_vkCmdDispatch g_vkCmdDispatch = nullptr;
+static PFN_vkCmdCopyBuffer g_vkCmdCopyBuffer = nullptr;
+static PFN_vkCmdPipelineBarrier g_vkCmdPipelineBarrier = nullptr;
 static PFN_vkQueueSubmit g_vkQueueSubmit = nullptr;
 static PFN_vkQueueWaitIdle g_vkQueueWaitIdle = nullptr;
 static PFN_vkCreateFence g_vkCreateFence = nullptr;
@@ -243,6 +260,8 @@ void load_instance_procs(VkInstance instance) {
     LOAD_PROC(vkCmdBindDescriptorSets);
     LOAD_PROC(vkCmdPushConstants);
     LOAD_PROC(vkCmdDispatch);
+    LOAD_PROC(vkCmdCopyBuffer);
+    LOAD_PROC(vkCmdPipelineBarrier);
     LOAD_PROC(vkQueueSubmit);
     LOAD_PROC(vkQueueWaitIdle);
     LOAD_PROC(vkCreateFence);
@@ -295,7 +314,6 @@ void probe_cpu_and_os(ProbeResults& r) {
     // OS Version
     OSVERSIONINFOEXA osvi{};
     osvi.dwOSVersionInfoSize = sizeof(osvi);
-    // Modern Windows: use RtlGetVersion from ntdll
     typedef LONG(WINAPI* PFN_RtlGetVersion)(PRTL_OSVERSIONINFOW);
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     if (ntdll) {
@@ -323,7 +341,6 @@ void probe_cpu_and_os(ProbeResults& r) {
     } else {
         r.cpu_brand = "AMD Ryzen Processor";
     }
-    // Trim leading/trailing whitespace
     size_t start = r.cpu_brand.find_first_not_of(" \t\r\n");
     if (start != std::string::npos) r.cpu_brand = r.cpu_brand.substr(start);
 
@@ -332,7 +349,6 @@ void probe_cpu_and_os(ProbeResults& r) {
     GetSystemInfo(&sysInfo);
     r.cpu_logical_cores = sysInfo.dwNumberOfProcessors;
 
-    // Physical core count via GetLogicalProcessorInformation
     DWORD returnLength = 0;
     GetLogicalProcessorInformation(nullptr, &returnLength);
     if (returnLength > 0) {
@@ -620,7 +636,7 @@ void probe_vulkan(ProbeResults& r) {
         }
     }
 
-    // Create Logical Device to test Wave32 and UMA compute execution
+    // Create Logical Device to test Wave32, UMA compute execution, and Heap Bandwidth
     float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueCreateInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueCreateInfo.queueFamilyIndex = 0;
@@ -670,7 +686,6 @@ void probe_vulkan(ProbeResults& r) {
         smInfo.pCode = subgroup_spv.data();
         VkShaderModule shaderModule = VK_NULL_HANDLE;
         if (g_vkCreateShaderModule(device, &smInfo, nullptr, &shaderModule) == VK_SUCCESS) {
-            // Create buffer for output
             VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             bufInfo.size = 256;
             bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -682,7 +697,6 @@ void probe_vulkan(ProbeResults& r) {
             VkMemoryRequirements memReq;
             g_vkGetBufferMemoryRequirements(device, testBuf, &memReq);
 
-            // Find host-visible memory type
             uint32_t memTypeIdx = 0;
             for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
                 if ((memReq.memoryTypeBits & (1 << i)) &&
@@ -699,7 +713,6 @@ void probe_vulkan(ProbeResults& r) {
             g_vkAllocateMemory(device, &allocInfo, nullptr, &testMem);
             g_vkBindBufferMemory(device, testBuf, testMem, 0);
 
-            // Descriptor layout & pool
             VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
             VkDescriptorSetLayoutCreateInfo dslInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
             dslInfo.bindingCount = 1;
@@ -801,184 +814,278 @@ void probe_vulkan(ProbeResults& r) {
         }
     }
 
-    // Test 2: UMA Zero-Copy Checksum Test
+    // Test 2 & 3: UMA Checksum & Multi-Heap Bandwidth / Staging Upload Probe (R0.2)
     std::vector<uint32_t> checksum_spv = load_spirv_file("build/probe_checksum.spv");
     if (!checksum_spv.empty()) {
         const size_t test_size = 245 * 1024 * 1024; // 245 MB
         const size_t num_words = test_size / sizeof(uint32_t);
         r.uma_test_bytes = test_size;
 
-        VkBufferCreateInfo inBufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        inBufInfo.size = test_size;
-        inBufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        inBufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        // Find memory type indices:
+        // heap0Type: DEVICE_LOCAL only, NOT host-visible
+        // heap1Type: HOST_VISIBLE | HOST_COHERENT (Heap 1)
+        // heap2Type: DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT (Heap 2 / ReBAR if present)
+        int heap0Type = -1;
+        int heap1Type = -1;
+        int heap2Type = -1;
 
-        VkBuffer inBuf = VK_NULL_HANDLE;
-        g_vkCreateBuffer(device, &inBufInfo, nullptr, &inBuf);
-
-        VkMemoryRequirements inMemReq;
-        g_vkGetBufferMemoryRequirements(device, inBuf, &inMemReq);
-
-        // Find best host-visible heap (prefer DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT)
-        uint32_t bestMemType = 0;
-        bool foundBest = false;
         for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-            if ((inMemReq.memoryTypeBits & (1 << i)) &&
-                (memProps.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) ==
-                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                bestMemType = i;
-                foundBest = true;
-                break;
+            const auto& t = memProps.memoryTypes[i];
+            bool is_dl = (t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+            bool is_hv = (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+            bool is_hc = (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+
+            if (is_dl && is_hv && is_hc && heap2Type == -1) {
+                heap2Type = (int)i;
+            } else if (is_hv && is_hc && !is_dl && heap1Type == -1) {
+                heap1Type = (int)i;
+            } else if (is_dl && !is_hv && heap0Type == -1) {
+                heap0Type = (int)i;
             }
         }
-        if (!foundBest) {
+
+        // Fallback for host-visible if not separated
+        if (heap1Type == -1) {
             for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-                if ((inMemReq.memoryTypeBits & (1 << i)) &&
-                    (memProps.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))) {
-                    bestMemType = i;
+                if (memProps.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                    heap1Type = (int)i;
                     break;
                 }
             }
         }
 
-        VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocInfo.allocationSize = inMemReq.size;
-        allocInfo.memoryTypeIndex = bestMemType;
-        VkDeviceMemory inMem = VK_NULL_HANDLE;
-        if (g_vkAllocateMemory(device, &allocInfo, nullptr, &inMem) == VK_SUCCESS) {
-            g_vkBindBufferMemory(device, inBuf, inMem, 0);
+        // Setup descriptor set layout and pipeline for checksum / reduction kernel
+        VkShaderModuleCreateInfo smInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smInfo.codeSize = checksum_spv.size() * 4;
+        smInfo.pCode = checksum_spv.data();
+        VkShaderModule csmModule = VK_NULL_HANDLE;
+        g_vkCreateShaderModule(device, &smInfo, nullptr, &csmModule);
 
-            // Map and populate directly on CPU
+        VkDescriptorSetLayoutBinding bindings[2]{
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
+        };
+        VkDescriptorSetLayoutCreateInfo dslInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dslInfo.bindingCount = 2;
+        dslInfo.pBindings = bindings;
+        VkDescriptorSetLayout csmDescLayout = VK_NULL_HANDLE;
+        g_vkCreateDescriptorSetLayout(device, &dslInfo, nullptr, &csmDescLayout);
+
+        VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t)};
+        VkPipelineLayoutCreateInfo plInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        plInfo.setLayoutCount = 1;
+        plInfo.pSetLayouts = &csmDescLayout;
+        plInfo.pushConstantRangeCount = 1;
+        plInfo.pPushConstantRanges = &pcRange;
+        VkPipelineLayout csmPipeLayout = VK_NULL_HANDLE;
+        g_vkCreatePipelineLayout(device, &plInfo, nullptr, &csmPipeLayout);
+
+        VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stageInfo.module = csmModule;
+        stageInfo.pName = "main";
+
+        VkComputePipelineCreateInfo cpInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpInfo.stage = stageInfo;
+        cpInfo.layout = csmPipeLayout;
+        VkPipeline csmPipeline = VK_NULL_HANDLE;
+        g_vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpInfo, nullptr, &csmPipeline);
+
+        VkCommandPoolCreateInfo cmdPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        cmdPoolInfo.queueFamilyIndex = 0;
+        VkCommandPool cmdPool = VK_NULL_HANDLE;
+        g_vkCreateCommandPool(device, &cmdPoolInfo, nullptr, &cmdPool);
+
+        VkDescriptorPoolSize poolSizes[1]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8}};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 4;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = poolSizes;
+        VkDescriptorPool descPool = VK_NULL_HANDLE;
+        g_vkCreateDescriptorPool(device, &poolInfo, nullptr, &descPool);
+
+        // Allocate outBuf (256 B) in host-visible heap
+        VkBuffer outBuf = VK_NULL_HANDLE;
+        VkBufferCreateInfo outBufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        g_vkCreateBuffer(device, &outBufInfo, nullptr, &outBuf);
+        VkMemoryRequirements outMemReq;
+        g_vkGetBufferMemoryRequirements(device, outBuf, &outMemReq);
+        VkMemoryAllocateInfo outAlloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, outMemReq.size, (uint32_t)(heap1Type >= 0 ? heap1Type : 0)};
+        VkDeviceMemory outMem = VK_NULL_HANDLE;
+        g_vkAllocateMemory(device, &outAlloc, nullptr, &outMem);
+        g_vkBindBufferMemory(device, outBuf, outMem, 0);
+
+        uint32_t cpu_expected_sum = 0;
+
+        // A. Allocate Heap 1 Buffer (Host-Visible)
+        VkBuffer heap1Buf = VK_NULL_HANDLE;
+        VkDeviceMemory heap1Mem = VK_NULL_HANDLE;
+        if (heap1Type >= 0) {
+            VkBufferCreateInfo bInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, test_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
+            g_vkCreateBuffer(device, &bInfo, nullptr, &heap1Buf);
+            VkMemoryRequirements req;
+            g_vkGetBufferMemoryRequirements(device, heap1Buf, &req);
+            VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, (uint32_t)heap1Type};
+            g_vkAllocateMemory(device, &alloc, nullptr, &heap1Mem);
+            g_vkBindBufferMemory(device, heap1Buf, heap1Mem, 0);
+
+            // Populate on CPU
             uint32_t* host_ptr = nullptr;
-            g_vkMapMemory(device, inMem, 0, test_size, 0, (void**)&host_ptr);
-
-            uint32_t cpu_expected_sum = 0;
+            g_vkMapMemory(device, heap1Mem, 0, test_size, 0, (void**)&host_ptr);
             if (host_ptr) {
                 for (size_t i = 0; i < num_words; ++i) {
                     uint32_t val = (uint32_t)(i * 2654435761u + 1337);
                     host_ptr[i] = val;
                     cpu_expected_sum += val;
                 }
-                // NOTE: Intentionally do NOT call vkFlushMappedMemoryRanges to assert HOST_COHERENT UMA
+                g_vkUnmapMemory(device, heap1Mem);
             }
+        }
 
-            // Output buffer for checksum (1 uint)
-            VkBufferCreateInfo outBufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            outBufInfo.size = 256;
-            outBufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-            VkBuffer outBuf = VK_NULL_HANDLE;
-            g_vkCreateBuffer(device, &outBufInfo, nullptr, &outBuf);
+        // B. Allocate Heap 0 Buffer (Device-Local only, 13.10 GiB pool)
+        VkBuffer heap0Buf = VK_NULL_HANDLE;
+        VkDeviceMemory heap0Mem = VK_NULL_HANDLE;
+        if (heap0Type >= 0) {
+            VkBufferCreateInfo bInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, test_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+            g_vkCreateBuffer(device, &bInfo, nullptr, &heap0Buf);
+            VkMemoryRequirements req;
+            g_vkGetBufferMemoryRequirements(device, heap0Buf, &req);
+            VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, req.size, (uint32_t)heap0Type};
+            g_vkAllocateMemory(device, &alloc, nullptr, &heap0Mem);
+            g_vkBindBufferMemory(device, heap0Buf, heap0Mem, 0);
+        }
 
-            VkMemoryRequirements outMemReq;
-            g_vkGetBufferMemoryRequirements(device, outBuf, &outMemReq);
-            VkMemoryAllocateInfo outAllocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            outAllocInfo.allocationSize = outMemReq.size;
-            outAllocInfo.memoryTypeIndex = bestMemType;
-            VkDeviceMemory outMem = VK_NULL_HANDLE;
-            g_vkAllocateMemory(device, &outAllocInfo, nullptr, &outMem);
-            g_vkBindBufferMemory(device, outBuf, outMem, 0);
+        // Benchmark Staging Upload (Heap 1 -> Heap 0)
+        if (heap1Buf && heap0Buf && g_vkCmdCopyBuffer) {
+            VkCommandBuffer copyCmd = VK_NULL_HANDLE;
+            VkCommandBufferAllocateInfo cbAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, cmdPool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+            g_vkAllocateCommandBuffers(device, &cbAlloc, &copyCmd);
 
-            uint32_t* out_mapped = nullptr;
-            g_vkMapMemory(device, outMem, 0, 256, 0, (void**)&out_mapped);
-            if (out_mapped) out_mapped[0] = 0;
+            VkCommandBufferBeginInfo bBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            g_vkBeginCommandBuffer(copyCmd, &bBegin);
+            VkBufferCopy region{0, 0, test_size};
+            g_vkCmdCopyBuffer(copyCmd, heap1Buf, heap0Buf, 1, &region);
+            g_vkEndCommandBuffer(copyCmd);
 
-            // Pipeline setup for checksum
-            VkShaderModuleCreateInfo smInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            smInfo.codeSize = checksum_spv.size() * 4;
-            smInfo.pCode = checksum_spv.data();
-            VkShaderModule csmModule = VK_NULL_HANDLE;
-            g_vkCreateShaderModule(device, &smInfo, nullptr, &csmModule);
+            // Warmup copy
+            VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &copyCmd, 0, nullptr};
+            g_vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE);
+            g_vkQueueWaitIdle(queue);
 
-            VkDescriptorSetLayoutBinding bindings[2]{
-                {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-                {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}
-            };
-            VkDescriptorSetLayoutCreateInfo dslInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-            dslInfo.bindingCount = 2;
-            dslInfo.pBindings = bindings;
-            VkDescriptorSetLayout csmDescLayout = VK_NULL_HANDLE;
-            g_vkCreateDescriptorSetLayout(device, &dslInfo, nullptr, &csmDescLayout);
+            // Measure 20 iterations
+            const int iters = 20;
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iters; ++i) {
+                g_vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE);
+            }
+            g_vkQueueWaitIdle(queue);
+            auto t1 = std::chrono::high_resolution_clock::now();
 
-            VkPushConstantRange pcRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t)};
-            VkPipelineLayoutCreateInfo plInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-            plInfo.setLayoutCount = 1;
-            plInfo.pSetLayouts = &csmDescLayout;
-            plInfo.pushConstantRangeCount = 1;
-            plInfo.pPushConstantRanges = &pcRange;
-            VkPipelineLayout csmPipeLayout = VK_NULL_HANDLE;
-            g_vkCreatePipelineLayout(device, &plInfo, nullptr, &csmPipeLayout);
+            double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
+            double total_gb = (double)(test_size * iters) / (1024.0 * 1024.0 * 1024.0);
+            r.staging_heap1_to_heap0_gbs = total_gb / elapsed_sec;
+        }
 
-            VkPipelineShaderStageCreateInfo stageInfo{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-            stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-            stageInfo.module = csmModule;
-            stageInfo.pName = "main";
+        // Benchmark GPU Compute Read from Heap 0
+        if (heap0Buf) {
+            VkDescriptorSet ds0 = VK_NULL_HANDLE;
+            VkDescriptorSetAllocateInfo dsAlloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, descPool, 1, &csmDescLayout};
+            g_vkAllocateDescriptorSets(device, &dsAlloc, &ds0);
 
-            VkComputePipelineCreateInfo cpInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-            cpInfo.stage = stageInfo;
-            cpInfo.layout = csmPipeLayout;
-            VkPipeline csmPipeline = VK_NULL_HANDLE;
-            g_vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpInfo, nullptr, &csmPipeline);
-
-            VkDescriptorPoolSize poolSizes[1]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
-            VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-            poolInfo.maxSets = 1;
-            poolInfo.poolSizeCount = 1;
-            poolInfo.pPoolSizes = poolSizes;
-            VkDescriptorPool csmDescPool = VK_NULL_HANDLE;
-            g_vkCreateDescriptorPool(device, &poolInfo, nullptr, &csmDescPool);
-
-            VkDescriptorSetAllocateInfo dsAllocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-            dsAllocInfo.descriptorPool = csmDescPool;
-            dsAllocInfo.descriptorSetCount = 1;
-            dsAllocInfo.pSetLayouts = &csmDescLayout;
-            VkDescriptorSet csmDescSet = VK_NULL_HANDLE;
-            g_vkAllocateDescriptorSets(device, &dsAllocInfo, &csmDescSet);
-
-            VkDescriptorBufferInfo dbiIn{inBuf, 0, test_size};
+            VkDescriptorBufferInfo dbiIn{heap0Buf, 0, test_size};
             VkDescriptorBufferInfo dbiOut{outBuf, 0, 256};
             VkWriteDescriptorSet writes[2]{};
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[0].dstSet = csmDescSet;
+            writes[0].dstSet = ds0;
             writes[0].dstBinding = 0;
             writes[0].descriptorCount = 1;
             writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[0].pBufferInfo = &dbiIn;
 
             writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[1].dstSet = csmDescSet;
+            writes[1].dstSet = ds0;
             writes[1].dstBinding = 1;
             writes[1].descriptorCount = 1;
             writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[1].pBufferInfo = &dbiOut;
             g_vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 
-            VkCommandPoolCreateInfo cmdPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-            cmdPoolInfo.queueFamilyIndex = 0;
-            VkCommandPool csmCmdPool = VK_NULL_HANDLE;
-            g_vkCreateCommandPool(device, &cmdPoolInfo, nullptr, &csmCmdPool);
-
-            VkCommandBufferAllocateInfo cbAllocInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            cbAllocInfo.commandPool = csmCmdPool;
-            cbAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cbAllocInfo.commandBufferCount = 1;
-            VkCommandBuffer csmCmdBuf = VK_NULL_HANDLE;
-            g_vkAllocateCommandBuffers(device, &cbAllocInfo, &csmCmdBuf);
+            VkCommandBuffer compCmd = VK_NULL_HANDLE;
+            VkCommandBufferAllocateInfo cbAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, cmdPool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+            g_vkAllocateCommandBuffers(device, &cbAlloc, &compCmd);
 
             uint32_t push_words = (uint32_t)num_words;
-            VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            g_vkBeginCommandBuffer(csmCmdBuf, &beginInfo);
-            g_vkCmdBindPipeline(csmCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, csmPipeline);
-            g_vkCmdBindDescriptorSets(csmCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, csmPipeLayout, 0, 1, &csmDescSet, 0, nullptr);
-            g_vkCmdPushConstants(csmCmdBuf, csmPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &push_words);
-            g_vkCmdDispatch(csmCmdBuf, 256, 1, 1);
-            g_vkEndCommandBuffer(csmCmdBuf);
+            VkCommandBufferBeginInfo bBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            g_vkBeginCommandBuffer(compCmd, &bBegin);
+            g_vkCmdBindPipeline(compCmd, VK_PIPELINE_BIND_POINT_COMPUTE, csmPipeline);
+            g_vkCmdBindDescriptorSets(compCmd, VK_PIPELINE_BIND_POINT_COMPUTE, csmPipeLayout, 0, 1, &ds0, 0, nullptr);
+            g_vkCmdPushConstants(compCmd, csmPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &push_words);
+            g_vkCmdDispatch(compCmd, 256, 1, 1);
+            g_vkEndCommandBuffer(compCmd);
 
-            // Execute and measure
+            // Warmup
+            VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &compCmd, 0, nullptr};
+            g_vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE);
+            g_vkQueueWaitIdle(queue);
+
+            const int iters = 20;
             auto t0 = std::chrono::high_resolution_clock::now();
-            VkSubmitInfo submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &csmCmdBuf;
-            g_vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+            for (int i = 0; i < iters; ++i) {
+                g_vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE);
+            }
+            g_vkQueueWaitIdle(queue);
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
+            double total_gb = (double)(test_size * iters) / (1024.0 * 1024.0 * 1024.0);
+            r.heap0_read_bandwidth_gbs = total_gb / elapsed_sec;
+        }
+
+        // Benchmark GPU Compute Read from Heap 1 (Host-Visible) & Verify Checksum
+        if (heap1Buf) {
+            VkDescriptorSet ds1 = VK_NULL_HANDLE;
+            VkDescriptorSetAllocateInfo dsAlloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, descPool, 1, &csmDescLayout};
+            g_vkAllocateDescriptorSets(device, &dsAlloc, &ds1);
+
+            VkDescriptorBufferInfo dbiIn{heap1Buf, 0, test_size};
+            VkDescriptorBufferInfo dbiOut{outBuf, 0, 256};
+            VkWriteDescriptorSet writes[2]{};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet = ds1;
+            writes[0].dstBinding = 0;
+            writes[0].descriptorCount = 1;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[0].pBufferInfo = &dbiIn;
+
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet = ds1;
+            writes[1].dstBinding = 1;
+            writes[1].descriptorCount = 1;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[1].pBufferInfo = &dbiOut;
+            g_vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+            VkCommandBuffer compCmd = VK_NULL_HANDLE;
+            VkCommandBufferAllocateInfo cbAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, cmdPool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+            g_vkAllocateCommandBuffers(device, &cbAlloc, &compCmd);
+
+            uint32_t push_words = (uint32_t)num_words;
+            VkCommandBufferBeginInfo bBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            g_vkBeginCommandBuffer(compCmd, &bBegin);
+            g_vkCmdBindPipeline(compCmd, VK_PIPELINE_BIND_POINT_COMPUTE, csmPipeline);
+            g_vkCmdBindDescriptorSets(compCmd, VK_PIPELINE_BIND_POINT_COMPUTE, csmPipeLayout, 0, 1, &ds1, 0, nullptr);
+            g_vkCmdPushConstants(compCmd, csmPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t), &push_words);
+            g_vkCmdDispatch(compCmd, 256, 1, 1);
+            g_vkEndCommandBuffer(compCmd);
+
+            // Single iteration timing for UMA zero-copy reporting
+            uint32_t* out_mapped = nullptr;
+            g_vkMapMemory(device, outMem, 0, 256, 0, (void**)&out_mapped);
+            if (out_mapped) out_mapped[0] = 0;
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &compCmd, 0, nullptr};
+            g_vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE);
             g_vkQueueWaitIdle(queue);
             auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -990,106 +1097,181 @@ void probe_vulkan(ProbeResults& r) {
             } else {
                 std::cerr << "[uma] Checksum mismatch! CPU=" << cpu_expected_sum << " GPU=" << (out_mapped ? out_mapped[0] : 0) << std::endl;
             }
-
             if (out_mapped) g_vkUnmapMemory(device, outMem);
-            if (host_ptr) g_vkUnmapMemory(device, inMem);
 
-            g_vkDestroyCommandPool(device, csmCmdPool, nullptr);
-            g_vkDestroyDescriptorPool(device, csmDescPool, nullptr);
-            g_vkDestroyPipeline(device, csmPipeline, nullptr);
-            g_vkDestroyPipelineLayout(device, csmPipeLayout, nullptr);
-            g_vkDestroyDescriptorSetLayout(device, csmDescLayout, nullptr);
-            g_vkDestroyShaderModule(device, csmModule, nullptr);
-            g_vkDestroyBuffer(device, outBuf, nullptr);
-            g_vkFreeMemory(device, outMem, nullptr);
-            g_vkDestroyBuffer(device, inBuf, nullptr);
-            g_vkFreeMemory(device, inMem, nullptr);
+            // Measure 20 iterations for sustained read bandwidth
+            const int iters = 20;
+            t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < iters; ++i) {
+                g_vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE);
+            }
+            g_vkQueueWaitIdle(queue);
+            t1 = std::chrono::high_resolution_clock::now();
+
+            double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
+            double total_gb = (double)(test_size * iters) / (1024.0 * 1024.0 * 1024.0);
+            r.heap1_read_bandwidth_gbs = total_gb / elapsed_sec;
         }
+
+        // Cleanup
+        g_vkDestroyCommandPool(device, cmdPool, nullptr);
+        g_vkDestroyDescriptorPool(device, descPool, nullptr);
+        g_vkDestroyPipeline(device, csmPipeline, nullptr);
+        g_vkDestroyPipelineLayout(device, csmPipeLayout, nullptr);
+        g_vkDestroyDescriptorSetLayout(device, csmDescLayout, nullptr);
+        g_vkDestroyShaderModule(device, csmModule, nullptr);
+        g_vkDestroyBuffer(device, outBuf, nullptr);
+        g_vkFreeMemory(device, outMem, nullptr);
+        if (heap0Buf) g_vkDestroyBuffer(device, heap0Buf, nullptr);
+        if (heap0Mem) g_vkFreeMemory(device, heap0Mem, nullptr);
+        if (heap1Buf) g_vkDestroyBuffer(device, heap1Buf, nullptr);
+        if (heap1Mem) g_vkFreeMemory(device, heap1Mem, nullptr);
     }
 
     g_vkDestroyDevice(device, nullptr);
     g_vkDestroyInstance(instance, nullptr);
 }
 
-void probe_storage_benchmarks(ProbeResults& r) {
-    const std::string test_file_path = "build/io_test_4gb.tmp";
-    const uint64_t file_size = 4ULL * 1024ULL * 1024ULL * 1024ULL; // 4 GB
-    const DWORD block_size = 1024 * 1024; // 1 MB per chunk
-
-    std::cout << "[storage] preparing 4 GB test file for sustained NVMe I/O benchmarks..." << std::endl;
-    // Check if test file already exists with exact size
-    bool file_ready = false;
-    HANDLE hCheck = CreateFileA(test_file_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+// Helpers for Storage Benchmarks
+void ensure_test_file(const std::string& path, uint64_t size_bytes) {
+    HANDLE hCheck = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hCheck != INVALID_HANDLE_VALUE) {
         LARGE_INTEGER curSize;
-        if (GetFileSizeEx(hCheck, &curSize) && (uint64_t)curSize.QuadPart == file_size) {
-            file_ready = true;
+        if (GetFileSizeEx(hCheck, &curSize) && (uint64_t)curSize.QuadPart == size_bytes) {
+            CloseHandle(hCheck);
+            return;
         }
         CloseHandle(hCheck);
     }
 
-    if (!file_ready) {
-        HANDLE hWrite = CreateFileA(test_file_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hWrite == INVALID_HANDLE_VALUE) {
-            std::cerr << "[storage] Failed to create test file " << test_file_path << std::endl;
-            return;
-        }
-        // Write fast using 4MB chunks
-        const DWORD write_chunk = 4 * 1024 * 1024;
-        std::vector<BYTE> write_buf(write_chunk, 0xA5);
-        DWORD written = 0;
-        uint64_t total_written = 0;
-        while (total_written < file_size) {
-            DWORD to_write = (DWORD)std::min((uint64_t)write_chunk, file_size - total_written);
-            if (!WriteFile(hWrite, write_buf.data(), to_write, &written, nullptr) || written == 0) break;
-            total_written += written;
-        }
-        CloseHandle(hWrite);
-    }
+    HANDLE hWrite = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hWrite == INVALID_HANDLE_VALUE) return;
 
-    // 1. Buffered Read Benchmark (Cold & Warm)
+    const DWORD write_chunk = 4 * 1024 * 1024;
+    std::vector<BYTE> write_buf(write_chunk, 0xA5);
+    DWORD written = 0;
+    uint64_t total_written = 0;
+    while (total_written < size_bytes) {
+        DWORD to_write = (DWORD)std::min((uint64_t)write_chunk, size_bytes - total_written);
+        if (!WriteFile(hWrite, write_buf.data(), to_write, &written, nullptr) || written == 0) break;
+        total_written += written;
+    }
+    CloseHandle(hWrite);
+}
+
+double measure_warm_readfile(const std::string& path, uint64_t size_bytes, DWORD chunk_size, bool seq_scan) {
+    DWORD flags = FILE_ATTRIBUTE_NORMAL;
+    if (seq_scan) flags |= FILE_FLAG_SEQUENTIAL_SCAN;
+
+    // Warm-up pass
     {
-        // Cold read
-        HANDLE hFile = CreateFileA(test_file_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
         if (hFile != INVALID_HANDLE_VALUE) {
-            std::vector<BYTE> buf(block_size);
+            std::vector<BYTE> buf(chunk_size);
             DWORD read_bytes = 0;
             uint64_t total_read = 0;
-            auto t0 = std::chrono::high_resolution_clock::now();
-            while (total_read < file_size) {
-                if (!ReadFile(hFile, buf.data(), block_size, &read_bytes, nullptr) || read_bytes == 0) break;
+            while (total_read < size_bytes) {
+                if (!ReadFile(hFile, buf.data(), chunk_size, &read_bytes, nullptr) || read_bytes == 0) break;
                 total_read += read_bytes;
             }
-            auto t1 = std::chrono::high_resolution_clock::now();
             CloseHandle(hFile);
-
-            double sec = std::chrono::duration<double>(t1 - t0).count();
-            r.storage_buffered_cold_gbs = ((double)total_read / (1024.0 * 1024.0 * 1024.0)) / sec;
-        }
-
-        // Warm read (in OS page cache)
-        hFile = CreateFileA(test_file_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            std::vector<BYTE> buf(block_size);
-            DWORD read_bytes = 0;
-            uint64_t total_read = 0;
-            auto t0 = std::chrono::high_resolution_clock::now();
-            while (total_read < file_size) {
-                if (!ReadFile(hFile, buf.data(), block_size, &read_bytes, nullptr) || read_bytes == 0) break;
-                total_read += read_bytes;
-            }
-            auto t1 = std::chrono::high_resolution_clock::now();
-            CloseHandle(hFile);
-
-            double sec = std::chrono::duration<double>(t1 - t0).count();
-            r.storage_buffered_warm_gbs = ((double)total_read / (1024.0 * 1024.0 * 1024.0)) / sec;
         }
     }
 
-    // 2. Unbuffered Asynchronous Overlapped Read Benchmark (QD = 1, 4, 8, 16)
+    // Timed pass
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return 0.0;
+
+    std::vector<BYTE> buf(chunk_size);
+    DWORD read_bytes = 0;
+    uint64_t total_read = 0;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    while (total_read < size_bytes) {
+        if (!ReadFile(hFile, buf.data(), chunk_size, &read_bytes, nullptr) || read_bytes == 0) break;
+        total_read += read_bytes;
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    CloseHandle(hFile);
+
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+    return ((double)total_read / (1024.0 * 1024.0 * 1024.0)) / sec;
+}
+
+double measure_warm_mmap(const std::string& path, uint64_t size_bytes) {
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return 0.0;
+
+    HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!hMap) {
+        CloseHandle(hFile);
+        return 0.0;
+    }
+
+    const BYTE* ptr = (const BYTE*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, size_bytes);
+    if (!ptr) {
+        CloseHandle(hMap);
+        CloseHandle(hFile);
+        return 0.0;
+    }
+
+    // Warm-up pass (touch all pages)
+    volatile uint64_t dummy = 0;
+    const uint64_t* u64_ptr = (const uint64_t*)ptr;
+    const size_t u64_count = size_bytes / sizeof(uint64_t);
+    for (size_t i = 0; i < u64_count; i += 512) { // step by 4KB page
+        dummy += u64_ptr[i];
+    }
+
+    // Timed sequential read pass
+    auto t0 = std::chrono::high_resolution_clock::now();
+    uint64_t sum = 0;
+    for (size_t i = 0; i < u64_count; ++i) {
+        sum += u64_ptr[i];
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    UnmapViewOfFile(ptr);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+
+    if (sum == 0) dummy = sum; // prevent compiler elision
+
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+    return ((double)size_bytes / (1024.0 * 1024.0 * 1024.0)) / sec;
+}
+
+void probe_storage_benchmarks(ProbeResults& r) {
+    const std::string test_file_256mb = "build/io_test_256mb.tmp";
+    const std::string test_file_1gb   = "build/io_test_1gb.tmp";
+    const std::string test_file_4gb   = "build/io_test_4gb.tmp";
+
+    const uint64_t size_256mb = 256ULL * 1024ULL * 1024ULL;
+    const uint64_t size_1gb   = 1024ULL * 1024ULL * 1024ULL;
+    const uint64_t size_4gb   = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+
+    std::cout << "[storage] preparing test files (256 MB, 1 GB, 4 GB)..." << std::endl;
+    ensure_test_file(test_file_256mb, size_256mb);
+    ensure_test_file(test_file_1gb, size_1gb);
+    ensure_test_file(test_file_4gb, size_4gb);
+
+    // 1. Warm-Cache Multi-Size and Chunk Benchmarks (R0.1)
+    std::cout << "[storage] benchmarking warm OS page cache reads across file sizes & chunk configurations..." << std::endl;
+    r.storage_warm_256mb_gbs = measure_warm_readfile(test_file_256mb, size_256mb, 16 * 1024 * 1024, true);
+    r.storage_warm_1gb_gbs   = measure_warm_readfile(test_file_1gb, size_1gb, 16 * 1024 * 1024, true);
+
+    r.storage_warm_4gb_1mb_gbs           = measure_warm_readfile(test_file_4gb, size_4gb, 1 * 1024 * 1024, false);
+    r.storage_warm_4gb_4mb_gbs           = measure_warm_readfile(test_file_4gb, size_4gb, 4 * 1024 * 1024, false);
+    r.storage_warm_4gb_16mb_gbs          = measure_warm_readfile(test_file_4gb, size_4gb, 16 * 1024 * 1024, false);
+    r.storage_warm_4gb_seqscan_16mb_gbs  = measure_warm_readfile(test_file_4gb, size_4gb, 16 * 1024 * 1024, true);
+    r.storage_warm_4gb_mmap_gbs          = measure_warm_mmap(test_file_4gb, size_4gb);
+
+    r.storage_buffered_warm_gbs = r.storage_warm_4gb_seqscan_16mb_gbs;
+    r.storage_buffered_cold_gbs = r.storage_warm_4gb_1mb_gbs; // Note legacy field
+
+    // 2. Unbuffered Asynchronous Overlapped Read Benchmark (Cold NVMe Hardware Throughput)
     auto bench_unbuffered = [&](int qd, size_t alignment, double& result_gbs) {
         HANDLE hFile = CreateFileA(
-            test_file_path.c_str(),
+            test_file_4gb.c_str(),
             GENERIC_READ,
             FILE_SHARE_READ,
             nullptr,
@@ -1102,8 +1284,8 @@ void probe_storage_benchmarks(ProbeResults& r) {
             return;
         }
 
-        const DWORD io_chunk_size = 1024 * 1024; // 1 MB unbuffered chunk (aligned to 4KB/16KB)
-        const size_t total_chunks = file_size / io_chunk_size;
+        const DWORD io_chunk_size = 1024 * 1024; // 1 MB unbuffered chunk
+        const size_t total_chunks = size_4gb / io_chunk_size;
 
         struct Slot {
             OVERLAPPED ov{};
@@ -1115,7 +1297,6 @@ void probe_storage_benchmarks(ProbeResults& r) {
         for (int i = 0; i < qd; ++i) {
             slots[i].event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
             slots[i].ov.hEvent = slots[i].event;
-            // Allocate aligned buffer
             slots[i].buf = (BYTE*)_aligned_malloc(io_chunk_size, alignment);
         }
 
@@ -1133,10 +1314,7 @@ void probe_storage_benchmarks(ProbeResults& r) {
             ResetEvent(slots[i].event);
 
             DWORD read = 0;
-            BOOL ok = ReadFile(hFile, slots[i].buf, io_chunk_size, &read, &slots[i].ov);
-            if (!ok && GetLastError() != ERROR_IO_PENDING) {
-                // error
-            }
+            ReadFile(hFile, slots[i].buf, io_chunk_size, &read, &slots[i].ov);
             next_chunk++;
             in_flight++;
         }
@@ -1271,6 +1449,11 @@ void write_json_and_markdown(const ProbeResults& r, const std::string& json_path
         jf << "      \"host_visible_bytes\": " << r.heap_host_visible_bytes << ",\n";
         jf << "      \"device_local_only_bytes\": " << r.heap_device_local_only_bytes << "\n";
         jf << "    },\n";
+        jf << "    \"heap_bandwidth\": {\n";
+        jf << "      \"gpu_read_heap0_gbs\": " << r.heap0_read_bandwidth_gbs << ",\n";
+        jf << "      \"gpu_read_heap1_gbs\": " << r.heap1_read_bandwidth_gbs << ",\n";
+        jf << "      \"staging_upload_heap1_to_heap0_gbs\": " << r.staging_heap1_to_heap0_gbs << "\n";
+        jf << "    },\n";
         jf << "    \"cooperative_matrix\": {\n";
         jf << "      \"supported\": " << (r.coop_matrix_supported ? "true" : "false") << ",\n";
         jf << "      \"tuples_count\": " << r.coop_matrix_tuples.size() << ",\n";
@@ -1293,6 +1476,13 @@ void write_json_and_markdown(const ProbeResults& r, const std::string& json_path
         jf << "  \"storage\": {\n";
         jf << "    \"buffered_cold_gbs\": " << r.storage_buffered_cold_gbs << ",\n";
         jf << "    \"buffered_warm_gbs\": " << r.storage_buffered_warm_gbs << ",\n";
+        jf << "    \"warm_256mb_gbs\": " << r.storage_warm_256mb_gbs << ",\n";
+        jf << "    \"warm_1gb_gbs\": " << r.storage_warm_1gb_gbs << ",\n";
+        jf << "    \"warm_4gb_1mb_chunk_gbs\": " << r.storage_warm_4gb_1mb_gbs << ",\n";
+        jf << "    \"warm_4gb_4mb_chunk_gbs\": " << r.storage_warm_4gb_4mb_gbs << ",\n";
+        jf << "    \"warm_4gb_16mb_chunk_gbs\": " << r.storage_warm_4gb_16mb_gbs << ",\n";
+        jf << "    \"warm_4gb_seqscan_16mb_gbs\": " << r.storage_warm_4gb_seqscan_16mb_gbs << ",\n";
+        jf << "    \"warm_4gb_mmap_gbs\": " << r.storage_warm_4gb_mmap_gbs << ",\n";
         jf << "    \"unbuffered_qd1_gbs\": " << r.storage_unbuffered_qd1_gbs << ",\n";
         jf << "    \"unbuffered_qd4_gbs\": " << r.storage_unbuffered_qd4_gbs << ",\n";
         jf << "    \"unbuffered_qd8_gbs\": " << r.storage_unbuffered_qd8_gbs << ",\n";
@@ -1335,11 +1525,19 @@ void write_json_and_markdown(const ProbeResults& r, const std::string& json_path
                << std::fixed << std::setprecision(1) << (double)h.budget_bytes / (1024.0 * 1024.0) << " MB |\n";
         }
         mf << "\n";
-        mf << "- **`HOST_VISIBLE | HOST_COHERENT | DEVICE_LOCAL` Heap:** " << std::fixed << std::setprecision(2) << ((double)r.heap_host_visible_device_local_bytes / (1024.0 * 1024.0 * 1024.0)) << " GB\n";
-        mf << "- **General `HOST_VISIBLE` Heap (RAM):** " << std::fixed << std::setprecision(2) << ((double)r.heap_host_visible_bytes / (1024.0 * 1024.0 * 1024.0)) << " GB\n";
+        mf << "- **`DEVICE_LOCAL` Heap 0 (VRAM pool):** " << std::fixed << std::setprecision(2) << ((double)r.heap_device_local_only_bytes / (1024.0 * 1024.0 * 1024.0)) << " GiB\n";
+        mf << "- **`HOST_VISIBLE` Heap 1 (System RAM pool):** " << std::fixed << std::setprecision(2) << ((double)r.heap_host_visible_bytes / (1024.0 * 1024.0 * 1024.0)) << " GiB\n";
+        mf << "- **`HOST_VISIBLE | DEVICE_LOCAL` Heap 2:** " << std::fixed << std::setprecision(2) << ((double)r.heap_host_visible_device_local_bytes / (1024.0 * 1024.0 * 1024.0)) << " GiB\n";
         mf << "- **DXGI Shared Memory Budget:** " << std::fixed << std::setprecision(2) << ((double)r.dxgi_non_local_budget / (1024.0 * 1024.0 * 1024.0)) << " GB (Local Dedicated: " << ((double)r.dxgi_dedicated_vram / (1024.0 * 1024.0)) << " MB)\n\n";
 
-        mf << "## 3. Subgroup Control & Cooperative Matrix\n\n";
+        mf << "## 3. GPU Heap Read Bandwidth & Staging Upload (R0.2)\n\n";
+        mf << "| Memory Operation | Measured Bandwidth |\n";
+        mf << "|---|---:|\n";
+        mf << "| **GPU Compute Read from Heap 0** (`DEVICE_LOCAL` 13.1 GiB pool) | **" << std::fixed << std::setprecision(2) << r.heap0_read_bandwidth_gbs << " GB/s** |\n";
+        mf << "| **GPU Compute Read from Heap 1** (`HOST_VISIBLE` 6.55 GiB pool) | **" << std::fixed << std::setprecision(2) << r.heap1_read_bandwidth_gbs << " GB/s** |\n";
+        mf << "| **Staging Upload (`vkCmdCopyBuffer` Heap 1 -> Heap 0)** | **" << std::fixed << std::setprecision(2) << r.staging_heap1_to_heap0_gbs << " GB/s** |\n\n";
+
+        mf << "## 4. Subgroup Control & Cooperative Matrix\n\n";
         mf << "- **Default Subgroup Size:** " << r.subgroup_size << " lanes\n";
         mf << "- **`VK_EXT_subgroup_size_control`:** " << (r.subgroup_size_control_supported ? "✔ Supported" : "✘ Not Supported") << " (Min: " << r.subgroup_min_size << ", Max: " << r.subgroup_max_size << ")\n";
         mf << "- **Wave32 Explicit Pipeline Creation:** " << (r.wave32_pipeline_created ? "✔ Success" : "✘ Failed") << " -> **Runtime Measured Lane Count: " << r.wave32_runtime_measured << "**\n";
@@ -1355,16 +1553,21 @@ void write_json_and_markdown(const ProbeResults& r, const std::string& json_path
             mf << "\n";
         }
 
-        mf << "## 4. UMA Zero-Copy Verification\n\n";
-        mf << "- **Buffer Size:** " << (r.uma_test_bytes / (1024 * 1024)) << " MB\n";
-        mf << "- **Execution Time:** " << std::fixed << std::setprecision(2) << r.uma_checksum_time_ms << " ms (" << std::fixed << std::setprecision(2) << r.uma_bandwidth_gbs << " GB/s reduction rate)\n";
-        mf << "- **Zero-Copy Checksum Match:** " << (r.uma_zero_copy_passed ? "✔ PASSED (CPU and GPU sums identical without flush/staging)" : "✘ FAILED") << "\n\n";
+        mf << "## 5. Storage / NVMe & Warm-Cache Throughput (R0.1)\n\n";
+        mf << "### Warm OS Page-Cache Read Rates across File Sizes:\n\n";
+        mf << "| File Size | Chunk Size / Mode | Measured Throughput |\n";
+        mf << "|---|---|---:|\n";
+        mf << "| 256 MB File | 16 MB Chunk + `SEQUENTIAL_SCAN` | **" << std::fixed << std::setprecision(2) << r.storage_warm_256mb_gbs << " GB/s** |\n";
+        mf << "| 1.0 GB File | 16 MB Chunk + `SEQUENTIAL_SCAN` | **" << std::fixed << std::setprecision(2) << r.storage_warm_1gb_gbs << " GB/s** |\n";
+        mf << "| 4.0 GB File | 1 MB Chunk `ReadFile` | " << std::fixed << std::setprecision(2) << r.storage_warm_4gb_1mb_gbs << " GB/s |\n";
+        mf << "| 4.0 GB File | 4 MB Chunk `ReadFile` | " << std::fixed << std::setprecision(2) << r.storage_warm_4gb_4mb_gbs << " GB/s |\n";
+        mf << "| 4.0 GB File | 16 MB Chunk `ReadFile` | " << std::fixed << std::setprecision(2) << r.storage_warm_4gb_16mb_gbs << " GB/s |\n";
+        mf << "| 4.0 GB File | 16 MB Chunk + `SEQUENTIAL_SCAN` | **" << std::fixed << std::setprecision(2) << r.storage_warm_4gb_seqscan_16mb_gbs << " GB/s** |\n";
+        mf << "| 4.0 GB File | Memory Mapped (`MapViewOfFile`) | **" << std::fixed << std::setprecision(2) << r.storage_warm_4gb_mmap_gbs << " GB/s** |\n\n";
 
-        mf << "## 5. Storage / NVMe Throughput\n\n";
+        mf << "### Unbuffered Direct NVMe Throughput (Hardware Limit):\n\n";
         mf << "| Access Mode | Alignment | Queue Depth | Measured Throughput |\n";
         mf << "|---|---|---|---:|\n";
-        mf << "| Win32 Buffered `ReadFile` (Cold Cache) | Standard | Synchronous | " << std::fixed << std::setprecision(2) << r.storage_buffered_cold_gbs << " GB/s |\n";
-        mf << "| Win32 Buffered `ReadFile` (Warm Page Cache) | Standard | Synchronous | **" << std::fixed << std::setprecision(2) << r.storage_buffered_warm_gbs << " GB/s** |\n";
         mf << "| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 1 | " << std::fixed << std::setprecision(2) << r.storage_unbuffered_qd1_gbs << " GB/s |\n";
         mf << "| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 4 | " << std::fixed << std::setprecision(2) << r.storage_unbuffered_qd4_gbs << " GB/s |\n";
         mf << "| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 8 | " << std::fixed << std::setprecision(2) << r.storage_unbuffered_qd8_gbs << " GB/s |\n";
@@ -1390,7 +1593,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Ensure directories exist
     CreateDirectoryA("build", nullptr);
     CreateDirectoryA("docs", nullptr);
 
@@ -1417,11 +1619,15 @@ int main(int argc, char** argv) {
     std::cout << "      Wave32 Subgroup Runtime: " << r.wave32_runtime_measured << " lanes" << std::endl;
     std::cout << "      Cooperative Matrix Tuples: " << r.coop_matrix_tuples.size() << std::endl;
     std::cout << "      UMA Zero-Copy: " << (r.uma_zero_copy_passed ? "PASSED" : "FAILED") << std::endl;
+    std::cout << "      GPU Read Heap 0: " << std::fixed << std::setprecision(2) << r.heap0_read_bandwidth_gbs << " GB/s" << std::endl;
+    std::cout << "      GPU Read Heap 1: " << std::fixed << std::setprecision(2) << r.heap1_read_bandwidth_gbs << " GB/s" << std::endl;
+    std::cout << "      Staging Heap 1 -> Heap 0: " << std::fixed << std::setprecision(2) << r.staging_heap1_to_heap0_gbs << " GB/s" << std::endl;
 
-    std::cout << "[4/5] Running sustained sequential NVMe I/O benchmarks (4 GB)..." << std::endl;
+    std::cout << "[4/5] Running sustained sequential NVMe & warm-cache I/O benchmarks..." << std::endl;
     probe_storage_benchmarks(r);
-    std::cout << "      Buffered Warm: " << std::fixed << std::setprecision(2) << r.storage_buffered_warm_gbs << " GB/s" << std::endl;
-    std::cout << "      Unbuffered QD=8: " << std::fixed << std::setprecision(2) << r.storage_unbuffered_qd8_gbs << " GB/s" << std::endl;
+    std::cout << "      Warm Page Cache (16MB Chunk + Seq): " << std::fixed << std::setprecision(2) << r.storage_warm_4gb_seqscan_16mb_gbs << " GB/s" << std::endl;
+    std::cout << "      Warm Memory Mapped (4GB): " << std::fixed << std::setprecision(2) << r.storage_warm_4gb_mmap_gbs << " GB/s" << std::endl;
+    std::cout << "      Unbuffered QD=8 (Cold SSD limit): " << std::fixed << std::setprecision(2) << r.storage_unbuffered_qd8_gbs << " GB/s" << std::endl;
 
     std::cout << "[5/5] Writing " << json_path << " and " << md_path << "..." << std::endl;
     write_json_and_markdown(r, json_path, md_path);

@@ -41,8 +41,11 @@ private:
     std::shared_ptr<Tokenizer> tokenizer_;
     G4DenseHeader header_{};
 
-    // Internal model weights buffer (read directly from container)
-    std::vector<uint8_t> container_data_;
+    // Memory-mapped container buffer for zero-copy 64-bit safe reads
+    const uint8_t* mapped_data_{nullptr};
+    size_t mapped_size_{0};
+    void* mapping_handle_{nullptr};
+    void* file_handle_{nullptr};
 
     // CPU KV cache
     std::vector<std::vector<float>> k_cache_; // per layer

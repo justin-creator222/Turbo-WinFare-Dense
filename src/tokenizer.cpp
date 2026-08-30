@@ -518,6 +518,43 @@ bool Tokenizer::is_byte_fallback(uint32_t token, uint8_t& value) const {
     return true;
 }
 
+size_t utf8_repair(std::string_view in, bool flush_all, std::string& out) {
+    // Length of the UTF-8 sequence starting with `lead`, or 0 if it is not a valid lead byte.
+    auto utf8_len = [](unsigned char lead) -> size_t {
+        if (lead < 0x80) return 1;
+        if ((lead & 0xE0) == 0xC0) return 2;
+        if ((lead & 0xF0) == 0xE0) return 3;
+        if ((lead & 0xF8) == 0xF0) return 4;
+        return 0;   // continuation byte or invalid lead
+    };
+    static constexpr const char* kReplacement = "\xEF\xBF\xBD";   // U+FFFD
+
+    size_t i = 0;
+    while (i < in.size()) {
+        const unsigned char lead = static_cast<unsigned char>(in[i]);
+        const size_t need = utf8_len(lead);
+
+        if (need == 0) {
+            // Not a valid lead byte. Emit a replacement and resynchronize by one byte, so a
+            // single corrupt byte cannot poison the rest of the stream.
+            out += kReplacement;
+            ++i;
+            continue;
+        }
+        if (i + need > in.size()) {
+            // Incomplete tail. Hold it unless this is the final flush, where no further bytes
+            // can arrive to complete it.
+            if (!flush_all) break;
+            out += kReplacement;
+            i = in.size();
+            break;
+        }
+        out.append(in.data() + i, need);
+        i += need;
+    }
+    return i;
+}
+
 std::string Tokenizer::decode(const std::vector<uint32_t>& tokens, bool skip_special) const {
     if (!loaded_) {
         throw G4DenseFormatError("Tokenizer::decode called before a vocabulary was loaded");
@@ -525,11 +562,16 @@ std::string Tokenizer::decode(const std::vector<uint32_t>& tokens, bool skip_spe
 
     std::string out;
     // Byte-fallback tokens must be fused before being interpreted, so that a multi-byte
-    // UTF-8 character split across several <0xNN> tokens reassembles correctly.
+    // UTF-8 character split across several <0xNN> tokens reassembles correctly. The fused run
+    // then goes through utf8_repair, exactly as the streaming path does -- otherwise a
+    // sequence of byte tokens that is not valid UTF-8 decodes to different bytes depending on
+    // whether the caller streamed the response or waited for it.
     std::string byte_run;
     auto flush_bytes = [&]() {
-        out += byte_run;
-        byte_run.clear();
+        if (!byte_run.empty()) {
+            utf8_repair(byte_run, /*flush_all=*/true, out);
+            byte_run.clear();
+        }
     };
 
     for (uint32_t t : tokens) {

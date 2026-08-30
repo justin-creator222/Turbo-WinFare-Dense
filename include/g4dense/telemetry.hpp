@@ -44,6 +44,12 @@ public:
     void record_io_throughput(double bytes_read, double io_time_sec);
     void record_ttft(double ttft_ms);
 
+    // Per-forward-pass phase attribution, as an exponential moving average so a single slow
+    // pass does not dominate. Without this, "the pass takes 9.6 s" is all we know and every
+    // optimization is a guess about which part of it moved.
+    void record_phase_breakdown(double stream_io_ms, double gpu_wait_ms,
+                                double lm_head_ms, double cpu_other_ms);
+
     TelemetrySnapshot snapshot() const;
     void reset();
 

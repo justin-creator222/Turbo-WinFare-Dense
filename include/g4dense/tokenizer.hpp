@@ -1,11 +1,26 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
 
 namespace g4dense {
+
+// Appends the valid UTF-8 prefix of `in` to `out`, substituting U+FFFD for bytes that cannot
+// form a character, and returns how many bytes of `in` were consumed.
+//
+// With `flush_all == false` an incomplete trailing sequence is left unconsumed, so a caller
+// streaming byte-fallback tokens can hold it until the rest arrives. With `flush_all == true`
+// the tail is terminal and becomes a replacement character.
+//
+// Both the batch decoder (Tokenizer::decode) and the streaming one (IncrementalDetokenizer)
+// go through this, so streamed output is byte-identical to non-streamed output for the same
+// token sequence. They diverged before: batch emitted raw bytes while streaming repaired
+// them, which meant an SSE response and a blocking response disagreed -- and raw invalid
+// UTF-8 cannot be encoded into a JSON body at all.
+size_t utf8_repair(std::string_view in, bool flush_all, std::string& out);
 
 enum class PieceType : uint8_t {
     Normal = 1,

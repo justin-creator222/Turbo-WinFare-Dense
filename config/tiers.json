@@ -1,8 +1,9 @@
 {
   "hardware_context": {
     "usable_ram_gb": 23.81,
-    "measured_nvme_warm_gbs": 5.82,
-    "device_local_heap_mb": 13417.62
+    "measured_nvme_warm_gbs": 5.68,
+    "heap0_device_local_mb": 13417.62,
+    "heap1_host_visible_mb": 6708.75
   },
   "layer_geometry": {
     "d_model": 5376,
@@ -10,6 +11,18 @@
     "total_layers": 60,
     "sliding_layers_count": 50,
     "global_layers_count": 10,
+    "global_layers": [
+      5,
+      11,
+      17,
+      23,
+      29,
+      35,
+      41,
+      47,
+      53,
+      59
+    ],
     "layer_bytes": 269446146,
     "embedding_bytes": 792723456
   },
@@ -18,8 +31,12 @@
       "tier_id": 1,
       "name": "Tier 1 (Baseline)",
       "ceiling_mb": 6000.0,
-      "actual_footprint_mb": 5939.7,
-      "slack_mb": 60.3,
+      "heap0_usage_mb": 1541.8,
+      "heap0_budget_mb": 13417.6,
+      "heap1_usage_mb": 3197.9,
+      "heap1_budget_mb": 6708.8,
+      "actual_footprint_mb": 4739.7,
+      "slack_mb": 1260.3,
       "pinned_layers_count": 6,
       "pinned_layers": [
         0,
@@ -34,22 +51,26 @@
       "kv_cache_dtype": "INT8",
       "kv_cache_mb": 1044.1,
       "projected_tps": {
-        "alpha_0.60": 1.02,
-        "alpha_0.70": 1.29,
-        "alpha_0.78": 1.58,
-        "alpha_0.85": 1.9
+        "alpha_0.60": 0.95,
+        "alpha_0.70": 1.19,
+        "alpha_0.78": 1.46,
+        "alpha_0.85": 1.77
       },
       "target_tps": 2.5,
       "meets_target": false,
       "feasible": true,
-      "reason": "Feasible on target hardware."
+      "reason": "Feasible under two-tier residency."
     },
     {
       "tier_id": 2,
       "name": "Tier 2 (Balanced)",
       "ceiling_mb": 10000.0,
-      "actual_footprint_mb": 9794.2,
-      "slack_mb": 205.8,
+      "heap0_usage_mb": 5396.2,
+      "heap0_budget_mb": 13417.6,
+      "heap1_usage_mb": 3197.9,
+      "heap1_budget_mb": 6708.8,
+      "actual_footprint_mb": 8594.2,
+      "slack_mb": 1405.8,
       "pinned_layers_count": 21,
       "pinned_layers": [
         0,
@@ -79,23 +100,27 @@
       "kv_cache_dtype": "INT8",
       "kv_cache_mb": 1044.1,
       "projected_tps": {
-        "alpha_0.60": 1.4,
-        "alpha_0.70": 1.77,
-        "alpha_0.78": 2.16,
-        "alpha_0.85": 2.62
+        "alpha_0.60": 1.28,
+        "alpha_0.70": 1.61,
+        "alpha_0.78": 1.97,
+        "alpha_0.85": 2.38
       },
       "target_tps": 3.85,
       "meets_target": false,
       "feasible": true,
-      "reason": "Feasible on target hardware."
+      "reason": "Feasible under two-tier residency."
     },
     {
       "tier_id": 3,
       "name": "Tier 3 (High-Perf)",
       "ceiling_mb": 16000.0,
-      "actual_footprint_mb": 15969.4,
-      "slack_mb": 30.6,
-      "pinned_layers_count": 41,
+      "heap0_usage_mb": 12334.3,
+      "heap0_budget_mb": 13417.6,
+      "heap1_usage_mb": 3197.9,
+      "heap1_budget_mb": 6708.8,
+      "actual_footprint_mb": 15532.2,
+      "slack_mb": 467.8,
+      "pinned_layers_count": 48,
       "pinned_layers": [
         0,
         1,
@@ -128,7 +153,14 @@
         28,
         29,
         30,
+        31,
+        32,
+        33,
+        34,
         35,
+        36,
+        37,
+        38,
         41,
         47,
         53,
@@ -139,27 +171,31 @@
         58,
         59
       ],
-      "streamed_layers_count": 19,
-      "streamed_bytes": 5119476774,
-      "kv_cache_dtype": "FP16",
-      "kv_cache_mb": 2080.0,
+      "streamed_layers_count": 12,
+      "streamed_bytes": 3233353752,
+      "kv_cache_dtype": "INT8",
+      "kv_cache_mb": 1044.1,
       "projected_tps": {
-        "alpha_0.60": 2.8,
-        "alpha_0.70": 3.52,
-        "alpha_0.78": 4.31,
-        "alpha_0.85": 5.21
+        "alpha_0.60": 3.42,
+        "alpha_0.70": 4.31,
+        "alpha_0.78": 5.28,
+        "alpha_0.85": 6.38
       },
       "target_tps": 6.0,
       "meets_target": false,
       "feasible": true,
-      "reason": "Feasible on target hardware."
+      "reason": "Feasible under two-tier residency."
     },
     {
       "tier_id": 4,
       "name": "Tier 4 (Resident)",
       "ceiling_mb": 22000.0,
-      "actual_footprint_mb": 20851.7,
-      "slack_mb": 1148.3,
+      "heap0_usage_mb": 15417.8,
+      "heap0_budget_mb": 13417.6,
+      "heap1_usage_mb": 3206.0,
+      "heap1_budget_mb": 6708.8,
+      "actual_footprint_mb": 18623.8,
+      "slack_mb": 3376.2,
       "pinned_layers_count": 60,
       "pinned_layers": [
         0,
@@ -228,15 +264,15 @@
       "kv_cache_dtype": "FP16",
       "kv_cache_mb": 2080.0,
       "projected_tps": {
-        "alpha_0.60": 9.35,
-        "alpha_0.70": 11.76,
-        "alpha_0.78": 14.41,
-        "alpha_0.85": 17.42
+        "alpha_0.60": 6.07,
+        "alpha_0.70": 7.64,
+        "alpha_0.78": 9.36,
+        "alpha_0.85": 11.32
       },
       "target_tps": 18.0,
       "meets_target": false,
       "feasible": false,
-      "reason": "Tier 4 (22.0 GB) exceeds usable system RAM (23.8 GB); requires 32 GB hardware to avoid OS thrashing."
+      "reason": "Heap 0 use (15417.8 MB) exceeds physical Device-Local Heap 0 (13417.6 MB); requires 32 GB hardware."
     }
   ]
 }

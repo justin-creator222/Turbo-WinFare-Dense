@@ -6,64 +6,79 @@
 // Andrey Mikhaylov, Apache-2.0. See NOTICE in the repository root.
 //
 // Shared helpers and binding convention for the Turbo-WinFare compute kernels.
-//
-// BINDING CONVENTION
-// ------------------
-// Everything is a raw byte-address buffer. The previous kernels declared a mix of
-// StructuredBuffer<float16_t> (stride 2) and Texture2D<uint> while the host bound every
-// resource as a stride-4 structured buffer, so the views silently disagreed with the
-// declarations. Raw buffers remove that entire class of bug: the shader does explicit
-// Load()/Store() at byte offsets and the host only has to get the offsets right.
-//
-// Activations are FP32. This is a correctness-first port -- FP16 packing is a later
-// optimization, and mixing it in now would make GPU-vs-CPU diffs ambiguous.
-//
-//   t0..t7  ByteAddressBuffer     inputs (weights, scales, biases, activations)
-//   u0..u3  RWByteAddressBuffer   outputs
-//   b0      16 root constants     see each kernel for its layout
-//
-// QUANTIZATION
-// ------------
-// MLX affine: w = q * scale + bias, group_size 64 along the input dimension, BF16 scale
-// and bias. 4-bit values are packed low-nibble-first (element c is in byte c/2, low nibble
-// when c is even); 8-bit values (routers only) are one byte each.
 
 #ifndef GTURBO_COMMON_HLSLI
 #define GTURBO_COMMON_HLSLI
 
 static const uint GROUP_SIZE = 64;
-
-// The number of threads in a GEMV threadgroup -- NOT an assumption about the hardware wave
-// width. RDNA 3 may execute this as a single Wave64 with half the lanes inactive, in which
-// case WaveActiveSum still reduces only the active lanes and the result is unchanged. Any
-// kernel that needs the real wave width must query WaveGetLaneCount() at runtime.
 static const uint GEMV_THREADS = 32;
 static const uint WAVE_SIZE = GEMV_THREADS;
 
-ByteAddressBuffer   g_in0 : register(t0);
-ByteAddressBuffer   g_in1 : register(t1);
-ByteAddressBuffer   g_in2 : register(t2);
-ByteAddressBuffer   g_in3 : register(t3);
-ByteAddressBuffer   g_in4 : register(t4);
-ByteAddressBuffer   g_in5 : register(t5);
+[[vk::binding(0, 0)]] ByteAddressBuffer   g_in0 : register(t0);
+[[vk::binding(1, 0)]] ByteAddressBuffer   g_in1 : register(t1);
+[[vk::binding(2, 0)]] ByteAddressBuffer   g_in2 : register(t2);
+[[vk::binding(3, 0)]] ByteAddressBuffer   g_in3 : register(t3);
+[[vk::binding(4, 0)]] ByteAddressBuffer   g_in4 : register(t4);
+[[vk::binding(5, 0)]] ByteAddressBuffer   g_in5 : register(t5);
 
-RWByteAddressBuffer g_out0 : register(u0);
-RWByteAddressBuffer g_out1 : register(u1);
-RWByteAddressBuffer g_out2 : register(u2);
-RWByteAddressBuffer g_out3 : register(u3);
+[[vk::binding(6, 0)]] RWByteAddressBuffer g_out0 : register(u0);
+[[vk::binding(7, 0)]] RWByteAddressBuffer g_out1 : register(u1);
+[[vk::binding(8, 0)]] RWByteAddressBuffer g_out2 : register(u2);
+[[vk::binding(9, 0)]] RWByteAddressBuffer g_out3 : register(u3);
 
-cbuffer Params : register(b0) {
+struct PushParams {
     uint4 gp0;
     uint4 gp1;
     uint4 gp2;
     uint4 gp3;
 };
 
+[[vk::push_constant]]
+PushParams g_params;
+
+#define gp0 g_params.gp0
+#define gp1 g_params.gp1
+#define gp2 g_params.gp2
+#define gp3 g_params.gp3
+
 // Reads a BF16 value at an arbitrary 2-byte-aligned offset.
+//
+// Use this for EVERY non-quantized tensor: the LayerNorm family (input/post_attn/pre_ffn/
+// post_ffn layernorms, q_norm, k_norm, the final model norm), the per-layer scalar, and the
+// quantization scales and biases. The MLX export tags them all BF16 and that tag is correct.
+//
+// A previous round decided the LayerNorm family was secretly IEEE FP16, on the grounds that
+// the BF16 decode "looks wrong" (model.norm.weight median 6.28, max 510) while the FP16
+// decode looks like a textbook norm weight (median 2.393). That reasoning does not work: on
+// this value range the two decodings are a BIJECTION, so each is self-consistent and neither
+// can be picked by how it looks.
+//
+// What settles it is behaviour, measured on the checkpoint itself:
+//
+//                        pre-softmax |score|      hidden rms, layers 0..7
+//     read as BF16       mean 5-16, max 24        0.81 1.69 1.68 1.66 1.66 1.76 2.08  (stable)
+//     read as FP16       mean 192-327, max 549    4.3 8.2 15.6 30 57 106 197  (x2 per layer)
+//
+// Gemma4TextAttention sets self.scaling = 1.0, so nothing downstream rescales those scores.
+// FP16 makes softmax a hard argmax and makes the residual stream diverge as 2^60; BF16 gives
+// an ordinary transformer. The FP16 reading was the defect, and the NumPy reference agreed
+// with it only because that reference was written from the same assumption.
 float bf16_load(ByteAddressBuffer buf, uint byte_off) {
     uint word = buf.Load(byte_off & ~3u);
     uint half_bits = ((byte_off & 2u) != 0u) ? (word >> 16) : (word & 0xFFFFu);
     return asfloat(half_bits << 16);
+}
+
+// Reads a 32-bit uint at an arbitrary 2-byte-aligned offset.
+uint u32_load(ByteAddressBuffer buf, uint byte_off) {
+    uint base = byte_off & ~3u;
+    if ((byte_off & 2u) == 0u) {
+        return buf.Load(base);
+    } else {
+        uint w0 = buf.Load(base);
+        uint w1 = buf.Load(base + 4u);
+        return (w0 >> 16) | (w1 << 16);
+    }
 }
 
 float f32_load(ByteAddressBuffer buf, uint byte_off) {
@@ -89,90 +104,108 @@ float gelu_tanh(float x) {
 
 // One wave's dot product of an affine-quantized 4-bit row against an FP32 vector.
 // Each lane walks a strided subset of the groups; the caller reduces with WaveActiveSum.
-//
-// The stride is WaveGetLaneCount(), NOT a compile-time constant. A fixed stride of 32 is
-// correct only when the caller's threadgroup is exactly 32 threads; a 512-thread group on
-// RDNA 3 (Wave64) passes lanes 0..63, and lanes 32..63 would then re-process groups 32..63
-// and double-count them. That produced a *lower* maximum in the greedy LM head rather than
-// an obviously broken one.
 float gemv_int4_row_lane(ByteAddressBuffer W, uint w_base,
                          ByteAddressBuffer S, uint s_base,
                          ByteAddressBuffer B, uint b_base,
                          ByteAddressBuffer X, uint x_base,
-                         uint row, uint in_dim, uint lane)
-{
-    const uint groups = in_dim / GROUP_SIZE;
-    const uint row_bytes = in_dim / 2;
-    const uint w_row = w_base + row * row_bytes;
-    const uint s_row = s_base + row * groups * 2;
-    const uint b_row = b_base + row * groups * 2;
+                         uint row, uint in_dim, uint lane) {
+    const uint num_groups       = in_dim / GROUP_SIZE;
+    const uint row_w_bytes      = (in_dim / 8u) * 4u;
+    const uint row_sb_bytes     = num_groups * 2u;
+    const uint row_w_base       = w_base + row * row_w_bytes;
+    const uint row_s_base       = s_base + row * row_sb_bytes;
+    const uint row_b_base       = b_base + row * row_sb_bytes;
 
     float acc = 0.0f;
-    for (uint g = lane; g < groups; g += WaveGetLaneCount()) {
-        const float s = bf16_load(S, s_row + g * 2);
-        const float b = bf16_load(B, b_row + g * 2);
-        const uint gw = w_row + g * (GROUP_SIZE / 2);   // 32 bytes per group
-        const uint gx = x_base + g * GROUP_SIZE * 4;    // FP32 activations
 
-        float dot = 0.0f;
-        float sum = 0.0f;
-        // MEASURED: replacing these scalar loads with two Load4 per w iteration is SLOWER on
-        // RDNA 3 -- 7.3-7.8 tok/s against 8.6-9.0 for this version, across three variants
-        // (local array, explicit scalars, and with `precise`). DXC already merges these into
-        // wide fetches; hoisting all 8 values by hand only inflates register pressure. Do
-        // not "optimize" this without measuring.
-        [unroll]
-        for (uint w = 0; w < 8; ++w) {
-            const uint packed = W.Load(gw + w * 4);     // 8 nibbles = 8 elements
-            [unroll]
-            for (uint n = 0; n < 4; ++n) {
-                const uint byte = (packed >> (n * 8)) & 0xFFu;
-                const uint e = w * 8 + n * 2;
-                const float x0 = f32_load(X, gx + (e + 0) * 4);
-                const float x1 = f32_load(X, gx + (e + 1) * 4);
-                dot += float(byte & 0x0Fu) * x0;
-                dot += float(byte >> 4) * x1;
-                sum += x0 + x1;
-            }
+    for (uint g = lane; g < num_groups; g += GEMV_THREADS) {
+        const float scale = bf16_load(S, row_s_base + g * 2u);
+        const float bias  = bf16_load(B, row_b_base + g * 2u);
+
+        const uint g_w_base = row_w_base + g * 32u;
+        const uint g_x_base = x_base     + g * (GROUP_SIZE * 4u);
+
+        for (uint word_idx = 0; word_idx < 8u; ++word_idx) {
+            const uint packed = u32_load(W, g_w_base + word_idx * 4u);
+            const uint x_off  = g_x_base + word_idx * 32u;
+
+            const float x0 = f32_load(X, x_off + 0u);
+            const float x1 = f32_load(X, x_off + 4u);
+            const float x2 = f32_load(X, x_off + 8u);
+            const float x3 = f32_load(X, x_off + 12u);
+            const float x4 = f32_load(X, x_off + 16u);
+            const float x5 = f32_load(X, x_off + 20u);
+            const float x6 = f32_load(X, x_off + 24u);
+            const float x7 = f32_load(X, x_off + 28u);
+
+            const uint q0 = (packed >>  0) & 0xFu;
+            const uint q1 = (packed >>  4) & 0xFu;
+            const uint q2 = (packed >>  8) & 0xFu;
+            const uint q3 = (packed >> 12) & 0xFu;
+            const uint q4 = (packed >> 16) & 0xFu;
+            const uint q5 = (packed >> 20) & 0xFu;
+            const uint q6 = (packed >> 24) & 0xFu;
+            const uint q7 = (packed >> 28) & 0xFu;
+
+            const float w0 = float(q0) * scale + bias;
+            const float w1 = float(q1) * scale + bias;
+            const float w2 = float(q2) * scale + bias;
+            const float w3 = float(q3) * scale + bias;
+            const float w4 = float(q4) * scale + bias;
+            const float w5 = float(q5) * scale + bias;
+            const float w6 = float(q6) * scale + bias;
+            const float w7 = float(q7) * scale + bias;
+
+            acc += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3
+                 + w4 * x4 + w5 * x5 + w6 * x6 + w7 * x7;
         }
-        acc += s * dot + b * sum;
     }
     return acc;
 }
 
-// Same, for 8-bit rows (routers). One byte per element.
+// One wave's dot product of an affine-quantized 8-bit row against an FP32 vector.
 float gemv_int8_row_lane(ByteAddressBuffer W, uint w_base,
                          ByteAddressBuffer S, uint s_base,
                          ByteAddressBuffer B, uint b_base,
                          ByteAddressBuffer X, uint x_base,
-                         uint row, uint in_dim, uint lane)
-{
-    const uint groups = in_dim / GROUP_SIZE;
-    const uint w_row = w_base + row * in_dim;
-    const uint s_row = s_base + row * groups * 2;
-    const uint b_row = b_base + row * groups * 2;
+                         uint row, uint in_dim, uint lane) {
+    const uint num_groups       = in_dim / GROUP_SIZE;
+    const uint row_w_bytes      = in_dim;
+    const uint row_sb_bytes     = num_groups * 2u;
+    const uint row_w_base       = w_base + row * row_w_bytes;
+    const uint row_s_base       = s_base + row * row_sb_bytes;
+    const uint row_b_base       = b_base + row * row_sb_bytes;
 
     float acc = 0.0f;
-    for (uint g = lane; g < groups; g += WaveGetLaneCount()) {
-        const float s = bf16_load(S, s_row + g * 2);
-        const float b = bf16_load(B, b_row + g * 2);
-        const uint gw = w_row + g * GROUP_SIZE;
-        const uint gx = x_base + g * GROUP_SIZE * 4;
 
-        float dot = 0.0f;
-        float sum = 0.0f;
-        // See the note in gemv_int4_row_lane: Load4 measured slower here too.
-        [unroll]
-        for (uint w = 0; w < 16; ++w) {
-            const uint packed = W.Load(gw + w * 4);     // 4 bytes = 4 elements
-            [unroll]
-            for (uint n = 0; n < 4; ++n) {
-                const float xv = f32_load(X, gx + (w * 4 + n) * 4);
-                dot += float((packed >> (n * 8)) & 0xFFu) * xv;
-                sum += xv;
-            }
+    for (uint g = lane; g < num_groups; g += GEMV_THREADS) {
+        const float scale = bf16_load(S, row_s_base + g * 2u);
+        const float bias  = bf16_load(B, row_b_base + g * 2u);
+
+        const uint g_w_base = row_w_base + g * 64u;
+        const uint g_x_base = x_base     + g * (GROUP_SIZE * 4u);
+
+        for (uint word_idx = 0; word_idx < 16u; ++word_idx) {
+            const uint packed = u32_load(W, g_w_base + word_idx * 4u);
+            const uint x_off  = g_x_base + word_idx * 16u;
+
+            const float x0 = f32_load(X, x_off + 0u);
+            const float x1 = f32_load(X, x_off + 4u);
+            const float x2 = f32_load(X, x_off + 8u);
+            const float x3 = f32_load(X, x_off + 12u);
+
+            const uint q0 = (packed >>  0) & 0xFFu;
+            const uint q1 = (packed >>  8) & 0xFFu;
+            const uint q2 = (packed >> 16) & 0xFFu;
+            const uint q3 = (packed >> 24) & 0xFFu;
+
+            const float w0 = float(q0) * scale + bias;
+            const float w1 = float(q1) * scale + bias;
+            const float w2 = float(q2) * scale + bias;
+            const float w3 = float(q3) * scale + bias;
+
+            acc += w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
         }
-        acc += s * dot + b * sum;
     }
     return acc;
 }

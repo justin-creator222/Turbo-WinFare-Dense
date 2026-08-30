@@ -19,9 +19,10 @@ const char* get_kernel_spv_name(ComputeKernel kernel) {
         case ComputeKernel::GemmInt4Batch:  return "GemvInt4.spv"; // Shared kernel with batch parameter
         case ComputeKernel::QKVEpilogue:    return "QKVEpilogue.spv";
         case ComputeKernel::Attention:      return "Attention.spv";
-        case ComputeKernel::SwiGLU:         return "GeGLU.spv";
+        case ComputeKernel::GeGLU:          return "GeGLU.spv";
         case ComputeKernel::PostAttn:       return "PostAttn.spv";
         case ComputeKernel::LayerTail:      return "LayerTail.spv";
+        case ComputeKernel::ResidualAccum:  return "ResidualAccum.spv";
         case ComputeKernel::Softcap:        return "Softcap.spv";
         case ComputeKernel::LMHeadGreedy:   return "LMHeadGreedy.spv";
         case ComputeKernel::ArgmaxReduce:   return "ArgmaxReduce.spv";
@@ -68,8 +69,14 @@ VkShaderModule VulkanPipelineManager::load_shader_module(const std::string& spv_
 
 void VulkanPipelineManager::initialize_pipelines(size_t descriptor_capacity) {
     VkDevice dev = ctx_.device();
+    descriptor_capacity_ = descriptor_capacity;
+    sets_allocated_since_reset_ = 0;
 
     // 1. Create Descriptor Pool
+    //
+    // Capacity is a per-forward-pass budget, not a lifetime one: reset_descriptor_pool()
+    // reclaims the whole pool between passes. One 60-layer pass costs roughly 800 sets, so
+    // the default leaves several times the headroom actually needed.
     VkDescriptorPoolSize pool_sizes[] = {
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<uint32_t>(descriptor_capacity * 8) },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, static_cast<uint32_t>(descriptor_capacity * 2) }
@@ -114,9 +121,9 @@ void VulkanPipelineManager::initialize_pipelines(size_t descriptor_capacity) {
         VkShaderModule sm = load_shader_module(found_path);
         shader_modules_[kernel] = sm;
 
-        // Create Descriptor Set Layout (Up to 8 Storage Buffers)
+        // Create Descriptor Set Layout (Up to 12 Storage Buffers: 0..5 inputs, 6..9 outputs)
         std::vector<VkDescriptorSetLayoutBinding> bindings;
-        for (uint32_t b = 0; b < 8; ++b) {
+        for (uint32_t b = 0; b < 12; ++b) {
             VkDescriptorSetLayoutBinding bind{};
             bind.binding = b;
             bind.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -169,7 +176,15 @@ void VulkanPipelineManager::initialize_pipelines(size_t descriptor_capacity) {
         VkPipeline pipe = VK_NULL_HANDLE;
         res = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &pipe);
         if (res != VK_SUCCESS) {
-            // Fallback without subgroup size control if driver rejects
+            // Fallback WITHOUT subgroup size control. This is not a neutral retry: the kernel
+            // then runs at the device default (Wave64 on RDNA 3) instead of the Wave32 it was
+            // written and parity-tested against. Common.hlsli queries WaveGetLaneCount() so
+            // most kernels adapt, but a silent width change is exactly the class of downgrade
+            // this project forbids -- so it is recorded and reported rather than swallowed.
+            subgroup_fallbacks_.push_back(spv_name);
+            std::cerr << "[VulkanPipelineManager] WARNING: " << spv_name
+                      << " could not be created with requiredSubgroupSize=32 (VkResult " << res
+                      << "); falling back to the device default wave width.\n";
             stage_ci.pNext = nullptr;
             stage_ci.flags = 0;
             res = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &pipe);
@@ -178,6 +193,21 @@ void VulkanPipelineManager::initialize_pipelines(size_t descriptor_capacity) {
             }
         }
         pipelines_[kernel] = pipe;
+    }
+
+    // Every kernel the enum declares must have a live pipeline before any dispatch runs.
+    // Without this, a kernel that quietly failed to build only shows up as an output buffer
+    // that was never written -- which reads as a plausible-looking wrong answer, not an error.
+    for (uint32_t k = 0; k < static_cast<uint32_t>(ComputeKernel::COUNT); ++k) {
+        ComputeKernel kernel = static_cast<ComputeKernel>(k);
+        const char* name = get_kernel_spv_name(kernel);
+        if (!name || strlen(name) == 0) continue;
+        if (pipelines_.find(kernel) == pipelines_.end() ||
+            pipelines_[kernel] == VK_NULL_HANDLE) {
+            throw G4DenseFormatError(
+                std::string("VulkanPipelineManager: pipeline for ") + name +
+                " is missing after initialize_pipelines().");
+        }
     }
 }
 
@@ -192,7 +222,19 @@ VkPipelineLayout VulkanPipelineManager::get_pipeline_layout(ComputeKernel kernel
 }
 
 void VulkanPipelineManager::bind_kernel(VkCommandBuffer cmd, ComputeKernel kernel) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, get_pipeline(kernel));
+    VkPipeline pipe = get_pipeline(kernel);
+    if (pipe == VK_NULL_HANDLE) {
+        // Binding a null pipeline is undefined behaviour: the dispatch silently does nothing
+        // and the output buffer keeps whatever it held. That is how a second ForwardRunner in
+        // one process produced all-zero logits with no error anywhere -- the forward pass
+        // "succeeded" having computed nothing.
+        throw G4DenseFormatError(
+            "VulkanPipelineManager: no pipeline for kernel index " +
+            std::to_string(static_cast<uint32_t>(kernel)) +
+            " (" + std::string(get_kernel_spv_name(kernel)) + "). initialize_pipelines() did not "
+            "create it, so this dispatch would silently produce nothing.");
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
 }
 
 void VulkanPipelineManager::push_constants(VkCommandBuffer cmd, ComputeKernel kernel,
@@ -214,9 +256,26 @@ VkDescriptorSet VulkanPipelineManager::allocate_descriptor_set(ComputeKernel ker
     VkDescriptorSet ds = VK_NULL_HANDLE;
     VkResult res = vkAllocateDescriptorSets(ctx_.device(), &ds_ai, &ds);
     if (res != VK_SUCCESS) {
-        throw G4DenseFormatError("VulkanPipelineManager: failed to allocate descriptor set");
+        // Name the actual cause. This used to surface as a bare failure mid-generation with
+        // no indication that the pool -- not the device -- was the constraint.
+        throw G4DenseFormatError(
+            "VulkanPipelineManager: failed to allocate descriptor set (pool capacity " +
+            std::to_string(descriptor_capacity_) + " sets, " +
+            std::to_string(sets_allocated_since_reset_) +
+            " allocated since the last reset). Call reset_descriptor_pool() once per forward "
+            "pass, or raise the capacity passed to initialize_pipelines().");
+    }
+    ++sets_allocated_since_reset_;
+    if (sets_allocated_since_reset_ > peak_sets_per_pass_) {
+        peak_sets_per_pass_ = sets_allocated_since_reset_;
     }
     return ds;
+}
+
+void VulkanPipelineManager::reset_descriptor_pool() {
+    if (descriptor_pool_ == VK_NULL_HANDLE) return;
+    vkResetDescriptorPool(ctx_.device(), descriptor_pool_, 0);
+    sets_allocated_since_reset_ = 0;
 }
 
 void VulkanPipelineManager::update_storage_buffer(VkDescriptorSet ds, uint32_t binding,

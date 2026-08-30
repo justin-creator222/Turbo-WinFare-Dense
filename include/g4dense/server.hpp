@@ -61,6 +61,12 @@ private:
     std::unique_ptr<RequestCoordinator> coordinator_;
 
     std::string load_error_;
+
+    // Set by POST /api/stop, passed to ForwardRunner::generate as its cancel_flag, and
+    // cleared at the start of each generation. Without it the GUI's Stop button had nothing
+    // to talk to -- the endpoint returned 404 and a slow generation could not be abandoned.
+    std::atomic<bool> cancel_generation_{false};
+
     std::atomic<bool> is_running_{false};
     std::thread server_thread_;
     uintptr_t listen_socket_{0};

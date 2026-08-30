@@ -175,9 +175,13 @@ bool bundle_loads(const std::string& path) {
 std::vector<std::string> bundle_search_roots() {
     std::vector<std::string> roots;
     roots.push_back(".");
-    roots.push_back("models");
-    roots.push_back("build");
     roots.push_back("..");
+    roots.push_back("models");
+    roots.push_back("../models");
+    roots.push_back("build");
+    roots.push_back("tests/fixtures");
+    roots.push_back("../tests/fixtures");
+    roots.push_back("../../tests/fixtures");
 
 #ifdef _WIN32
     char exe_buf[MAX_PATH];
@@ -186,18 +190,34 @@ std::vector<std::string> bundle_search_roots() {
         std::filesystem::path exe_dir = std::filesystem::path(exe_buf).parent_path();
         roots.push_back(exe_dir.string());
         roots.push_back((exe_dir / "..").string());
+        roots.push_back((exe_dir / ".." / "tests" / "fixtures").string());
+        roots.push_back((exe_dir / ".." / "models").string());
     }
 #endif
     return roots;
+}
+
+std::string resolve_resource_path(const std::string& name_or_path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::exists(name_or_path, ec)) {
+        return name_or_path;
+    }
+    for (const auto& root : bundle_search_roots()) {
+        fs::path candidate = fs::path(root) / name_or_path;
+        if (fs::exists(candidate, ec)) {
+            return candidate.string();
+        }
+    }
+    return name_or_path;
 }
 
 std::string resolve_bundle_path(const std::string& name_or_path) {
     namespace fs = std::filesystem;
     std::error_code ec;
 
-    // Explicit path with separator
-    if (name_or_path.find('/') != std::string::npos || name_or_path.find('\\') != std::string::npos) {
-        if (bundle_loads(name_or_path)) return name_or_path;
+    // Check directly first
+    if (bundle_loads(name_or_path)) {
         return name_or_path;
     }
 

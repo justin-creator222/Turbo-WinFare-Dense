@@ -68,6 +68,18 @@ void TelemetryCollector::record_generation_step(double step_time_ms, uint32_t to
     }
 }
 
+void TelemetryCollector::record_phase_breakdown(double stream_io_ms, double gpu_wait_ms,
+                                                double lm_head_ms, double cpu_other_ms) {
+    std::lock_guard<std::mutex> lock(g_telemetry_mutex);
+    auto ema = [](double prev, double next) {
+        return (prev == 0.0) ? next : (0.8 * prev + 0.2 * next);
+    };
+    g_snapshot.stream_io_ms = ema(g_snapshot.stream_io_ms, stream_io_ms);
+    g_snapshot.gpu_wait_ms  = ema(g_snapshot.gpu_wait_ms, gpu_wait_ms);
+    g_snapshot.lm_head_ms   = ema(g_snapshot.lm_head_ms, lm_head_ms);
+    g_snapshot.cpu_other_ms = ema(g_snapshot.cpu_other_ms, cpu_other_ms);
+}
+
 void TelemetryCollector::record_io_throughput(double bytes_read, double io_time_sec) {
     std::lock_guard<std::mutex> lock(g_telemetry_mutex);
     if (io_time_sec > 0.0) {

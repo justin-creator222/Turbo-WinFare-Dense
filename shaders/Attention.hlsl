@@ -1,8 +1,13 @@
 // Grouped-query attention with sliding-window masking.
 //
-// The attention scale is 1.0, NOT 1/sqrt(head_dim) -- the query scaling is already absorbed
-// into q_norm (RealForwardRunner.swift:1404). Dividing again here is a subtle, plausible-
-// looking error that this kernel deliberately does not make.
+// The attention scale comes in as a push constant and is 1.0 for this model:
+// Gemma4TextAttention sets `self.scaling = 1.0` outright, and the config defines no
+// query_pre_attn_scalar. A round-4 change made it head_dim^-0.5 on the reasoning that q_norm
+// (a constant 1.8779) could not be absorbing the factor; the premise was right and the
+// conclusion wrong -- upstream simply does not scale here.
+//
+// It is passed in rather than baked into the kernel so it stays a property of the model, and
+// so the parity test can prove the kernel honours a non-unit value.
 //
 // One threadgroup per query head. Scores are staged in groupshared, so max context is
 // ATTN_MAX_POS.
@@ -17,7 +22,7 @@
 //
 //   gp0 = (q_heads, kv_heads, head_dim, n_pos)
 //   gp1 = (first_pos, q_off, k_off, v_off)
-//   gp2 = (out_off, kv_capacity, 0, 0)
+//   gp2 = (out_off, kv_capacity, scale_bits, 0)
 
 #include "Common.hlsli"
 
@@ -43,6 +48,7 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     const uint v_off    = gp1.w;
     const uint out_off  = gp2.x;
     const uint capacity = gp2.y;
+    const float scale   = asfloat(gp2.z);
 
     const uint h = gid.x;
     if (h >= q_heads) return;
@@ -64,8 +70,11 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
         for (uint d = 0; d < head_dim; ++d) {
             dot += f32_load(g_in0, qbase + d * 4) * f32_load(g_in1, kbase + d * 4);
         }
-        s_scores[t - first] = dot;  // scale is 1.0; staged relative to `first`
-        local_max = max(local_max, dot);
+        const float score = dot * scale;
+        s_scores[t - first] = score;   // staged relative to `first`
+        // Track the max of the SCALED score: step 2 subtracts `best` from these same values,
+        // so a max taken before scaling would shift every exponent.
+        local_max = max(local_max, score);
     }
     local_max = WaveActiveMax(local_max);
     if (WaveIsFirstLane()) s_partial[tid / lane_count] = local_max;
@@ -77,6 +86,15 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     }
     GroupMemoryBarrierWithGroupSync();
     const float best = s_partial[0];
+    // s_partial is reused below for the sum reduction. Without this barrier a fast wave can
+    // overwrite s_partial[0] with its partial sum while a slower wave is still reading `best`
+    // from it -- the group-sync above only guarantees arrival at that point, not that every
+    // thread has completed the read that follows.
+    //
+    // The race window scales with the length of the loop below, so a single-token pass
+    // (n_pos == 1) almost never hits it while multi-token generation does: the oracle diff at
+    // position 0 stayed argmax-exact while real generation degenerated into repeated tokens.
+    GroupMemoryBarrierWithGroupSync();
 
     // --- 2. exp and its sum ------------------------------------------------
     float local_sum = 0.0f;
@@ -95,6 +113,9 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     }
     GroupMemoryBarrierWithGroupSync();
     const float inv_sum = 1.0f / s_partial[0];
+    // Same hazard in the other direction: step 3 below reads s_scores across the whole group,
+    // so every thread must have taken inv_sum before any of them moves on.
+    GroupMemoryBarrierWithGroupSync();
 
     // --- 3. Weighted sum of V, parallel over the head dimension -----------
     for (uint d = tid; d < head_dim; d += ATTN_THREADS) {

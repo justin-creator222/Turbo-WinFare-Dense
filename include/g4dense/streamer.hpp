@@ -65,6 +65,13 @@ public:
     LayerPlan plan_layers(const std::vector<int>& layer_ids);
 
     // Issues asynchronous DMA reads for cache misses and waits for completion
+    // Issue the reads for a plan's misses and return immediately. Pair with await_reads()
+    // when the layer is actually needed -- that is what lets I/O overlap GPU work.
+    void issue_reads(LayerPlan& plan);
+    void await_reads(LayerPlan& plan);
+
+    // issue_reads() followed immediately by await_reads(). Convenient, but it overlaps
+    // nothing: callers on the hot path should use the two halves.
     void fetch_misses(LayerPlan& plan);
 
     // Releases and unpins slots after computation
@@ -72,6 +79,11 @@ public:
 
     // Live re-tiering: permanently pin priority layers
     void apply_tier_pinning(const std::vector<int>& pinned_layers);
+
+    // Invalidates every slot that is not permanently pinned by the active tier, so the next
+    // pass re-reads those layers from disk. Permanently pinned (resident) layers are kept --
+    // dropping them would silently change the tier the user selected.
+    void clear_cache();
 
     size_t slot_count() const { return slots_.size(); }
     uint64_t layer_bytes() const { return layer_bytes_; }

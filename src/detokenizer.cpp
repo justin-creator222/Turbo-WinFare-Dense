@@ -4,49 +4,13 @@
 
 namespace g4dense {
 
-namespace {
-
-// Length of the UTF-8 sequence starting with `lead`, or 0 if it is not a valid lead byte.
-size_t utf8_len(unsigned char lead) {
-    if (lead < 0x80) return 1;
-    if ((lead & 0xE0) == 0xC0) return 2;
-    if ((lead & 0xF0) == 0xE0) return 3;
-    if ((lead & 0xF8) == 0xF0) return 4;
-    return 0;   // continuation byte or invalid lead
-}
-
-constexpr const char* kReplacement = "\xEF\xBF\xBD";   // U+FFFD
-
-} // namespace
-
 std::string IncrementalDetokenizer::drain(bool flush_all) {
+    // Shares utf8_repair with Tokenizer::decode so the streamed and batch paths cannot drift
+    // apart. They did: this one repaired invalid sequences while batch emitted raw bytes, so
+    // the same token sequence produced different text depending on whether it was streamed.
     std::string out;
-    size_t i = 0;
-
-    while (i < pending_.size()) {
-        const unsigned char lead = static_cast<unsigned char>(pending_[i]);
-        const size_t need = utf8_len(lead);
-
-        if (need == 0) {
-            // Not a valid lead byte. Emit a replacement and resynchronize by one byte, so a
-            // single corrupt byte cannot poison the rest of the stream.
-            out += kReplacement;
-            ++i;
-            continue;
-        }
-        if (i + need > pending_.size()) {
-            // Incomplete tail. Hold it unless this is the final flush, where there will be
-            // no more bytes to complete it.
-            if (!flush_all) break;
-            out += kReplacement;
-            i = pending_.size();
-            break;
-        }
-        out.append(pending_, i, need);
-        i += need;
-    }
-
-    pending_.erase(0, i);
+    const size_t consumed = utf8_repair(pending_, flush_all, out);
+    pending_.erase(0, consumed);
     return out;
 }
 

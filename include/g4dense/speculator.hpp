@@ -26,7 +26,8 @@ public:
         const std::vector<const float*>& target_logits_per_pos,
         uint32_t vocab_size,
         const SamplingParams& sampling,
-        uint64_t base_seed
+        uint64_t base_seed,
+        const std::vector<std::vector<float>>& draft_logits = {}
     );
 
     // Cumulative telemetry metrics

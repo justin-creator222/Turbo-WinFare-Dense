@@ -73,7 +73,15 @@ void LayerStreamer::initialize(const G4DenseHeader& header) {
     slots_.reserve(slot_count_);
     for (size_t i = 0; i < slot_count_; ++i) {
         auto slot = std::make_unique<LayerSlot>();
-        slot->buffer = ctx_->allocate_buffer(layer_bytes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+        // HOST_CACHED, not merely HOST_VISIBLE. These slots are the destination of a ReadFile
+        // per streamed layer, and the first type matching HOST_VISIBLE|HOST_COHERENT on this
+        // driver is write-combined. Measured on this machine (bench_gpu section 5), reading
+        // four real layers:
+        //     write-combined  1.95 GB/s
+        //     HOST_CACHED     5.97 GB/s
+        // The GPU reads both at the same speed (~30 GB/s, bench_gpu section 3), so there is no
+        // trade here -- the uncached type was simply the wrong choice.
+        slot->buffer = ctx_->allocate_buffer(layer_bytes_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostCachedMapped);
         slot->host_ptr = slot->buffer.mapped_ptr;
         slot->event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
         slot->layer_id = -1;
@@ -191,23 +199,24 @@ void LayerStreamer::await_read(LayerSlot* slot, size_t count) {
     }
 }
 
-void LayerStreamer::fetch_misses(LayerPlan& plan) {
-    // 1. Issue all async DMA reads in parallel
+void LayerStreamer::issue_reads(LayerPlan& plan) {
     for (size_t miss_idx : plan.misses) {
         LayerSlot* slot = plan.slots[miss_idx];
-        int lid = slot->layer_id;
-        uint64_t offset = header_.layer_offsets[lid];
-        uint64_t size = header_.layer_sizes[lid];
-        issue_read(slot, offset, size);
+        const int lid = slot->layer_id;
+        issue_read(slot, header_.layer_offsets[lid], header_.layer_sizes[lid]);
     }
+}
 
-    // 2. Wait for completion
+void LayerStreamer::await_reads(LayerPlan& plan) {
     for (size_t miss_idx : plan.misses) {
         LayerSlot* slot = plan.slots[miss_idx];
-        int lid = slot->layer_id;
-        uint64_t size = header_.layer_sizes[lid];
-        await_read(slot, size);
+        await_read(slot, header_.layer_sizes[slot->layer_id]);
     }
+}
+
+void LayerStreamer::fetch_misses(LayerPlan& plan) {
+    issue_reads(plan);
+    await_reads(plan);
 }
 
 void LayerStreamer::release_plan(LayerPlan& plan) {
@@ -237,6 +246,16 @@ void LayerStreamer::apply_tier_pinning(const std::vector<int>& pinned_layers) {
             issue_read(slot, offset, size);
             await_read(slot, size);
         }
+    }
+}
+
+void LayerStreamer::clear_cache() {
+    std::lock_guard<std::mutex> guard(lock_);
+    for (auto& slot : slots_) {
+        if (slot->permanently_pinned || slot->pinned) continue;
+        slot->layer_id = -1;          // forces a miss, and therefore a re-read, next plan
+        slot->frequency = 0;
+        slot->last_used_timestamp = 0;
     }
 }
 

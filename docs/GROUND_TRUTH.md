@@ -11,7 +11,7 @@
 | **CPU** | AMD Ryzen Z1 Extreme                            (8C / 16T) |
 | **AVX-512 Support** | F=Yes, BW=Yes, VNNI=Yes, BF16=Yes |
 | **Physical RAM** | **23.81 GB usable** (25565188096 bytes) |
-| **Storage Device** | SAMSUNG MZAL81T0HDLB-00BL2 (335.3 GB free on C:) |
+| **Storage Device** | SAMSUNG MZAL81T0HDLB-00BL2 (325.3 GB free on C:) |
 | **iGPU** | AMD Radeon Graphics (Vulkan 1.4.344, Driver 8388996) |
 
 ## 2. Vulkan Memory Heaps & Shared Memory Budget
@@ -22,11 +22,20 @@
 | Heap 1 | 6708.8 MB | No | ✔ Yes | 6373.3 MB |
 | Heap 2 | 256.0 MB | ✔ Yes | ✔ Yes | 243.2 MB |
 
-- **`HOST_VISIBLE | HOST_COHERENT | DEVICE_LOCAL` Heap:** 0.25 GB
-- **General `HOST_VISIBLE` Heap (RAM):** 6.55 GB
+- **`DEVICE_LOCAL` Heap 0 (VRAM pool):** 13.10 GiB
+- **`HOST_VISIBLE` Heap 1 (System RAM pool):** 6.55 GiB
+- **`HOST_VISIBLE | DEVICE_LOCAL` Heap 2:** 0.25 GiB
 - **DXGI Shared Memory Budget:** 0.00 GB (Local Dedicated: 8098.73 MB)
 
-## 3. Subgroup Control & Cooperative Matrix
+## 3. GPU Heap Read Bandwidth & Staging Upload (R0.2)
+
+| Memory Operation | Measured Bandwidth |
+|---|---:|
+| **GPU Compute Read from Heap 0** (`DEVICE_LOCAL` 13.1 GiB pool) | **73.57 GB/s** |
+| **GPU Compute Read from Heap 1** (`HOST_VISIBLE` 6.55 GiB pool) | **65.30 GB/s** |
+| **Staging Upload (`vkCmdCopyBuffer` Heap 1 -> Heap 0)** | **26.94 GB/s** |
+
+## 4. Subgroup Control & Cooperative Matrix
 
 - **Default Subgroup Size:** 64 lanes
 - **`VK_EXT_subgroup_size_control`:** ✔ Supported (Min: 32, Max: 64)
@@ -49,22 +58,28 @@
 | 16 | 16 | 16 | INT8 | INT8 | INT32 | INT32 | Subgroup |
 | 16 | 16 | 16 | INT8 | INT8 | INT32 | INT32 | Subgroup |
 
-## 4. UMA Zero-Copy Verification
+## 5. Storage / NVMe & Warm-Cache Throughput (R0.1)
 
-- **Buffer Size:** 245 MB
-- **Execution Time:** 6.92 ms (34.56 GB/s reduction rate)
-- **Zero-Copy Checksum Match:** ✔ PASSED (CPU and GPU sums identical without flush/staging)
+### Warm OS Page-Cache Read Rates across File Sizes:
 
-## 5. Storage / NVMe Throughput
+| File Size | Chunk Size / Mode | Measured Throughput |
+|---|---|---:|
+| 256 MB File | 16 MB Chunk + `SEQUENTIAL_SCAN` | **2.73 GB/s** |
+| 1.0 GB File | 16 MB Chunk + `SEQUENTIAL_SCAN` | **5.99 GB/s** |
+| 4.0 GB File | 1 MB Chunk `ReadFile` | 6.65 GB/s |
+| 4.0 GB File | 4 MB Chunk `ReadFile` | 6.42 GB/s |
+| 4.0 GB File | 16 MB Chunk `ReadFile` | 5.28 GB/s |
+| 4.0 GB File | 16 MB Chunk + `SEQUENTIAL_SCAN` | **5.68 GB/s** |
+| 4.0 GB File | Memory Mapped (`MapViewOfFile`) | **37.15 GB/s** |
+
+### Unbuffered Direct NVMe Throughput (Hardware Limit):
 
 | Access Mode | Alignment | Queue Depth | Measured Throughput |
 |---|---|---|---:|
-| Win32 Buffered `ReadFile` (Cold Cache) | Standard | Synchronous | 6.52 GB/s |
-| Win32 Buffered `ReadFile` (Warm Page Cache) | Standard | Synchronous | **5.82 GB/s** |
-| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 1 | 2.15 GB/s |
-| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 4 | 5.73 GB/s |
-| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 8 | 5.73 GB/s |
-| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 16 | 5.75 GB/s |
-| `NO_BUFFERING` Overlapped | 16 KB Sector | QD = 8 | 5.73 GB/s |
+| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 1 | 1.87 GB/s |
+| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 4 | 3.44 GB/s |
+| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 8 | 3.54 GB/s |
+| `NO_BUFFERING` Overlapped | 4 KB Sector | QD = 16 | 2.75 GB/s |
+| `NO_BUFFERING` Overlapped | 16 KB Sector | QD = 8 | 3.61 GB/s |
 
 - **DirectStorage 1.2 Status:** dstorage.dll not found in app directory (System32 lookup expectedly absent; will use Win32 IOCP backend)

@@ -12,11 +12,24 @@
 // One wave (32 lanes) per output row. Lanes stride over the quantization groups and reduce
 // with WaveActiveSum -- SM 6.6 is required, and there is deliberately no cs_5_0 fallback
 // where that intrinsic degrades to identity.
+//
+// GEMV_ROWS_PER_GROUP waves share a threadgroup. This kernel used one wave per group, and RDNA
+// caps the number of workgroups resident per CU well below the number of waves a CU can hold,
+// so single-wave groups left most of the SIMD capacity idle and no latency hiding for a kernel
+// that is purely memory-bound. Packing several rows into one group raises occupancy without
+// changing the arithmetic: each row is still reduced by exactly one wave, so results are
+// bit-identical.
+//
+// The dispatch is (rows + GEMV_ROWS_PER_GROUP - 1) / GEMV_ROWS_PER_GROUP groups. Callers that
+// still dispatch one group per row will compute only the first 1/GEMV_ROWS_PER_GROUP of the
+// output.
 
 #include "Common.hlsli"
 
-[numthreads(WAVE_SIZE, 1, 1)]
-void main(uint3 gid : SV_GroupID, uint lane : SV_GroupIndex) {
+#define GEMV_ROWS_PER_GROUP 8
+
+[numthreads(WAVE_SIZE * GEMV_ROWS_PER_GROUP, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     const uint rows       = gp0.x;
     const uint in_dim     = gp0.y;
     const uint w_off      = gp0.z;
@@ -26,7 +39,10 @@ void main(uint3 gid : SV_GroupID, uint lane : SV_GroupIndex) {
     const uint out_off    = gp1.z;
     const uint row_base   = gp1.w;
 
-    const uint row = gid.x + row_base;
+    // tid is linear across the group, so tid / WAVE_SIZE selects the wave and tid % WAVE_SIZE
+    // is the lane within it -- exactly the mapping WaveActiveSum below reduces over.
+    const uint lane = tid % WAVE_SIZE;
+    const uint row  = gid.x * GEMV_ROWS_PER_GROUP + (tid / WAVE_SIZE) + row_base;
     if (row >= rows) return;
 
     const float partial = gemv_int4_row_lane(g_in0, w_off, g_in1, s_off, g_in2, b_off,

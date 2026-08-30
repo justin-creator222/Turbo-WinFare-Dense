@@ -60,7 +60,6 @@ def quantize_affine_int4_g64(weights: np.ndarray, group_size: int = 64):
 
     # Convert scales and biases to BF16
     def to_bf16_bytes(arr: np.ndarray) -> bytes:
-        # Float32 to BF16 (top 16 bits)
         f32_u32 = arr.astype(np.float32).view(np.uint32)
         bf16_u16 = (f32_u32 >> 16).astype(np.uint16)
         return bf16_u16.tobytes()
@@ -83,12 +82,31 @@ def make_synthetic_model(out_path: str, seed: int = 42):
     vocab_size = 1024
     sliding_window = 512
     quant_group_size = 64
-    global_layer_mask = (1 << 1) | (1 << 3)  # layers 1 and 3
+    global_layer_mask = 0
 
-    # Generate Embeddings [vocab_size, d_model]
+    def to_bf16_bytes(arr: np.ndarray) -> bytes:
+        """Quantization scales and biases. These really are BF16 in the real container."""
+        f32_u32 = arr.astype(np.float32).view(np.uint32)
+        bf16_u16 = (f32_u32 >> 16).astype(np.uint16)
+        return bf16_u16.tobytes()
+
+    def to_norm_bytes(arr: np.ndarray) -> bytes:
+        """LayerNorm-family weights: input/post_attn/pre_ffn/post_ffn norms, q_norm, k_norm,
+        the final model norm, and the per-layer scalar.
+
+        BF16, same as the scales -- every non-quantized tensor in the real MLX container is
+        BF16, exactly as its safetensors header says. A previous round wrote these as IEEE
+        FP16 here to match a reader that had been changed to decode norms as FP16; both were
+        wrong, and the fixture has to match the real container or it stops being a valid
+        stand-in.
+        """
+        return to_bf16_bytes(arr)
+
+    # Generate Embeddings [vocab_size, d_model] + Final RMSNorm [d_model]
     w_embed = np.random.randn(vocab_size, d_model).astype(np.float32) * 0.02
     embed_packed, embed_scales, embed_biases = quantize_affine_int4_g64(w_embed, quant_group_size)
-    embed_bytes = embed_packed + embed_scales + embed_biases
+    norm_final = np.ones(d_model, dtype=np.float32)
+    embed_bytes = embed_packed + embed_scales + embed_biases + to_norm_bytes(norm_final)
     embed_bytes = pad_to_alignment(embed_bytes)
 
     # Generate Layers 0..3
@@ -114,23 +132,20 @@ def make_synthetic_model(out_path: str, seed: int = 42):
         norm_post_ffn = np.ones(d_model, dtype=np.float32)
         norm_q = np.ones(head_dim, dtype=np.float32)
         norm_k = np.ones(head_dim, dtype=np.float32)
-
-        def to_bf16_bytes(arr: np.ndarray) -> bytes:
-            f32_u32 = arr.astype(np.float32).view(np.uint32)
-            bf16_u16 = (f32_u32 >> 16).astype(np.uint16)
-            return bf16_u16.tobytes()
+        layer_scalar = np.array([1.0 / np.sqrt(2.0 * num_layers)], dtype=np.float32)
 
         # Assemble Layer Payload
         ldata = bytearray()
-        # Norms first
-        ldata += to_bf16_bytes(norm_in)
-        ldata += to_bf16_bytes(norm_post_attn)
-        ldata += to_bf16_bytes(norm_pre_ffn)
-        ldata += to_bf16_bytes(norm_post_ffn)
-        ldata += to_bf16_bytes(norm_q)
-        ldata += to_bf16_bytes(norm_k)
+        # Norms + Layer Scalar
+        ldata += to_norm_bytes(norm_in)
+        ldata += to_norm_bytes(norm_post_attn)
+        ldata += to_norm_bytes(norm_pre_ffn)
+        ldata += to_norm_bytes(norm_post_ffn)
+        ldata += to_norm_bytes(norm_q)
+        ldata += to_norm_bytes(norm_k)
+        ldata += to_bf16_bytes(layer_scalar)   # genuinely BF16, not a norm weight
 
-        # Q, K, V, O
+        # Q, K, V, O, Gate, Up, Down
         for w in [w_q, w_k, w_v, w_o, w_gate, w_up, w_down]:
             p, s, b = quantize_affine_int4_g64(w, quant_group_size)
             ldata += p + s + b

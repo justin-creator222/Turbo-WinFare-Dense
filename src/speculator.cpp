@@ -4,15 +4,40 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <cstring>
+#include <random>
 
 namespace g4dense {
+
+namespace {
+
+void compute_softmax(float* logits, uint32_t n, float temp) {
+    if (temp <= 0.0f) temp = 1.0f;
+    float max_l = -1e9f;
+    for (uint32_t i = 0; i < n; ++i) {
+        logits[i] /= temp;
+        if (logits[i] > max_l) max_l = logits[i];
+    }
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n; ++i) {
+        logits[i] = std::exp(logits[i] - max_l);
+        sum += logits[i];
+    }
+    float inv = 1.0f / (sum > 1e-12f ? sum : 1.0f);
+    for (uint32_t i = 0; i < n; ++i) {
+        logits[i] *= inv;
+    }
+}
+
+} // namespace
 
 SpeculativeEvaluation SpeculativeCoordinator::evaluate_verification(
     const std::vector<uint32_t>& draft_tokens,
     const std::vector<const float*>& target_logits_per_pos,
     uint32_t vocab_size,
     const SamplingParams& sampling,
-    uint64_t base_seed
+    uint64_t base_seed,
+    const std::vector<std::vector<float>>& draft_logits
 ) {
     SpeculativeEvaluation eval{};
     eval.total_drafted = static_cast<uint32_t>(draft_tokens.size());
@@ -30,10 +55,8 @@ SpeculativeEvaluation SpeculativeCoordinator::evaluate_verification(
         const float* logits = target_logits_per_pos[i];
         uint64_t step_seed = splitmix64(base_seed + i);
 
-        // Sample target token from verification logits
-        uint32_t target_tok = sample_token(logits, vocab_size, sampling, step_seed);
-
         if (sampling.is_greedy()) {
+            uint32_t target_tok = sample_token(logits, vocab_size, sampling, step_seed);
             if (draft_tok == target_tok) {
                 eval.accepted_tokens.push_back(draft_tok);
                 accepted_count++;
@@ -45,15 +68,69 @@ SpeculativeEvaluation SpeculativeCoordinator::evaluate_verification(
                 break;
             }
         } else {
-            // Sampling mode
-            if (draft_tok == target_tok) {
-                eval.accepted_tokens.push_back(draft_tok);
-                accepted_count++;
+            // Rejection sampling using probability ratio
+            bool has_draft_probs = (i < draft_logits.size() && !draft_logits[i].empty());
+            if (has_draft_probs) {
+                // Compute softmax probabilities
+                std::vector<float> p_target(vocab_size);
+                std::memcpy(p_target.data(), logits, vocab_size * sizeof(float));
+                compute_softmax(p_target.data(), vocab_size, sampling.temperature);
+
+                std::vector<float> q_draft(vocab_size);
+                std::memcpy(q_draft.data(), draft_logits[i].data(), vocab_size * sizeof(float));
+                compute_softmax(q_draft.data(), vocab_size, sampling.temperature);
+
+                float p_val = (draft_tok < vocab_size) ? p_target[draft_tok] : 0.0f;
+                float q_val = (draft_tok < vocab_size) ? q_draft[draft_tok] : 0.0f;
+                float r = (q_val > 1e-12f) ? (p_val / q_val) : 1.0f;
+
+                std::mt19937_64 rng(step_seed);
+                std::uniform_real_distribution<float> udist(0.0f, 1.0f);
+                float u = udist(rng);
+
+                if (u <= r) {
+                    eval.accepted_tokens.push_back(draft_tok);
+                    accepted_count++;
+                } else {
+                    // Rejection: sample from (p - q)^+
+                    std::vector<float> diff(vocab_size, 0.0f);
+                    float sum_diff = 0.0f;
+                    for (uint32_t v = 0; v < vocab_size; ++v) {
+                        float d = std::max(0.0f, p_target[v] - q_draft[v]);
+                        diff[v] = d;
+                        sum_diff += d;
+                    }
+                    uint32_t corr_tok = 0;
+                    if (sum_diff > 1e-9f) {
+                        float r_val = udist(rng) * sum_diff;
+                        float acc = 0.0f;
+                        for (uint32_t v = 0; v < vocab_size; ++v) {
+                            acc += diff[v];
+                            if (acc >= r_val) {
+                                corr_tok = v;
+                                break;
+                            }
+                        }
+                    } else {
+                        corr_tok = sample_token(logits, vocab_size, sampling, step_seed);
+                    }
+
+                    eval.bonus_token = corr_tok;
+                    eval.bonus_token_sampled = true;
+                    eval.accepted_tokens.push_back(corr_tok);
+                    break;
+                }
             } else {
-                eval.bonus_token = target_tok;
-                eval.bonus_token_sampled = true;
-                eval.accepted_tokens.push_back(target_tok);
-                break;
+                uint32_t target_tok = sample_token(logits, vocab_size, sampling, step_seed);
+                if (draft_tok == target_tok) {
+                    eval.accepted_tokens.push_back(draft_tok);
+                    accepted_count++;
+                } else {
+                    eval.bonus_token = target_tok;
+                    eval.bonus_token_sampled = true;
+                    eval.accepted_tokens.push_back(target_tok);
+                    break;
+                }
             }
         }
     }

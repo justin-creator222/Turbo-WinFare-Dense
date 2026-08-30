@@ -4,6 +4,7 @@
 #include "g4dense/vk_context.hpp"
 #include "g4dense/telemetry.hpp"
 #include "g4dense/manifest.hpp"
+#include "g4dense/cpu_reference.hpp"
 
 #include <iostream>
 #include <string>
@@ -13,6 +14,7 @@
 #include <thread>
 #include <csignal>
 #include <windows.h>
+#include <shellapi.h>
 
 namespace fs = std::filesystem;
 
@@ -26,19 +28,21 @@ void print_usage() {
     std::cout << "Turbo-WinFare Dense: Gemma 4 31B Streaming Inference Engine\n\n"
               << "Usage: turbo-dense.exe [options]\n\n"
               << "Options:\n"
-              << "  --model <path>      Path to .g4dense model file or bundle directory\n"
-              << "  --tier <1|2|3|4>    Target memory tier (default: 1)\n"
-              << "  --prompt <text>     Prompt to run generation on\n"
-              << "  --max-tokens <N>    Maximum tokens to generate (default: 512)\n"
-              << "  --temp <float>      Sampling temperature (0.0 = greedy, default: 0.2)\n"
-              << "  --top-p <float>     Nucleus sampling top-p (default: 0.95)\n"
-              << "  --top-k <int>       Top-k truncation (default: 64)\n"
-              << "  --draft-k <int>     Speculative draft tokens per step (default: 4)\n"
-              << "  --no-spec           Disable speculative decoding\n"
-              << "  --server            Start OpenAI-compatible HTTP server and Web GUI\n"
-              << "  --port <port>       Server port (default: 8080)\n"
-              << "  --gui               Auto-open Web GUI in default browser\n"
-              << "  --help              Display this help message\n"
+              << "  --model <path>       Path to .g4dense model file or bundle directory\n"
+              << "  --tier <1|2|3|4>     Target memory tier (default: 1)\n"
+              << "  --prompt <text>      Prompt to run generation on\n"
+              << "  --cpu                Run pure scalar FP32 CPU reference path\n"
+              << "  --dump-tensors <dir> Dump per-stage FP32 reference tensors (--cpu only)\n"
+              << "  --max-tokens <N>     Maximum tokens to generate (default: 512)\n"
+              << "  --temp <float>       Sampling temperature (0.0 = greedy, default: 0.2)\n"
+              << "  --top-p <float>      Nucleus sampling top-p (default: 0.95)\n"
+              << "  --top-k <int>        Top-k truncation (default: 64)\n"
+              << "  --draft-k <int>      Speculative draft tokens per step (default: 4)\n"
+              << "  --no-spec            Disable speculative decoding\n"
+              << "  --server             Start OpenAI-compatible HTTP server and Web GUI\n"
+              << "  --port <port>        Server port (default: 8080)\n"
+              << "  --gui                Auto-open Web GUI in default browser\n"
+              << "  --help               Display this help message\n"
               << std::endl;
 }
 
@@ -53,6 +57,8 @@ int main(int argc, char** argv) {
     int draft_k = 4;
     bool speculative = true;
     bool run_server = false;
+    bool cpu_mode = false;
+    std::string dump_tensors_dir = "";
     uint16_t port = 8080;
     bool open_gui = false;
 
@@ -67,6 +73,10 @@ int main(int argc, char** argv) {
             tier_id = std::stoi(argv[++i]);
         } else if (arg == "--prompt" && i + 1 < argc) {
             prompt = argv[++i];
+        } else if (arg == "--cpu") {
+            cpu_mode = true;
+        } else if (arg == "--dump-tensors" && i + 1 < argc) {
+            dump_tensors_dir = argv[++i];
         } else if (arg == "--max-tokens" && i + 1 < argc) {
             max_tokens = std::stoi(argv[++i]);
         } else if (arg == "--temp" && i + 1 < argc) {
@@ -94,31 +104,84 @@ int main(int argc, char** argv) {
               << "========================================================" << std::endl;
 
     std::string resolved_path = g4dense::resolve_bundle_path(model_path);
-    if (!fs::exists(resolved_path)) {
-        // Check relative fallback
-        if (fs::exists("tests/fixtures/tiny.g4dense")) {
-            resolved_path = "tests/fixtures/tiny.g4dense";
+    if (!g4dense::bundle_loads(resolved_path)) {
+        std::string fallback = g4dense::resolve_bundle_path("tests/fixtures/tiny.g4dense");
+        if (g4dense::bundle_loads(fallback)) {
+            resolved_path = fallback;
         }
     }
 
-    if (!fs::exists(resolved_path)) {
-        std::cerr << "Error: Model file not found at " << resolved_path << std::endl;
+    if (!g4dense::bundle_loads(resolved_path)) {
+        std::cerr << "Error: Model file or valid container not found for: " << model_path << std::endl;
         return 1;
     }
 
-    // Initialize Vulkan Context
+    // Initialize Tokenizer
+    auto tok = std::make_shared<g4dense::Tokenizer>();
+    std::string tok_file = g4dense::resolve_resource_path("tokenizer.json");
+    if (!fs::exists(tok_file)) {
+        tok_file = g4dense::resolve_resource_path("tests/fixtures/tokenizer.json");
+    }
+    if (fs::exists(tok_file)) {
+        if (!tok->load_vocabulary(tok_file)) {
+            std::cerr << "Warning: Failed to parse tokenizer vocabulary at " << tok_file << std::endl;
+        }
+    } else {
+        std::cerr << "Warning: tokenizer.json not found in search paths." << std::endl;
+    }
+
+    // CPU Reference Path
+    if (cpu_mode) {
+        std::cout << "Running pure scalar CPU Reference Oracle..." << std::endl;
+        std::cout << "Loading model container: " << resolved_path << std::endl;
+        g4dense::CpuReferenceConfig cpu_cfg;
+        cpu_cfg.container_path = resolved_path;
+        cpu_cfg.dump_tensors_dir = dump_tensors_dir;
+        cpu_cfg.verbose = true;
+
+        try {
+            g4dense::CpuReferenceRunner oracle(cpu_cfg, tok);
+            oracle.initialize();
+
+            std::string gen_prompt = prompt.empty() ? "Hello! Introduce yourself." : prompt;
+            std::cout << "\nPrompt: " << gen_prompt << "\n\nResponse:\n";
+
+            g4dense::SamplingParams samp;
+            samp.temperature = temp;
+            samp.top_p = top_p;
+            samp.top_k = top_k;
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            int tok_count = 0;
+
+            oracle.generate(gen_prompt, max_tokens, samp, [&](uint32_t, const std::string& piece) {
+                std::cout << piece << std::flush;
+                tok_count++;
+                return true;
+            });
+
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double total_sec = std::chrono::duration<double>(t1 - t0).count();
+
+            std::cout << "\n\n========================================================"
+                      << "\nCPU Reference Summary:"
+                      << "\n  Tokens Generated: " << tok_count
+                      << "\n  Elapsed Time:     " << total_sec << " s"
+                      << "\n  Throughput (TPS): " << (tok_count / (total_sec > 0.0 ? total_sec : 1.0)) << " tokens/s"
+                      << "\n========================================================"
+                      << std::endl;
+            return 0;
+        } catch (const std::exception& ex) {
+            std::cerr << "CPU Reference error: " << ex.what() << std::endl;
+            return 1;
+        }
+    }
+
+    // GPU Vulkan Path
     std::cout << "Initializing Vulkan 1.3 Compute Device..." << std::endl;
     auto ctx = std::make_shared<g4dense::VulkanContext>();
     ctx->initialize();
-    std::cout << "Device: " << ctx->device_name() << " (Wave32 Subgroups)" << std::endl;
-
-    // Initialize Tokenizer
-    auto tok = std::make_shared<g4dense::Tokenizer>();
-    if (fs::exists("tests/fixtures/tokenizer.json")) {
-        tok->load_vocabulary("tests/fixtures/tokenizer.json");
-    } else {
-        tok->load_vocabulary();
-    }
+    std::cout << "Device: " << ctx->device_name() << " (Wave" << ctx->subgroup_size() << " Subgroups)" << std::endl;
 
     // Initialize Forward Runner
     std::cout << "Loading model container: " << resolved_path << std::endl;
@@ -134,8 +197,8 @@ int main(int argc, char** argv) {
         std::cout << "Web GUI available at http://127.0.0.1:" << port << "/\n" << std::endl;
 
         if (open_gui) {
-            std::string open_cmd = "start http://127.0.0.1:" + std::to_string(port);
-            system(open_cmd.c_str());
+            std::string url = "http://127.0.0.1:" + std::to_string(port);
+            ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         }
 
         signal(SIGINT, signal_handler);
@@ -181,6 +244,14 @@ int main(int argc, char** argv) {
               << "\n  Throughput (TPS): " << (tok_count / (total_sec > 0.0 ? total_sec : 1.0)) << " tokens/s"
               << "\n  RAM Footprint:    " << tele.ram_footprint_mb << " MB / " << tele.ram_total_mb << " MB"
               << "\n  Memory Tier:      Tier " << tele.active_tier_id
+              // Per-forward-pass attribution. Printed so an optimization can be credited to a
+              // phase instead of guessed at; the numbers are an EMA over the pass, so a single
+              // cold pass does not dominate them.
+              << "\n  --- per forward pass (ms) ---"
+              << "\n  Layer stream I/O: " << tele.stream_io_ms
+              << "\n  GPU queue wait:   " << tele.gpu_wait_ms
+              << "\n  LM head:          " << tele.lm_head_ms
+              << "\n  CPU other:        " << tele.cpu_other_ms
               << "\n========================================================"
               << std::endl;
 

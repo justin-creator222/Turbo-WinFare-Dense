@@ -61,10 +61,11 @@ struct G4DenseManifest {
     static G4DenseManifest from_header(const G4DenseHeader& header, const std::string& model_id = "gemma-4-31b-dense");
 };
 
-// Bundle path resolution utilities
+// Bundle and resource path resolution utilities
 std::string read_text_file(const std::string& path);
 bool bundle_loads(const std::string& path);
 std::string resolve_bundle_path(const std::string& name_or_path);
+std::string resolve_resource_path(const std::string& name_or_path);
 std::vector<std::string> bundle_search_roots();
 
 } // namespace g4dense

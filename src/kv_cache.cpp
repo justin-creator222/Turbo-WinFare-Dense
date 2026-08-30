@@ -1,6 +1,7 @@
 #include "g4dense/kv_cache.hpp"
 #include "g4dense/format.hpp"
 
+#include <cstring>
 #include <iostream>
 
 namespace g4dense {
@@ -30,8 +31,27 @@ uint32_t KVCacheManager::physical_slot(uint32_t layer_idx, uint32_t logical_pos)
     return logical_pos % cap;
 }
 
+void KVCacheManager::reset() {
+    // All KV allocations are host-visible and persistently mapped, so this is a plain memset
+    // -- no command buffer, no queue submission, no synchronization with in-flight work
+    // (callers reset between generations, never mid-pass).
+    auto zero = [](std::vector<VkMemoryAllocation>& allocs) {
+        for (auto& a : allocs) {
+            if (a.mapped_ptr && a.size_bytes > 0) {
+                std::memset(a.mapped_ptr, 0, static_cast<size_t>(a.size_bytes));
+            }
+        }
+    };
+    zero(k_allocations_);
+    zero(v_allocations_);
+    zero(scale_allocations_);
+
+    current_pos_ = 0;
+    speculative_draft_k_ = 0;
+}
+
 void KVCacheManager::initialize() {
-    uint32_t elem_size = (config_.dtype == KVDType::FP16) ? 2 : 1;
+    uint32_t elem_size = (config_.dtype == KVDType::FP32) ? 4 : ((config_.dtype == KVDType::FP16) ? 2 : 1);
     total_bytes_ = 0;
 
     k_allocations_.reserve(config_.num_layers);
@@ -40,17 +60,23 @@ void KVCacheManager::initialize() {
 
     for (uint32_t l = 0; l < config_.num_layers; ++l) {
         uint32_t cap = layer_capacity(l);
-        uint64_t tensor_bytes = static_cast<uint64_t>(cap) * config_.num_kv_heads * config_.head_dim * elem_size;
+        // Size each slot from THIS layer's geometry. Using the sliding values throughout
+        // over-allocated the full-attention layers on the 31B (16x256 for a 4x512 slot) and
+        // would under-allocate a model whose full-attention slot is the larger of the two.
+        const bool global = is_global_layer(l);
+        const uint32_t slot_kv_heads = global ? config_.global_kv_heads : config_.num_kv_heads;
+        const uint32_t slot_head_dim = global ? config_.global_head_dim : config_.head_dim;
+        uint64_t tensor_bytes = static_cast<uint64_t>(cap) * slot_kv_heads * slot_head_dim * elem_size;
 
-        VkMemoryAllocation k_alloc = ctx_->allocate_buffer(tensor_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
-        VkMemoryAllocation v_alloc = ctx_->allocate_buffer(tensor_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+        VkMemoryAllocation k_alloc = ctx_->allocate_buffer(tensor_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+        VkMemoryAllocation v_alloc = ctx_->allocate_buffer(tensor_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
         k_allocations_.push_back(k_alloc);
         v_allocations_.push_back(v_alloc);
         total_bytes_ += tensor_bytes * 2;
 
         if (config_.dtype == KVDType::INT8) {
-            uint64_t scale_bytes = static_cast<uint64_t>(cap) * config_.num_kv_heads * sizeof(uint16_t);
-            VkMemoryAllocation s_alloc = ctx_->allocate_buffer(scale_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+            uint64_t scale_bytes = static_cast<uint64_t>(cap) * slot_kv_heads * sizeof(uint16_t);
+            VkMemoryAllocation s_alloc = ctx_->allocate_buffer(scale_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
             scale_allocations_.push_back(s_alloc);
             total_bytes_ += scale_bytes;
         }

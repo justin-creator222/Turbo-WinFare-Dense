@@ -11,6 +11,8 @@ bin/
 *.o
 
 # Model weights and bundles (Strict: NEVER commit weights)
+models/
+/tokenizer.json
 *.g4dense
 *.gturbo
 *.safetensors
@@ -30,3 +32,4 @@ __pycache__/
 .idea/
 Thumbs.db
 Desktop.ini
+

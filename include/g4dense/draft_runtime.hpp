@@ -1,6 +1,7 @@
 #pragma once
 
 #include "g4dense/sampling.hpp"
+#include "g4dense/tokenizer.hpp"
 #include <vector>
 #include <string>
 #include <memory>
@@ -35,6 +36,8 @@ private:
     bool loaded_{false};
     uint32_t default_k_{6};
     int num_threads_{8}; // Zen 4 physical cores
+    std::shared_ptr<Tokenizer> tokenizer_;
+    std::unique_ptr<class CpuReferenceRunner> runner_;
 };
 
 } // namespace g4dense

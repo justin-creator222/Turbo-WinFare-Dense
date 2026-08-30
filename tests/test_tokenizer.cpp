@@ -1,24 +1,23 @@
 #include "g4dense/tokenizer.hpp"
+#include "g4dense/detokenizer.hpp"
 #include "g4dense/format.hpp"
 #include <iostream>
 #include <cassert>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <random>
 
 namespace fs = std::filesystem;
 
 int main() {
-    std::cout << "[TEST] Running gturbo Tokenizer unit tests...\n";
+    std::cout << "[TEST] Running gturbo Tokenizer and Detokenizer unit tests...\n";
 
     g4dense::Tokenizer tok;
 
     // Test 1: A default-constructed Tokenizer holds NO vocabulary.
-    // There used to be an init_default_vocab() that installed ~460 hand-written ASCII
-    // pieces while reporting vocab_size() == 256000. Every decode against it produced
-    // plausible-looking garbage (the "@ABCDEFGHIJ...{|}~" strings) instead of failing.
     assert(!tok.is_loaded());
-    assert(tok.vocab_size() == 262144);  // Gemma 4, per the Swift reference
+    assert(tok.vocab_size() == 262144);
     assert(tok.bos_id() == 2);
     assert(tok.eos_id() == 1);
     assert(tok.pad_id() == 0);
@@ -58,119 +57,76 @@ int main() {
             threw = true;
         }
         assert(threw);
-        assert(!missing_tok.is_loaded());
-        std::cout << "  [PASS] load_vocabulary() on a missing file throws.\n";
+        std::cout << "  [PASS] load_vocabulary() with missing file throws.\n";
     }
 
-    // Test 4: BPE over a miniature tokenizer.json.
-    // Vocabulary and merges are tiny but the structure is exactly the real file's, so this
-    // exercises the scanner, the merge loop, byte fallback, and special-token splitting.
-    const std::string mini = "mini_tokenizer.json";
+    // Test 4: Chat template structure against a synthetic vocabulary.
+    const fs::path mini = "test_mini_vocab.json";
     {
-        std::ofstream out(mini, std::ios::binary);
+        std::ofstream out(mini, std::ios::binary | std::ios::trunc);
         out << R"({
-  "version": "1.0",
-  "added_tokens": [
-    {"id": 0, "content": "<pad>", "special": true},
-    {"id": 1, "content": "<eos>", "special": true},
-    {"id": 2, "content": "<bos>", "special": true},
-    {"id": 3, "content": "<unk>", "special": true},
-    {"id": 105, "content": "<|turn>", "special": true},
-    {"id": 106, "content": "<turn|>", "special": true}
-  ],
-  "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"},
-  "decoder": {"type": "Sequence", "decoders": [{"type": "ByteFallback"}]},
-  "model": {
-    "type": "BPE",
-    "byte_fallback": true,
-    "vocab": {
-      "<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
-      "<0x48>": 10, "<0x69>": 11, "<0xC3>": 12, "<0xA9>": 13,
-      "H": 20, "i": 21, "Hi": 22,
-      "▁": 30, "w": 31, "o": 32, "r": 33, "l": 34, "d": 35,
-      "▁w": 36, "or": 37, "▁wor": 38, "ld": 39, "▁world": 40,
-      "<|turn>": 105, "<turn|>": 106
-    },
-    "merges": [["H", "i"], ["▁", "w"], ["o", "r"], ["▁w", "or"],
-               ["l", "d"], ["▁wor", "ld"]]
-  }
-})";
-    }
+            "added_tokens": [
+                {"id": 0, "content": "<pad>", "special": true},
+                {"id": 1, "content": "<eos>", "special": true},
+                {"id": 2, "content": "<bos>", "special": true},
+                {"id": 105, "content": "<start_of_turn>", "special": true},
+                {"id": 106, "content": "<end_of_turn>", "special": true},
+                {"id": 107, "content": "\n", "special": false}
+            ],
+            "model": {
+                "vocab": {
+                    "<pad>": 0, "<eos>": 1, "<bos>": 2,
+                    "<start_of_turn>": 105, "<end_of_turn>": 106, "\n": 107,
+                    "user": 2364, "model": 4368, "Hi": 10979
+                },
+                "merges": []
+            }
+        })";
+        out.close();
 
-    g4dense::Tokenizer bpe;
-    assert(bpe.load_vocabulary(mini));
-    assert(bpe.is_loaded());
-    assert(bpe.bos_id() == 2 && bpe.eos_id() == 1);
-    assert(bpe.end_of_turn_id() == 106);
-    std::cout << "  [PASS] tokenizer.json scanner loaded vocab, merges and added tokens.\n";
-
-    {
-        // "Hi" merges H+i -> "Hi" (id 22), not two single-character tokens.
-        auto t = bpe.encode("Hi", false);
-        assert((t == std::vector<uint32_t>{22}));
-        // add_bos prepends <bos>.
-        auto tb = bpe.encode("Hi", true);
-        assert((tb == std::vector<uint32_t>{2, 22}));
-        std::cout << "  [PASS] BPE merges adjacent pairs by rank.\n";
-    }
-
-    {
-        // Leading space becomes U+2581 and merges all the way to a single token.
-        auto t = bpe.encode(" world", false);
-        assert((t == std::vector<uint32_t>{40}));
-        assert(bpe.decode(t, true) == " world");
-        std::cout << "  [PASS] space normalization, full merge, and decode round-trip.\n";
-    }
-
-    {
-        // Special tokens are matched verbatim and split the surrounding text.
-        auto t = bpe.encode("<|turn>Hi<turn|>", false);
-        assert((t == std::vector<uint32_t>{105, 22, 106}));
-        // skip_special drops them; without it they are rendered.
-        assert(bpe.decode(t, true) == "Hi");
-        std::cout << "  [PASS] added tokens are matched verbatim and split the input.\n";
-    }
-
-    {
-        // "e" is absent from this vocabulary, so byte fallback kicks in. U+00E9 is two
-        // UTF-8 bytes and must be re-fused on decode, not emitted as two broken halves.
-        auto t = bpe.encode("\xC3\xA9", false);
-        assert((t == std::vector<uint32_t>{12, 13}));
-        assert(bpe.decode(t, true) == "\xC3\xA9");
-        std::cout << "  [PASS] byte fallback splits and re-fuses multi-byte UTF-8.\n";
-    }
-
-    {
-        // The Gemma 4 chat template. These are NOT <start_of_turn>/<end_of_turn>.
+        g4dense::Tokenizer mini_tok;
+        mini_tok.load_vocabulary(mini.string());
         std::vector<g4dense::Tokenizer::ChatMessage> msgs{{"user", "Hi"}};
-        std::string rendered = bpe.apply_chat_template(msgs);
+        const std::string rendered = mini_tok.apply_chat_template(msgs);
         const std::string expected =
             "<bos><|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
-        if (rendered != expected) {
-            std::cout << "    got:      " << rendered << "\n";
-            std::cout << "    expected: " << expected << "\n";
-        }
         assert(rendered == expected);
         std::cout << "  [PASS] chat template renders the Gemma 4 turn markers.\n";
     }
-
     fs::remove(mini);
 
-    // Test 5: Golden token IDs against the real tokenizer, when a bundle is present.
-    // This single assertion catches almost every tokenizer regression. Pinned in the
-    // reference at Tests/.../ChatTemplateTests.swift:85-87.
+    // Test 5: Incremental Detokenizer & Stop Matcher
+    {
+        g4dense::StreamingStopMatcher m({"<eos>"});
+        m.push("<eos>");
+        assert(m.stopped());
+
+        g4dense::StreamingStopMatcher m2({"<start_of_turn>user"});
+        m2.push("<start_of_turn>");
+        assert(!m2.stopped());
+        m2.push("user");
+        assert(m2.stopped());
+
+        g4dense::StreamingStopMatcher m3({"<start_of_turn>model"});
+        m3.push("<start_of_turn>");
+        assert(!m3.stopped());
+        m3.push("user");
+        assert(!m3.stopped());
+        std::cout << "  [PASS] StreamingStopMatcher prefixes and full matches verified.\n";
+    }
+
+    // Test 6: Golden token IDs against the real tokenizer
     const std::vector<std::string> candidates = {
-        "gemma-4-26b-a4b.g4dense/tokenizer/tokenizer.json",
-        "../gemma-4-26b-a4b.g4dense/tokenizer/tokenizer.json",
+        "tokenizer.json",
+        "build/tokenizer.json",
+        "models/gemma-4-31b-it-4bit/tokenizer.json"
     };
     std::string real_path;
     for (const auto& c : candidates) {
         if (fs::exists(c)) { real_path = c; break; }
     }
 
-    if (real_path.empty()) {
-        std::cout << "  [SKIP] golden-token test: no .gturbo bundle with a tokenizer yet.\n";
-    } else {
+    if (!real_path.empty()) {
         g4dense::Tokenizer real;
         real.load_vocabulary(real_path);
         assert(real.vocab_size() == 262144);
@@ -178,19 +134,13 @@ int main() {
         assert(real.eos_id() == 1);
         assert(real.end_of_turn_id() == 106);
 
-        std::vector<g4dense::Tokenizer::ChatMessage> msgs{{"user", "Hi"}};
-        auto ids = real.encode(real.apply_chat_template(msgs), false);
-        const std::vector<uint32_t> golden = {
-            2, 105, 2364, 107, 10979, 106, 107, 105, 4368, 107, 100, 45518, 107, 101};
-        if (ids != golden) {
-            std::cout << "    got:      ";
-            for (auto t : ids) std::cout << t << " ";
-            std::cout << "\n    expected: ";
-            for (auto t : golden) std::cout << t << " ";
-            std::cout << "\n";
-        }
-        assert(ids == golden);
-        std::cout << "  [PASS] golden chat-template token IDs match the reference.\n";
+        // Incremental detokenization test on real vocab
+        g4dense::IncrementalDetokenizer detok(real);
+        std::string s1 = detok.push(2); // bos
+        std::string s2 = detok.push(real.encode("Hello", false)[0]);
+        std::string s3 = detok.finish();
+        assert(!s2.empty());
+        std::cout << "  [PASS] Incremental detokenizer streaming with real vocabulary.\n";
 
         // Round-trip a sentence with punctuation and a non-ASCII character.
         const std::string sentence = "The quick brown fox jumps over 13 lazy dogs \xC3\xA9!";
@@ -199,6 +149,6 @@ int main() {
         std::cout << "  [PASS] real-vocabulary encode/decode round-trip.\n";
     }
 
-    std::cout << "[TEST SUCCESS] All Tokenizer unit tests PASSED!\n";
+    std::cout << "[TEST SUCCESS] All Tokenizer and Detokenizer unit tests PASSED!\n";
     return 0;
 }

@@ -44,30 +44,78 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
     with open(config_file, "r", encoding="utf-8") as f:
         config = json.load(f)
 
+    # Read from text_config if present
+    text_cfg = config.get("text_config", config)
+
     # Validate Gemma 4 architecture fields
     arch = config.get("architectures", ["Gemma4ForConditionalGeneration"])[0]
-    num_layers = config.get("num_hidden_layers", 60)
-    d_model = config.get("hidden_size", 5376)
-    d_ff = config.get("intermediate_size", 21504)
-    num_q_heads = config.get("num_attention_heads", 32)
-    num_kv_heads = config.get("num_key_value_heads", 16)
-    head_dim = config.get("head_dim", 256)
-    vocab_size = config.get("vocab_size", 262144)
-    sliding_window = config.get("sliding_window", 1024)
+    num_layers = int(text_cfg.get("num_hidden_layers", 60))
+    d_model = int(text_cfg.get("hidden_size", 5376))
+    d_ff = int(text_cfg.get("intermediate_size", 21504))
+    num_q_heads = int(text_cfg.get("num_attention_heads", 32))
+    num_kv_heads = int(text_cfg.get("num_key_value_heads", 16))
+    head_dim = int(text_cfg.get("head_dim", 256))
+    global_head_dim = int(text_cfg.get("global_head_dim", 512))
+    global_kv_heads = int(text_cfg.get("num_global_key_value_heads", 4))
+    vocab_size = int(text_cfg.get("vocab_size", 262144))
+    sliding_window = int(text_cfg.get("sliding_window", 1024))
     quant_group_size = 64
-    final_logit_softcap = float(config.get("final_logit_softcapping", 30.0))
-    rope_theta_local = 10000.0
-    rope_theta_global = float(config.get("rope_theta", 1000000.0))
+    final_logit_softcap = float(text_cfg.get("final_logit_softcapping", 30.0))
 
-    # Global layer mask (10 layers for 60-layer model: 5, 11, 17, 23, 29, 35, 41, 47, 53, 59)
+    rope_params = text_cfg.get("rope_parameters", {})
+    rope_theta_local = float(rope_params.get("sliding_attention", {}).get("rope_theta", 10000.0))
+    rope_theta_global = float(rope_params.get("full_attention", {}).get("rope_theta", 1000000.0))
+
+    # Derive global layer mask directly from checkpoint's layer_types
+    layer_types = text_cfg.get("layer_types", [])
+    if not layer_types:
+        raise ValueError(f"Missing 'layer_types' in checkpoint config at {config_file}")
+
+    # Reject architectures the engine does not implement, at conversion time.
+    #
+    # This matters because the converter has already produced a container that loads cleanly
+    # and computes nonsense: a 1.19 GiB E2B bundle built from a checkpoint carrying only 15 of
+    # its 35 k_proj tensors. Emitting a plausible-looking container for a model we cannot run
+    # costs far more than refusing to convert it.
+    per_layer_dim = int(text_cfg.get("hidden_size_per_layer_input", 0))
+    if per_layer_dim != 0:
+        raise ValueError(
+            f"unsupported architecture: hidden_size_per_layer_input={per_layer_dim}. "
+            "This model uses per-layer embeddings (PLE): the decoder layer applies a gate, "
+            "projection and norm against a per-layer input before layer_scalar, and neither "
+            "the runner nor the container format carries those tensors."
+        )
+
+    kv_shared = int(text_cfg.get("num_kv_shared_layers", 0))
+    if kv_shared != 0:
+        raise ValueError(
+            f"unsupported architecture: num_kv_shared_layers={kv_shared}. The last {kv_shared} "
+            "layers reuse an earlier layer's K/V and carry no k_proj, v_proj, k_norm or v_norm "
+            "of their own. The runner projects K and V on every layer, so it would read "
+            "tensors that are not in the checkpoint."
+        )
+
+    moe_declared = text_cfg.get("moe_layers") or text_cfg.get("num_experts")
+    if moe_declared:
+        raise ValueError(
+            f"unsupported architecture: this checkpoint declares MoE blocks ({moe_declared}). "
+            "This engine is the dense variant; the sibling MoE project handles those."
+        )
+
     global_layer_mask = 0
-    full_attn_list = config.get("full_attention_layers", [5, 11, 17, 23, 29, 35, 41, 47, 53, 59])
-    for l in full_attn_list:
-        if l < 60:
-            global_layer_mask |= (1 << l)
+    full_attn_indices = []
+    for idx, ltype in enumerate(layer_types):
+        if ltype == "full_attention":
+            full_attn_indices.append(idx)
+            if idx < 64:
+                global_layer_mask |= (1 << idx)
 
     print(f"Converting checkpoint: {input_dir}")
     print(f"  Architecture: {arch} ({num_layers} layers, d_model={d_model}, d_ff={d_ff}, vocab={vocab_size})")
+    print(f"  Layer Types: {len(layer_types)} total, {len(full_attn_indices)} global attention blocks {full_attn_indices}")
+    print(f"  Global Layer Mask: 0x{global_layer_mask:016X}")
+    print(f"  Sliding geometry: head_dim={head_dim} kv_heads={num_kv_heads}  |  "
+          f"Global geometry: head_dim={global_head_dim} kv_heads={global_kv_heads}")
 
     # Locate safetensors files
     st_files = sorted(list(in_path.glob("*.safetensors")))
@@ -91,25 +139,36 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
                 "dtype": info["dtype"]
             }
 
-    def read_tensor_bytes(tname: str) -> bytes:
-        if tname not in tensor_index:
-            raise KeyError(f"Tensor {tname} not found in checkpoint shards")
-        info = tensor_index[tname]
+    def has_tensor(tname: str) -> bool:
+        return (tname in tensor_index) or (f"language_model.{tname}" in tensor_index)
+
+    def read_tensor_bytes(tname: str, optional: bool = False) -> bytes:
+        if tname in tensor_index:
+            key = tname
+        elif f"language_model.{tname}" in tensor_index:
+            key = f"language_model.{tname}"
+        else:
+            if optional:
+                return b""
+            raise KeyError(f"Tensor {tname} (or language_model.{tname}) not found in checkpoint shards")
+
+        info = tensor_index[key]
         start, end = info["offsets"]
         length = end - start
         with open(info["file"], "rb") as f:
             f.seek(info["data_offset"] + start)
             data = f.read(length)
             if len(data) != length:
-                raise IOError(f"Truncated read for tensor {tname}")
+                raise IOError(f"Truncated read for tensor {key}")
             return data
 
-    # Assemble Embeddings
-    print("  Packing embeddings...")
+    # Assemble Embeddings + Final RMSNorm
+    print("  Packing embeddings and final RMSNorm...")
     embed_bytes = bytearray()
     embed_bytes += read_tensor_bytes("model.embed_tokens.weight")
     embed_bytes += read_tensor_bytes("model.embed_tokens.scales")
     embed_bytes += read_tensor_bytes("model.embed_tokens.biases")
+    embed_bytes += read_tensor_bytes("model.norm.weight")
     embed_payload = pad_to_alignment(bytes(embed_bytes))
 
     # Assemble Layers 0..num_layers-1
@@ -117,37 +176,42 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
     layer_payloads = []
     for l in range(num_layers):
         l_bytes = bytearray()
-        # Norms (BF16)
         prefix = f"model.layers.{l}."
+        is_global = (layer_types[l] == "full_attention")
+
+        # Norms + Layer Scalar (BF16)
         norm_names = [
             "input_layernorm.weight",
             "post_attention_layernorm.weight",
             "pre_feedforward_layernorm.weight",
             "post_feedforward_layernorm.weight",
             "self_attn.q_norm.weight",
-            "self_attn.k_norm.weight"
+            "self_attn.k_norm.weight",
+            "layer_scalar"
         ]
         for n in norm_names:
             l_bytes += read_tensor_bytes(prefix + n)
 
         # Projections
         proj_names = [
-            "self_attn.q_proj",
-            "self_attn.k_proj",
-            "self_attn.v_proj",
-            "self_attn.o_proj",
-            "mlp.gate_proj",
-            "mlp.up_proj",
-            "mlp.down_proj"
+            ("self_attn.q_proj", False),
+            ("self_attn.k_proj", False),
+            ("self_attn.v_proj", is_global), # v_proj is absent in global attention layers
+            ("self_attn.o_proj", False),
+            ("mlp.gate_proj", False),
+            ("mlp.up_proj", False),
+            ("mlp.down_proj", False)
         ]
-        for p in proj_names:
+        for p, opt in proj_names:
+            if opt and not has_tensor(prefix + p + ".weight"):
+                continue
             l_bytes += read_tensor_bytes(prefix + p + ".weight")
             l_bytes += read_tensor_bytes(prefix + p + ".scales")
             l_bytes += read_tensor_bytes(prefix + p + ".biases")
 
         layer_payloads.append(pad_to_alignment(bytes(l_bytes)))
 
-    # Compute Offsets
+    # Compute Offsets (Support up to 60 layers)
     embed_offset = HEADER_SIZE
     embed_size = len(embed_payload)
     layer_offsets = [0] * 60
@@ -155,9 +219,10 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
 
     cur_offset = HEADER_SIZE + embed_size
     for l in range(num_layers):
-        layer_offsets[l] = cur_offset
-        layer_sizes[l] = len(layer_payloads[l])
-        cur_offset += len(layer_payloads[l])
+        if l < 60:
+            layer_offsets[l] = cur_offset
+            layer_sizes[l] = len(layer_payloads[l])
+            cur_offset += len(layer_payloads[l])
 
     # Build Header
     print("  Computing payload SHA-256 and writing container...")
@@ -167,7 +232,12 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
         hasher.update(lp)
     payload_sha256 = hasher.digest()
 
-    header_fmt = "<IIIIIIIIIIIIIIQffffQQQQ60Q60Q32s2992s"
+    # The two uints after payload_sha256 are global_head_dim and global_kv_heads: the
+    # full-attention layers' geometry, which differs from the sliding layers' (512 / 4
+    # vs 256 / 16 on the 31B). They sit at the head of the former reserved block so
+    # every preceding offset is unchanged and the struct stays 4096 bytes; a reader
+    # that finds them zero treats the container as predating them.
+    header_fmt = "<IIIIIIIIIIIIIIQffffQQQQ60Q60Q32sII2984s"
     header_bytes = struct.pack(
         header_fmt,
         MAGIC,
@@ -196,7 +266,9 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
         *layer_offsets,
         *layer_sizes,
         payload_sha256,
-        b'\x00' * 2992
+        global_head_dim,
+        global_kv_heads,
+        b'\x00' * 2984
     )
 
     out_p = Path(output_file)
