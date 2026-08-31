@@ -52,6 +52,13 @@ struct LayerOffsetsGPU {
     uint32_t layer_scalar_off{0};
     float layer_scalar{0.089355f};
 
+    // Per-layer embeddings (E2B/E4B). Zero-width on models without them.
+    uint32_t post_ple_norm_off{0};
+    // True when this layer has no k_proj/v_proj/k_norm of its own and reads another layer's
+    // K/V cache instead.
+    bool kv_shared{false};
+    uint32_t kv_donor{0};
+
     struct ProjOffsets {
         uint32_t w_off{0};
         uint32_t s_off{0};
@@ -64,6 +71,9 @@ struct LayerOffsetsGPU {
     ProjOffsets k_proj;
     ProjOffsets v_proj;
     ProjOffsets o_proj;
+    ProjOffsets ple_gate;      // hidden -> ple_dim
+    ProjOffsets ple_proj;      // ple_dim -> hidden
+
     ProjOffsets gate_proj;
     ProjOffsets up_proj;
     ProjOffsets down_proj;
@@ -79,6 +89,16 @@ public:
     void initialize();
 
     // GPU forward pass for a single token, producing logits on host/GPU
+    // One weight pass for `batch` consecutive positions from `base_position`. `out_logits`
+    // receives the LAST position's logits. batch == 1 is the decode path and is bit-identical
+    // to the pre-batching implementation.
+    // `all_positions` writes batch * vocab_size logits instead of just the last position's.
+    // Speculative verification needs every position's distribution to decide how many drafted
+    // tokens to accept, and the LM head is batched for it -- one 756 MB weight pass for all of
+    // them rather than one per position.
+    void forward_batch(const uint32_t* token_ids, uint32_t batch, uint32_t base_position,
+                       float* out_logits, bool all_positions = false);
+
     void forward_single_token(uint32_t token_id, uint32_t position, float* out_logits);
 
     // End-to-end generation loop with token callback streaming
@@ -100,6 +120,23 @@ public:
 
     // Drops non-resident streamer slots; layers pinned by the active tier are kept.
     void clear_layer_cache() { if (streamer_) streamer_->clear_cache(); }
+
+    // Drops accumulated K/V so an independent sequence can be run from position 0. generate()
+    // does this per call; tests need it to compare a batched prefill against a sequential one.
+    void reset_kv_cache() { if (kv_cache_) kv_cache_->reset(); }
+
+    // Loads a draft model for speculative decoding, sharing this runner's Vulkan context.
+    //
+    // Deliberately explicit rather than automatic: the draft is resident alongside the target
+    // and competes for the same import budget, so whether it is worth loading is a decision
+    // with a measurable cost, not a default.
+    bool load_draft_model(const std::string& path);
+
+    // Hold back device memory from this model's layer import, so a draft model can be loaded
+    // afterwards. Must be called BEFORE initialize(): the import is greedy, and once it has
+    // taken the budget there is nothing left for a second model.
+    void set_import_reserve(uint64_t bytes) { import_reserve_bytes_ = bytes; }
+    bool has_draft() const { return draft_runtime_ && draft_runtime_->is_loaded(); }
     const G4DenseHeader& header() const { return header_; }
     TelemetrySnapshot get_latest_telemetry() const;
 
@@ -113,6 +150,7 @@ private:
 
     G4DenseHeader header_{};
     uint32_t active_tier_id_{1};
+    uint64_t import_reserve_bytes_{0};
 
     // Layers held permanently in GPU-readable memory, imported once at load
     // (VK_EXT_external_memory_host) so the forward pass never copies them again. An entry with
@@ -174,6 +212,20 @@ private:
     // forward pass, while LMHeadGreedy.hlsl sat compiled and unused. Uploading once at load
     // trades a one-time copy for that cost on every token.
     VkMemoryAllocation buf_lm_head_{};
+
+    // Per-layer embeddings (E2B/E4B). Unallocated when header_.ple_dim == 0.
+    //
+    // embed_tokens_per_layer is NOT held on the device: at 262144 x 8960 it is 1.17 GB, and
+    // only one row per token is ever needed, so it is dequantized from the mapping on the CPU
+    // exactly like the main embedding. The projection matrix is small enough to upload once.
+    VkMemoryAllocation buf_ple_w_{};       // per_layer_model_projection (weights+scales+biases)
+    VkMemoryAllocation buf_ple_norm_w_{};  // per_layer_projection_norm
+    VkMemoryAllocation buf_ple_emb_{};     // token-identity part, CPU-filled
+    VkMemoryAllocation buf_ple_{};         // combined per-layer inputs
+    VkMemoryAllocation buf_ple_g_{};       // in-layer gate scratch
+    LayerOffsetsGPU::ProjOffsets ple_model_proj_{};
+    uint64_t ple_emb_w_bytes_{0};
+    uint64_t ple_emb_s_bytes_{0};
     uint64_t lm_head_w_bytes_{0};
     uint64_t lm_head_s_bytes_{0};
 };

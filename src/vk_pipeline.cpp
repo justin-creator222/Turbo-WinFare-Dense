@@ -16,16 +16,15 @@ const char* get_kernel_spv_name(ComputeKernel kernel) {
         case ComputeKernel::EmbedLookup:    return "EmbedLookup.spv";
         case ComputeKernel::RMSNormK:       return "RMSNormK.spv";
         case ComputeKernel::GemvInt4:       return "GemvInt4.spv";
-        case ComputeKernel::GemmInt4Batch:  return "GemvInt4.spv"; // Shared kernel with batch parameter
+        case ComputeKernel::GemmInt4Batch:  return "GemmInt4Batch.spv";
         case ComputeKernel::QKVEpilogue:    return "QKVEpilogue.spv";
         case ComputeKernel::Attention:      return "Attention.spv";
         case ComputeKernel::GeGLU:          return "GeGLU.spv";
-        case ComputeKernel::PostAttn:       return "PostAttn.spv";
-        case ComputeKernel::LayerTail:      return "LayerTail.spv";
         case ComputeKernel::ResidualAccum:  return "ResidualAccum.spv";
         case ComputeKernel::Softcap:        return "Softcap.spv";
         case ComputeKernel::LMHeadGreedy:   return "LMHeadGreedy.spv";
         case ComputeKernel::ArgmaxReduce:   return "ArgmaxReduce.spv";
+        case ComputeKernel::KVWrite:        return "KVWrite.spv";
         default: return "";
     }
 }

@@ -14,6 +14,20 @@ namespace g4dense {
 // output is silently left at whatever the buffer held.
 inline constexpr uint32_t kGemvRowsPerGroup = 8;
 
+// GemmInt4Batch's blocking factors. MUST match GEMM_ROWS_PER_GROUP and GEMM_MAX_BATCH in
+// shaders/GemmInt4Batch.hlsl: the kernel clamps the batch to kGemmMaxBatch internally, so
+// passing more positions than this silently drops the extra ones rather than failing.
+inline constexpr uint32_t kGemmRowsPerGroup = 8;
+inline constexpr uint32_t kGemmMaxBatch     = 8;
+
+// Kernels the forward pass actually dispatches, plus three kept deliberately:
+//   EmbedLookup   parity-tested; the embedding is still dequantized on the CPU, which measures
+//                 ~0.1 ms of a ~1400 ms pass, so wiring it in was not worth the change.
+//   LMHeadGreedy  a fused argmax head. Unused because sampling, speculative verification and
+//                 the oracle diff all need the full distribution, not just the top token.
+//   GemvInt8      for an INT8 KV path that does not exist.
+// PostAttn and LayerTail were fused epilogues from the sibling MoE project; they were deleted
+// in round 7 after fusion measured worthless against 3.6 ms of per-token submission overhead.
 enum class ComputeKernel : uint32_t {
     EmbedLookup = 0,
     RMSNormK,
@@ -22,12 +36,11 @@ enum class ComputeKernel : uint32_t {
     QKVEpilogue,
     Attention,
     GeGLU,
-    PostAttn,
-    LayerTail,
     ResidualAccum,
     Softcap,
     LMHeadGreedy,
     ArgmaxReduce,
+    KVWrite,
     COUNT
 };
 

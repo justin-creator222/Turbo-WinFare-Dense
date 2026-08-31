@@ -14,6 +14,11 @@
 //   gp0 = (head_dim, num_heads, in_off, out_off)
 //   gp1 = (eps_bits, w_off, has_weight, do_rope)
 //   gp2 = (rotated_pairs, position, theta_bits, 0)
+//   gp3 = (in_stride_bytes, out_stride_bytes, 0, 0)
+//
+// Batched: dispatch num_heads * M groups. Group g covers position g / num_heads and head
+// g % num_heads, so each position gets its own RoPE angle. M = 1 with zero strides is
+// bit-identical to the unbatched kernel.
 
 #include "Common.hlsli"
 
@@ -36,10 +41,11 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     const float position  = float(gp2.y);
     const float theta     = asfloat(gp2.z);
 
-    const uint head = gid.x;
-    if (head >= num_heads) return;
-    const uint base_in  = in_off  + head * head_dim * 4;
-    const uint base_out = out_off + head * head_dim * 4;
+    const uint head = gid.x % num_heads;
+    const uint slot = gid.x / num_heads;          // which position in the batch
+    const float position_b = position + float(slot);
+    const uint base_in  = in_off  + slot * gp3.x + head * head_dim * 4;
+    const uint base_out = out_off + slot * gp3.y + head * head_dim * 4;
 
     // --- RMSNorm over this head's slice ---
     float acc = 0.0f;
@@ -74,7 +80,7 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
         const uint half_dim = head_dim / 2;
         for (uint p = tid; p < rotated; p += QKV_THREADS) {
             const float freq = pow(theta, -float(2u * p) / float(head_dim));
-            const float angle = position * freq;
+            const float angle = position_b * freq;
             const float c = cos(angle);
             const float s = sin(angle);
             const float x0 = s_vec[p];

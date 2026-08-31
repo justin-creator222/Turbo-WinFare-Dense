@@ -200,7 +200,10 @@ void ForwardRunner::initialize() {
             "(costs groupshared occupancy) or implement online softmax.");
     }
     kv_cfg.global_layer_mask = header_.global_layer_mask;
-    kv_cfg.dtype = KVDType::FP32;
+    // FP16 halves the cache to 1.10 GiB, which is worth about four more resident layers.
+    // KVWrite converts on the way in and Attention reads it back with f16_load; the
+    // argmax-exact oracle diff is what says the precision loss is acceptable.
+    kv_cfg.dtype = KVDType::FP16;
 
     kv_cache_ = std::make_unique<KVCacheManager>(vk_ctx_, kv_cfg);
     kv_cache_->initialize();
@@ -260,18 +263,24 @@ void ForwardRunner::compute_layer_offsets() {
         uint32_t q_heads = geo.q_heads;
         uint32_t kv_heads = geo.kv_heads;
         uint32_t d_model = header_.d_model;
-        uint32_t d_ff = header_.d_ff;
+        uint32_t d_ff = layer_ffn_width(header_, l);
 
         LayerOffsetsGPU& lo = layer_gpu_offsets_[l];
         uint32_t cur = 0;
+
+        // Must mirror tools/convert_hf_to_g4dense.py exactly. A KV-sharing layer carries no
+        // k_norm (it has no k_proj), and a PLE model appends one more norm.
+        lo.kv_shared = is_kv_shared_layer(header_, l);
+        lo.kv_donor = kv_donor_layer(header_, l);
 
         lo.in_norm_off = cur; cur += d_model * 2;
         lo.post_attn_norm_off = cur; cur += d_model * 2;
         lo.pre_ffn_norm_off = cur; cur += d_model * 2;
         lo.post_ffn_norm_off = cur; cur += d_model * 2;
         lo.q_norm_off = cur; cur += head_dim * 2;
-        lo.k_norm_off = cur; cur += head_dim * 2;
+        if (!lo.kv_shared) { lo.k_norm_off = cur; cur += head_dim * 2; }
         lo.layer_scalar_off = cur; cur += 2;
+        if (header_.ple_dim) { lo.post_ple_norm_off = cur; cur += d_model * 2; }
 
         // Read layer scalar value
         if (mapped_data_ && header_.layer_offsets[l] > 0) {
@@ -296,14 +305,23 @@ void ForwardRunner::compute_layer_offsets() {
         };
 
         setup_proj(lo.q_proj, q_heads * head_dim, d_model);
-        setup_proj(lo.k_proj, kv_heads * head_dim, d_model);
-        if (!is_global) {
-            setup_proj(lo.v_proj, kv_heads * head_dim, d_model);
+        if (!lo.kv_shared) {
+            setup_proj(lo.k_proj, kv_heads * head_dim, d_model);
+            // Full-attention layers omit v_proj only when attention_k_eq_v is set, which the
+            // 31B does and E2B does not -- so this keys off the tensor actually being present,
+            // which for the 31B is exactly the global layers.
+            if (!is_global || header_.ple_dim != 0) {
+                setup_proj(lo.v_proj, kv_heads * head_dim, d_model);
+            }
         }
         setup_proj(lo.o_proj, d_model, q_heads * head_dim);
         setup_proj(lo.gate_proj, d_ff, d_model);
         setup_proj(lo.up_proj, d_ff, d_model);
         setup_proj(lo.down_proj, d_model, d_ff);
+        if (header_.ple_dim) {
+            setup_proj(lo.ple_gate, header_.ple_dim, d_model);
+            setup_proj(lo.ple_proj, d_model, header_.ple_dim);
+        }
     }
 }
 
@@ -327,22 +345,33 @@ void ForwardRunner::allocate_gpu_resources() {
 
     // Allocate GPU activation buffers
     uint32_t d_model = header_.d_model;
+    // Widest feed-forward across layers: E2B's last 20 are twice the rest.
     uint32_t d_ff = header_.d_ff;
+    for (uint32_t i = 0; i < header_.num_layers && i < G4DenseHeader::MAX_LAYERS; ++i) {
+        d_ff = std::max(d_ff, layer_ffn_width(header_, i));
+    }
     uint32_t max_q_dim = 32 * 512;
     uint32_t max_kv_dim = 16 * 512;
 
-    buf_hidden_ = vk_ctx_->allocate_buffer(d_model * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_norm_ = vk_ctx_->allocate_buffer(d_model * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_q_ = vk_ctx_->allocate_buffer(max_q_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_k_ = vk_ctx_->allocate_buffer(max_kv_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_v_ = vk_ctx_->allocate_buffer(max_kv_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_attn_out_ = vk_ctx_->allocate_buffer(max_q_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_proj_out_ = vk_ctx_->allocate_buffer(d_model * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_gate_ = vk_ctx_->allocate_buffer(d_ff * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_up_ = vk_ctx_->allocate_buffer(d_ff * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_ffn_out_ = vk_ctx_->allocate_buffer(d_model * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    // Every per-token activation buffer is sized for a whole prefill batch, laid out
+    // [position][dim] with no padding, so a batched dispatch addresses position m at
+    // m * dim * 4 and the elementwise kernels can treat the whole thing as one n * M vector.
+    // At kGemmMaxBatch = 8 the largest of these (d_ff) is under 700 KB, so this costs nothing
+    // against a memory budget measured in gigabytes.
+    const uint32_t B = kGemmMaxBatch;
+
+    buf_hidden_ = vk_ctx_->allocate_buffer(d_model * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_norm_ = vk_ctx_->allocate_buffer(d_model * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_q_ = vk_ctx_->allocate_buffer(max_q_dim * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_k_ = vk_ctx_->allocate_buffer(max_kv_dim * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_v_ = vk_ctx_->allocate_buffer(max_kv_dim * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_attn_out_ = vk_ctx_->allocate_buffer(max_q_dim * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_proj_out_ = vk_ctx_->allocate_buffer(d_model * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_gate_ = vk_ctx_->allocate_buffer(d_ff * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_up_ = vk_ctx_->allocate_buffer(d_ff * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_ffn_out_ = vk_ctx_->allocate_buffer(d_model * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
     buf_final_norm_w_ = vk_ctx_->allocate_buffer(d_model * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-    buf_logits_ = vk_ctx_->allocate_buffer(header_.vocab_size * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    buf_logits_ = vk_ctx_->allocate_buffer(static_cast<uint64_t>(header_.vocab_size) * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
 
     // Upload the tied LM head once, so the per-token head becomes a GPU GEMV instead of a
     // scalar CPU loop. Layout in the container is [packed INT4 | BF16 scales | BF16 biases],
@@ -364,6 +393,49 @@ void ForwardRunner::allocate_gpu_resources() {
                                                 MemoryResidency::HostVisibleMapped);
         std::memcpy(buf_lm_head_.mapped_ptr, mapped_data_ + header_.lm_head_offset,
                     static_cast<size_t>(total));
+    }
+
+    // Per-layer embedding resources.
+    if (header_.ple_dim) {
+        const uint32_t ple_rows = header_.num_layers * header_.ple_dim;   // 8960 on E2B
+        const uint64_t emb_w = static_cast<uint64_t>(header_.ple_vocab) * ple_rows / 2;
+        const uint64_t emb_sb = static_cast<uint64_t>(header_.ple_vocab) * (ple_rows / 64) * 2;
+        ple_emb_w_bytes_ = emb_w;
+        ple_emb_s_bytes_ = emb_sb;
+
+        const uint64_t proj_w = static_cast<uint64_t>(ple_rows) * d_model / 2;
+        const uint64_t proj_sb = static_cast<uint64_t>(ple_rows) * (d_model / 64) * 2;
+
+        ple_model_proj_.rows = ple_rows;
+        ple_model_proj_.in_dim = d_model;
+        ple_model_proj_.w_off = 0;
+        ple_model_proj_.s_off = static_cast<uint32_t>(proj_w);
+        ple_model_proj_.b_off = static_cast<uint32_t>(proj_w + proj_sb);
+
+        buf_ple_w_ = vk_ctx_->allocate_buffer(proj_w + 2 * proj_sb,
+                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                              MemoryResidency::HostCachedMapped);
+        buf_ple_norm_w_ = vk_ctx_->allocate_buffer(header_.ple_dim * 2,
+                                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                   MemoryResidency::HostVisibleMapped);
+        buf_ple_emb_ = vk_ctx_->allocate_buffer(static_cast<uint64_t>(ple_rows) * 4 * B,
+                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                MemoryResidency::HostVisibleMapped);
+        buf_ple_ = vk_ctx_->allocate_buffer(static_cast<uint64_t>(ple_rows) * 4 * B,
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                            MemoryResidency::HostVisibleMapped);
+        buf_ple_g_ = vk_ctx_->allocate_buffer(static_cast<uint64_t>(header_.ple_dim) * 4 * B,
+                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                              MemoryResidency::HostVisibleMapped);
+
+        if (mapped_data_ && header_.ple_offset) {
+            const uint8_t* base = mapped_data_ + header_.ple_offset + emb_w + 2 * emb_sb;
+            std::memcpy(buf_ple_w_.mapped_ptr, base, static_cast<size_t>(proj_w + 2 * proj_sb));
+            std::memcpy(buf_ple_norm_w_.mapped_ptr, base + proj_w + 2 * proj_sb,
+                        header_.ple_dim * 2);
+        }
+        std::cout << "[ForwardRunner] per-layer embeddings active: ple_dim=" << header_.ple_dim
+                  << ", " << header_.num_kv_shared_layers << " KV-sharing layers." << std::endl;
     }
 
     // Copy final norm weight (BF16) into buf_final_norm_w_
@@ -402,16 +474,32 @@ void ForwardRunner::allocate_gpu_resources() {
 // the layer import has taken too much is the driver's own per-submit allocation, not the work
 // itself.
 bool ForwardRunner::can_submit_work() {
+    static bool reported = false;
+    auto note = [&](const char* stage, VkResult r) {
+        if (!reported) {
+            reported = true;
+            std::cout << "[ForwardRunner] device probe failed at " << stage
+                      << " (VkResult=" << static_cast<int>(r) << ")" << std::endl;
+        }
+        return false;
+    };
+
     VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    if (vkResetCommandBuffer(cmd_, 0) != VK_SUCCESS) return false;
-    if (vkBeginCommandBuffer(cmd_, &begin_info) != VK_SUCCESS) return false;
-    if (vkEndCommandBuffer(cmd_) != VK_SUCCESS) return false;
+    VkResult r = vkResetCommandBuffer(cmd_, 0);
+    if (r != VK_SUCCESS) return note("vkResetCommandBuffer", r);
+    r = vkBeginCommandBuffer(cmd_, &begin_info);
+    if (r != VK_SUCCESS) return note("vkBeginCommandBuffer", r);
+    r = vkEndCommandBuffer(cmd_);
+    if (r != VK_SUCCESS) return note("vkEndCommandBuffer", r);
 
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd_;
-    if (vkQueueSubmit(vk_ctx_->compute_queue(), 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) return false;
-    return vkQueueWaitIdle(vk_ctx_->compute_queue()) == VK_SUCCESS;
+    r = vkQueueSubmit(vk_ctx_->compute_queue(), 1, &si, VK_NULL_HANDLE);
+    if (r != VK_SUCCESS) return note("vkQueueSubmit", r);
+    r = vkQueueWaitIdle(vk_ctx_->compute_queue());
+    if (r != VK_SUCCESS) return note("vkQueueWaitIdle", r);
+    return true;
 }
 
 void ForwardRunner::load_resident_layers() {
@@ -436,6 +524,93 @@ void ForwardRunner::load_resident_layers() {
         return;
     }
 
+    // How much may be imported.
+    //
+    // Importing until the driver refuses does NOT work: at 8 GB UMA it accepted 58 of 60 layers
+    // (14.81 GiB) and then failed every vkQueueSubmit with VK_ERROR_OUT_OF_DEVICE_MEMORY, and
+    // freeing the imports again did not restore it. VK_EXT_memory_budget cannot warn us either
+    // -- it reported 12.69 GiB still free immediately after that import, because it does not
+    // account for imported host memory at all.
+    //
+    // So imports are budgeted as if they DID debit the heaps: take what the driver reports free
+    // once every fixed-size allocation is in place (KV cache, LM head, activations, streaming
+    // pool), keep a reserve for the driver's own per-submit working set, and import into what
+    // is left. Conservative by construction, and it self-tunes to the BIOS UMA split.
+    // Reserve held back from the heap-reported free space for the driver's own per-submit
+    // working set. 1.5 GiB was over-cautious and cost five resident layers; 512 MB leaves the
+    // driver's natural refusal (42 layers here) as the binding limit, which is the point
+    // measured to be safe.
+    constexpr uint64_t kImportReserveBytes = 512ull * 1024 * 1024;
+    const uint64_t free_at_start = vk_ctx_->available_device_memory();
+    uint64_t import_budget =
+        (vk_ctx_->has_memory_budget() && free_at_start > kImportReserveBytes)
+            ? (free_at_start - kImportReserveBytes)
+            : 0;
+
+    // ...and cap it against VISIBLE SYSTEM RAM, which is what actually binds.
+    //
+    // Imported pages are private committed memory that the driver pins, so they are spent from
+    // the OS's RAM, not from a Vulkan heap -- and exceeding what the driver can pin makes every
+    // vkQueueSubmit return VK_ERROR_OUT_OF_DEVICE_MEMORY, unrecoverably. Measured on this
+    // machine, with everything else already allocated:
+    //
+    //   BIOS UMA   visible RAM   imported     result
+    //   minimum    31.3 GiB      10.74 GiB    works   (34% of RAM)
+    //   8 GB       23.8 GiB       7.67 GiB    works   (32%)
+    //   8 GB       23.8 GiB       7.92 GiB    FAILS   (33%)
+    //   8 GB       23.8 GiB       9.71 GiB    FAILS   (41%)
+    //
+    // Crossing the limit is not a soft failure: submission returns VK_ERROR_OUT_OF_DEVICE_MEMORY
+    // and stays broken however much is freed afterwards, so the edge cannot be found safely by
+    // walking up to it -- which is why this is a static budget rather than an adaptive one.
+    //
+    // 38% is chosen so that on the configuration this runs on (minimum UMA, 31.3 GiB visible)
+    // the DRIVER's own refusal binds first, at 46 layers / 11.75 GiB / 37.5% -- a stopping point
+    // measured to be safe. It moved from 42 when the KV cache went to FP16: the driver was
+    // refusing on TOTAL device memory, of which the cache is part, so halving it bought four
+    // resident layers. The fraction is a backstop for configurations where the driver
+    // over-permits instead, as it does at 8 GB UMA: there it accepted 58 layers and then could
+    // not submit any work at all.
+    //
+    // The consequence is worth stating plainly: a SMALLER BIOS UMA carve-out allows MORE
+    // resident layers. Imported weights are pinned system RAM, not Vulkan heap memory, so
+    // giving RAM back to Windows is what buys residency -- 42 layers at minimum UMA against 26
+    // at 8 GB, i.e. 1,421 ms per forward pass against 2,428 ms.
+    //
+    // If the probe below ever fails, lower this or set G4DENSE_MAX_RESIDENT_LAYERS.
+    MEMORYSTATUSEX mem{};
+    mem.dwLength = sizeof(mem);
+    if (GlobalMemoryStatusEx(&mem)) {
+        const uint64_t ram_cap = (mem.ullTotalPhys / 100) * 38;
+        if (import_budget == 0 || ram_cap < import_budget) import_budget = ram_cap;
+    }
+
+    // Leave room for a draft model if one is going to be loaded beside this one.
+    if (import_reserve_bytes_ > 0) {
+        import_budget = (import_budget > import_reserve_bytes_)
+                            ? (import_budget - import_reserve_bytes_) : 0;
+        std::cout << "[ForwardRunner] holding back "
+                  << (import_reserve_bytes_ / (1024.0 * 1024.0 * 1024.0))
+                  << " GiB for a draft model." << std::endl;
+    }
+    if (import_budget == 0) {
+        std::cout << "[ForwardRunner] no import budget available; streaming every layer."
+                  << std::endl;
+    }
+
+    // Escape hatch for calibrating the safe import size on a given machine. The device-memory
+    // limit that actually bites here is not one Vulkan reports, so the ceiling has to be found
+    // by measurement; this is how.
+    uint32_t max_resident = header_.num_layers;
+    if (const char* env = std::getenv("G4DENSE_MAX_RESIDENT_LAYERS")) {
+        max_resident = static_cast<uint32_t>(std::max(0, std::atoi(env)));
+        // Authoritative: it must be able to raise the count as well as lower it, or it cannot
+        // be used to find where the limit actually is on a given machine.
+        import_budget = UINT64_MAX;
+        std::cout << "[ForwardRunner] G4DENSE_MAX_RESIDENT_LAYERS=" << max_resident
+                  << " (RAM budget overridden)" << std::endl;
+    }
+
     const auto t_start = std::chrono::high_resolution_clock::now();
     uint64_t resident_bytes = 0;
     bool ceiling_hit = false;
@@ -443,6 +618,11 @@ void ForwardRunner::load_resident_layers() {
     for (uint32_t l = 0; l < header_.num_layers; ++l) {
         const uint64_t sz = header_.layer_sizes[l];
         if (ceiling_hit) { streamed_layers_.push_back(l); continue; }
+        if (l >= max_resident || resident_bytes + sz > import_budget) {
+            ceiling_hit = true;
+            streamed_layers_.push_back(l);
+            continue;
+        }
 
         void* region = VirtualAlloc(nullptr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!region) { ceiling_hit = true; streamed_layers_.push_back(l); continue; }
@@ -482,86 +662,95 @@ void ForwardRunner::load_resident_layers() {
     }
     CloseHandle(fh);
 
-    // Importing until vkAllocateMemory refuses leaves the device unable to submit ANY work:
-    // 58 of 60 layers imported cleanly, then every vkQueueSubmit failed, and before submits
-    // were checked that surfaced as a forward pass reporting ~0 ms of GPU time and producing
-    // empty output.
-    //
-    // VK_EXT_memory_budget cannot bound this -- it reported 12.69 GiB free immediately after
-    // importing 14.81 GiB, because it does not account for imported host memory at all. So
-    // rather than predict the limit, test the thing that actually matters and give layers back
-    // until the device works again.
-    size_t released = 0;
-    while (!can_submit_work()) {
-        uint32_t victim = UINT32_MAX;
-        for (uint32_t l = header_.num_layers; l-- > 0;) {
-            if (resident_layer_bufs_[l].buffer != VK_NULL_HANDLE) { victim = l; break; }
-        }
-        if (victim == UINT32_MAX) break;   // nothing left to give back
-
-        void* base = resident_layer_bufs_[victim].mapped_ptr;
-        vk_ctx_->free_buffer(resident_layer_bufs_[victim]);
-        resident_layer_bufs_[victim] = VkMemoryAllocation{};
-        if (base) {
-            resident_regions_.erase(
-                std::remove(resident_regions_.begin(), resident_regions_.end(), base),
-                resident_regions_.end());
-            VirtualFree(base, 0, MEM_RELEASE);
-        }
-        resident_bytes -= header_.layer_sizes[victim];
-        streamed_layers_.insert(streamed_layers_.begin(), victim);
-        ++released;
-    }
-    if (released > 0) {
-        std::cout << "[ForwardRunner] released " << released
-                  << " imported layer(s) so the device could accept work again." << std::endl;
-    }
-
     const double secs = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - t_start).count();
     const size_t resident_count = header_.num_layers - streamed_layers_.size();
     std::cout << "[ForwardRunner] " << resident_count << " of " << header_.num_layers
               << " layers resident (" << (resident_bytes / (1024.0 * 1024.0 * 1024.0))
               << " GiB imported in " << secs << " s); " << streamed_layers_.size()
-              << " streamed per token; "
-              << (vk_ctx_->available_device_memory() / (1024.0 * 1024.0 * 1024.0))
-              << " GiB device memory free." << std::endl;
+              << " streamed per token." << std::endl;
+
+    // One check that the device can still do work. It cannot be walked back from the edge --
+    // once submission returns VK_ERROR_OUT_OF_DEVICE_MEMORY, freeing the imports does not
+    // restore it -- so this is a loud assertion that the budget above was conservative enough,
+    // not a recovery path.
+    if (!can_submit_work()) {
+        throw G4DenseFormatError(
+            "ForwardRunner: the device cannot accept work after importing " +
+            std::to_string(resident_bytes / (1024 * 1024)) +
+            " MB of layers. The import budget is too aggressive for this machine; lower the "
+            "fraction of system RAM used in load_resident_layers(), or set "
+            "G4DENSE_MAX_RESIDENT_LAYERS.");
+    }
+}
+
+bool ForwardRunner::load_draft_model(const std::string& path) {
+    if (!draft_runtime_) return false;
+    if (!std::filesystem::exists(path)) {
+        std::cout << "[ForwardRunner] no draft model at " << path
+                  << "; speculative decoding disabled." << std::endl;
+        return false;
+    }
+    try {
+        draft_runtime_->load_model(path, vk_ctx_, tokenizer_);
+        std::cout << "[ForwardRunner] draft model loaded for speculative decoding: "
+                  << path << std::endl;
+        return true;
+    } catch (const std::exception& ex) {
+        std::cout << "[ForwardRunner] draft model failed to load (" << ex.what()
+                  << "); continuing without speculation." << std::endl;
+        return false;
+    }
 }
 
 void ForwardRunner::switch_memory_tier(uint32_t tier_id) {
     active_tier_id_ = tier_id;
     pinned_layers_.clear();
 
-    // Tiers pin layers into streamer slots to avoid re-reading them. Layers already imported
-    // need no slot at all, so the tier only has a say over the ones that still stream -- and it
-    // must leave at least one slot free for the prefetch queue, or plan_layers() throws
-    // "cache thrash: all layer slots are pinned".
-    // Nothing is pinned once residency is in play, and that is not a compromise: a pinned slot
-    // still costs a 269 MB read per token, while a resident layer costs nothing. Every layer
-    // that could be held permanently already was, by load_resident_layers(). The slots that
-    // remain exist only to rotate the leftovers through, so pinning any of them would starve
-    // the prefetch queue -- with a pool of 4 and 3 pinned, plan_layers() throws "cache thrash".
-    const size_t resident_count = header_.num_layers - streamed_layers_.size();
-    if (resident_count == 0) {
-        // No import happened (extension missing, or no memory). Fall back to the tier's pins.
-        const size_t pool = streamer_ ? streamer_->slot_count() : 0;
-        const size_t budget = pool > 1 ? pool - 1 : 0;
-        size_t want = 0;
-        if (tier_id == 1) want = 6;
-        else if (tier_id == 2) want = 21;
-        else if (tier_id == 3) want = 48;
-        want = std::min(want, budget);
-        for (size_t i = 0; i < want && i < header_.num_layers; ++i) {
-            pinned_layers_.push_back(static_cast<int>(i));
-        }
-    }
-
+    // pinned_layers_ stays empty, whatever the tier says.
+    //
+    // The streaming pool is sized for the prefetch queue and nothing else: PREFETCH_DEPTH (3)
+    // reads in flight plus the one being consumed is exactly its four slots. Pinning even one
+    // of them leaves the queue unable to issue and plan_layers() throws "cache thrash". A
+    // fallback branch here pinned three when no layer was resident, which broke the
+    // stream-everything path outright.
+    //
+    // Nothing is lost: pinning was only ever a way to avoid re-reading a layer, and residency
+    // does that better -- a pinned slot still costs a 269 MB read per token, a resident layer
+    // costs nothing.
     if (streamer_) {
         streamer_->apply_tier_pinning(pinned_layers_);
     }
 }
 
 void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, float* out_logits) {
+    forward_batch(&token_id, 1, position, out_logits);
+}
+
+// One pass over the weights for `batch` consecutive positions starting at `base_position`.
+//
+// Prefill used to call forward_single_token() once per prompt token, so a 15-token prompt read
+// all 16 GB of weights 15 times -- and 19 of the 60 layers are streamed from disk, so that was
+// 15 x 859 ms of I/O alone. Running the whole prompt through one weight pass is the fix, and it
+// is worth far more than the batched GEMM itself: measured, GemmInt4Batch beats M separate
+// GemvInt4 dispatches by only 1.17x, while amortizing the streaming is a multiple of M.
+//
+// `out_logits` receives the LAST position's logits, which is all a prefill needs -- the LM head
+// is 756 MB and running it for every position would cost more than it saves.
+//
+// batch == 1 must stay bit-identical to the old single-token path; the 4-position oracle diff
+// is what enforces that.
+void ForwardRunner::forward_batch(const uint32_t* token_ids, uint32_t batch,
+                                  uint32_t base_position, float* out_logits,
+                                  bool all_positions) {
+    if (batch == 0) return;
+    if (batch > kGemmMaxBatch) {
+        throw G4DenseFormatError("ForwardRunner::forward_batch: batch " + std::to_string(batch) +
+                                 " exceeds kGemmMaxBatch (" + std::to_string(kGemmMaxBatch) + ")");
+    }
+    const uint32_t token_id = token_ids[0];
+    const uint32_t position = base_position;
+    (void)token_id; (void)position;
     // Reclaim every descriptor set from the previous pass. Sets are allocated per dispatch
     // and never freed individually, so without this the pool runs out partway through the
     // fifth or sixth token and generation dies with "failed to allocate descriptor set".
@@ -586,23 +775,159 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
     const uint16_t* embed_s = reinterpret_cast<const uint16_t*>(embed_ptr + static_cast<size_t>(vocab_size) * packed_cols * sizeof(uint32_t));
     const uint16_t* embed_b = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(embed_s) + static_cast<size_t>(vocab_size) * groups_per_row * sizeof(uint16_t));
 
-    uint32_t safe_token = token_id % vocab_size;
-    const uint32_t* token_packed = embed_w + safe_token * packed_cols;
-    const uint16_t* token_scales = embed_s + safe_token * groups_per_row;
-    const uint16_t* token_biases = embed_b + safe_token * groups_per_row;
-
+    // Embedding lookup, one row per position, written contiguously as [position][d_model].
     float* hidden_host = static_cast<float*>(buf_hidden_.mapped_ptr);
-    for (uint32_t c = 0; c < d_model; ++c) {
-        uint32_t w_idx = c / 8;
-        uint32_t n_idx = c % 8;
-        uint8_t q_val = (token_packed[w_idx] >> (n_idx * 4)) & 0x0F;
-        uint32_t g = c / 64;
-        float s = bf16_to_f32(token_scales[g]);
-        float b = bf16_to_f32(token_biases[g]);
-        hidden_host[c] = (static_cast<float>(q_val) * s + b) * scale;
+    for (uint32_t m = 0; m < batch; ++m) {
+        const uint32_t safe_token = token_ids[m] % vocab_size;
+        const uint32_t* token_packed = embed_w + safe_token * packed_cols;
+        const uint16_t* token_scales = embed_s + safe_token * groups_per_row;
+        const uint16_t* token_biases = embed_b + safe_token * groups_per_row;
+        float* dst = hidden_host + static_cast<size_t>(m) * d_model;
+        for (uint32_t c = 0; c < d_model; ++c) {
+            uint32_t w_idx = c / 8;
+            uint32_t n_idx = c % 8;
+            uint8_t q_val = (token_packed[w_idx] >> (n_idx * 4)) & 0x0F;
+            uint32_t g = c / 64;
+            float s = bf16_to_f32(token_scales[g]);
+            float b = bf16_to_f32(token_biases[g]);
+            dst[c] = (static_cast<float>(q_val) * s + b) * scale;
+        }
+    }
+
+    // Per-layer embedding precompute (E2B/E4B only). Upstream:
+    //
+    //   per_layer_inputs     = embed_tokens_per_layer(token) * sqrt(ple_dim)
+    //   per_layer_projection = per_layer_model_projection(embeds) * hidden^-0.5
+    //   per_layer_projection = per_layer_projection_norm(per_layer_projection)
+    //   combined             = (per_layer_projection + per_layer_inputs) * 2^-0.5
+    //
+    // The hidden^-0.5 scale is dropped deliberately: an RMSNorm over each ple_dim slice follows
+    // it immediately, and a uniform scalar cancels exactly there.
+    const uint32_t ple_rows = header_.ple_dim ? header_.num_layers * header_.ple_dim : 0;
+    if (header_.ple_dim && mapped_data_ && header_.ple_offset) {
+        const uint8_t* ple_base = mapped_data_ + header_.ple_offset;
+        const uint32_t* pw = reinterpret_cast<const uint32_t*>(ple_base);
+        const uint16_t* ps = reinterpret_cast<const uint16_t*>(ple_base + ple_emb_w_bytes_);
+        const uint16_t* pb = reinterpret_cast<const uint16_t*>(ple_base + ple_emb_w_bytes_ + ple_emb_s_bytes_);
+        const uint32_t ple_packed_cols = ple_rows / 8;
+        const uint32_t ple_groups = ple_rows / 64;
+        const float ple_scale = std::sqrt(static_cast<float>(header_.ple_dim));
+
+        float* dst = static_cast<float*>(buf_ple_emb_.mapped_ptr);
+        for (uint32_t m = 0; m < batch; ++m) {
+            const uint32_t tok = token_ids[m] % header_.ple_vocab;
+            const uint32_t* rw = pw + static_cast<size_t>(tok) * ple_packed_cols;
+            const uint16_t* rs = ps + static_cast<size_t>(tok) * ple_groups;
+            const uint16_t* rb = pb + static_cast<size_t>(tok) * ple_groups;
+            float* out = dst + static_cast<size_t>(m) * ple_rows;
+            for (uint32_t c = 0; c < ple_rows; ++c) {
+                const uint8_t q = (rw[c / 8] >> ((c % 8) * 4)) & 0x0F;
+                out[c] = (static_cast<float>(q) * bf16_to_f32(rs[c / 64]) +
+                          bf16_to_f32(rb[c / 64])) * ple_scale;
+            }
+        }
     }
 
     VkQueue queue = vk_ctx_->compute_queue();
+
+    // GPU half of the PLE precompute: project, normalize each ple_dim slice, combine.
+    if (header_.ple_dim) {
+        vkResetCommandBuffer(cmd_, 0);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkBeginCommandBuffer(cmd_, &bi);
+
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        // per_layer_model_projection(inputs_embeds) -> buf_ple_
+        {
+            const bool batched = (batch > 1);
+            const ComputeKernel k = batched ? ComputeKernel::GemmInt4Batch : ComputeKernel::GemvInt4;
+            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(k);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_ple_w_.buffer, 0, buf_ple_w_.size_bytes);
+            pipeline_mgr_->update_storage_buffer(ds, 1, buf_ple_w_.buffer, 0, buf_ple_w_.size_bytes);
+            pipeline_mgr_->update_storage_buffer(ds, 2, buf_ple_w_.buffer, 0, buf_ple_w_.size_bytes);
+            pipeline_mgr_->update_storage_buffer(ds, 3, buf_hidden_.buffer, 0,
+                                                 static_cast<uint64_t>(d_model) * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_ple_.buffer, 0,
+                                                 static_cast<uint64_t>(ple_rows) * 4 * batch);
+            uint32_t pc[16]{0};
+            pc[0] = ple_model_proj_.rows;
+            pc[1] = ple_model_proj_.in_dim;
+            pc[2] = ple_model_proj_.w_off;
+            pc[3] = ple_model_proj_.s_off;
+            pc[4] = ple_model_proj_.b_off;
+            if (batched) { pc[8] = batch; pc[9] = d_model * 4; pc[10] = ple_rows * 4; }
+            pipeline_mgr_->bind_kernel(cmd_, k);
+            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipeline_mgr_->get_pipeline_layout(k), 0, 1, &ds, 0, nullptr);
+            pipeline_mgr_->push_constants(cmd_, k, pc, sizeof(pc));
+            const uint32_t per_group = batched ? kGemmRowsPerGroup : kGemvRowsPerGroup;
+            pipeline_mgr_->dispatch(cmd_, (ple_model_proj_.rows + per_group - 1) / per_group, 1, 1);
+        }
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+        // per_layer_projection_norm over each ple_dim slice: one group per (position, layer).
+        {
+            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::RMSNormK);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_ple_.buffer, 0,
+                                                 static_cast<uint64_t>(ple_rows) * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 1, buf_ple_norm_w_.buffer, 0, header_.ple_dim * 2);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_ple_.buffer, 0,
+                                                 static_cast<uint64_t>(ple_rows) * 4 * batch);
+            uint32_t pc[8]{0};
+            pc[0] = header_.ple_dim;
+            pc[4] = 1;
+            float eps = 1e-6f;
+            std::memcpy(&pc[5], &eps, 4);
+            pc[6] = header_.ple_dim * 4;
+            pc[7] = header_.ple_dim * 4;
+            pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::RMSNormK);
+            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipeline_mgr_->get_pipeline_layout(ComputeKernel::RMSNormK),
+                                    0, 1, &ds, 0, nullptr);
+            pipeline_mgr_->push_constants(cmd_, ComputeKernel::RMSNormK, pc, sizeof(pc));
+            pipeline_mgr_->dispatch(cmd_, header_.num_layers * batch, 1, 1);
+        }
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+
+        // combined = (projection + token_identity) * 2^-0.5
+        {
+            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::ResidualAccum);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_ple_.buffer, 0,
+                                                 static_cast<uint64_t>(ple_rows) * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 1, buf_ple_emb_.buffer, 0,
+                                                 static_cast<uint64_t>(ple_rows) * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_ple_.buffer, 0,
+                                                 static_cast<uint64_t>(ple_rows) * 4 * batch);
+            uint32_t pc[8]{0};
+            pc[0] = ple_rows * batch;
+            float one = 1.0f;
+            float inv_sqrt2 = 0.70710678118654752f;   // per_layer_input_scale = 2^-0.5
+            std::memcpy(&pc[1], &one, 4);
+            std::memcpy(&pc[2], &inv_sqrt2, 4);
+            pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::ResidualAccum);
+            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipeline_mgr_->get_pipeline_layout(ComputeKernel::ResidualAccum),
+                                    0, 1, &ds, 0, nullptr);
+            pipeline_mgr_->push_constants(cmd_, ComputeKernel::ResidualAccum, pc, sizeof(pc));
+            pipeline_mgr_->dispatch(cmd_, (ple_rows * batch + 255) / 256, 1, 1);
+        }
+
+        vkEndCommandBuffer(cmd_);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd_;
+        const VkResult r = vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        if (r != VK_SUCCESS) {
+            throw G4DenseFormatError("ForwardRunner: PLE precompute submit failed (VkResult=" +
+                                     std::to_string(r) + ")");
+        }
+        vkQueueWaitIdle(queue);
+    }
 
     // 2. Transformer layers.
     //
@@ -680,9 +1005,9 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // A. Input RMSNorm: hidden -> norm_buf
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::RMSNormK);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4 * batch);
             pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_norm_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_norm_.buffer, 0, d_model * 4 * batch);
 
             uint32_t pc[8]{0};
             pc[0] = d_model;
@@ -697,8 +1022,11 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::RMSNormK),
                                     0, 1, &ds, 0, nullptr);
+            // One threadgroup per position; gp1.z/gp1.w are the per-position strides.
+            pc[6] = d_model * 4;
+            pc[7] = d_model * 4;
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::RMSNormK, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, 1, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, batch, 1, 1);
         }
 
         // Barrier: norm_buf ready
@@ -709,15 +1037,21 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
                              0, 1, &mem_bar, 0, nullptr, 0, nullptr);
 
         // B. Q, K, V Projections via GemvInt4
+        // Projections. At batch == 1 this is the original GemvInt4 dispatch, unchanged; above
+        // that it switches to GemmInt4Batch, which reads each weight row once for all
+        // positions. Activations are [position][dim], so the strides are just the dimensions.
         auto dispatch_gemv = [&](const LayerOffsetsGPU::ProjOffsets& p, VkBuffer in_buf, VkBuffer out_buf) {
-            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::GemvInt4);
+            const bool batched = (batch > 1);
+            const ComputeKernel k = batched ? ComputeKernel::GemmInt4Batch : ComputeKernel::GemvInt4;
+
+            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(k);
             pipeline_mgr_->update_storage_buffer(ds, 0, layer_buf, 0, layer_buf_size);
             pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
             pipeline_mgr_->update_storage_buffer(ds, 2, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 3, in_buf, 0, p.in_dim * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 6, out_buf, 0, p.rows * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 3, in_buf, 0, static_cast<uint64_t>(p.in_dim) * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 6, out_buf, 0, static_cast<uint64_t>(p.rows) * 4 * batch);
 
-            uint32_t pc[8]{0};
+            uint32_t pc[16]{0};
             pc[0] = p.rows;
             pc[1] = p.in_dim;
             pc[2] = p.w_off;
@@ -726,27 +1060,34 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             pc[5] = 0; // x_off
             pc[6] = 0; // out_off
             pc[7] = 0; // row_base
+            if (batched) {
+                pc[8]  = batch;
+                pc[9]  = p.in_dim * 4;   // x stride between positions
+                pc[10] = p.rows * 4;     // out stride between positions
+            }
 
-            pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::GemvInt4);
+            pipeline_mgr_->bind_kernel(cmd_, k);
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    pipeline_mgr_->get_pipeline_layout(ComputeKernel::GemvInt4),
-                                    0, 1, &ds, 0, nullptr);
-            pipeline_mgr_->push_constants(cmd_, ComputeKernel::GemvInt4, pc, sizeof(pc));
-            // GemvInt4 packs kGemvRowsPerGroup rows per threadgroup (see the kernel).
-            pipeline_mgr_->dispatch(cmd_, (p.rows + kGemvRowsPerGroup - 1) / kGemvRowsPerGroup, 1, 1);
+                                    pipeline_mgr_->get_pipeline_layout(k), 0, 1, &ds, 0, nullptr);
+            pipeline_mgr_->push_constants(cmd_, k, pc, sizeof(pc));
+            const uint32_t per_group = batched ? kGemmRowsPerGroup : kGemvRowsPerGroup;
+            pipeline_mgr_->dispatch(cmd_, (p.rows + per_group - 1) / per_group, 1, 1);
         };
 
+        // A KV-sharing layer has no k_proj/v_proj at all: it reads the cache its donor built.
         dispatch_gemv(lo.q_proj, buf_norm_.buffer, buf_q_.buffer);
-        dispatch_gemv(lo.k_proj, buf_norm_.buffer, buf_k_.buffer);
-        if (!is_global) {
-            dispatch_gemv(lo.v_proj, buf_norm_.buffer, buf_v_.buffer);
+        if (!lo.kv_shared) {
+            dispatch_gemv(lo.k_proj, buf_norm_.buffer, buf_k_.buffer);
+            if (lo.v_proj.rows != 0) {
+                dispatch_gemv(lo.v_proj, buf_norm_.buffer, buf_v_.buffer);
+            }
         }
 
         // Barrier: Q, K (and non-global V) Gemvs complete before Epilogues
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &mem_bar, 0, nullptr, 0, nullptr);
 
-        {
+        if (!lo.kv_shared) {
             // V norm. Upstream (Gemma4TextAttention.forward, modular_gemma4.py):
             //
             //   value_states = v_proj(x) if v_proj is not None else key_states
@@ -766,14 +1107,19 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             // a new tensor, so V never sees k_norm -- and running this block BEFORE the Q/K
             // epilogue is what keeps buf_k_ raw at this point. A round-4 change applied k_norm
             // here instead; that was wrong.
-            VkBuffer v_src = is_global ? buf_k_.buffer : buf_v_.buffer;
+            // V comes from v_proj when the layer has one, and otherwise aliases the RAW
+            // k_proj output (attention_k_eq_v). That is a property of the TENSOR being
+            // present, not of the layer being full-attention: the 31B omits v_proj on its
+            // global layers, E2B does not. Keying this off `is_global` broke E2B at layer 4,
+            // its first full-attention layer, while layers 0-3 matched to 1e-3.
+            VkBuffer v_src = (lo.v_proj.rows != 0) ? buf_v_.buffer : buf_k_.buffer;
 
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::QKVEpilogue);
-            pipeline_mgr_->update_storage_buffer(ds, 0, v_src, 0, kv_heads * head_dim * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, v_src, 0, kv_heads * head_dim * 4 * batch);
             pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_v_.buffer, 0, kv_heads * head_dim * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_v_.buffer, 0, kv_heads * head_dim * 4 * batch);
 
-            uint32_t pc[12]{0};
+            uint32_t pc[16]{0};   // gp0..gp3: the batched kernels read gp3, so it must be pushed
             pc[0] = head_dim;
             pc[1] = kv_heads;
             pc[2] = 0; // in_off (gp0.z)
@@ -788,8 +1134,10 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::QKVEpilogue),
                                     0, 1, &ds, 0, nullptr);
+            pc[12] = kv_heads * head_dim * 4;   // gp3.x: input stride per position
+            pc[13] = kv_heads * head_dim * 4;   // gp3.y: output stride per position
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::QKVEpilogue, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, kv_heads, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, kv_heads * batch, 1, 1);
 
             // On global layers this read raw buf_k_, so it must complete before the K epilogue
             // below overwrites buf_k_ with k_norm + RoPE.
@@ -801,11 +1149,11 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // Q Norm & RoPE
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::QKVEpilogue);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_q_.buffer, 0, q_heads * head_dim * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_q_.buffer, 0, q_heads * head_dim * 4 * batch);
             pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_q_.buffer, 0, q_heads * head_dim * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_q_.buffer, 0, q_heads * head_dim * 4 * batch);
 
-            uint32_t pc[12]{0};
+            uint32_t pc[16]{0};   // gp0..gp3: the batched kernels read gp3, so it must be pushed
             pc[0] = head_dim;
             pc[1] = q_heads;
             pc[2] = 0; // in_off (gp0.z)
@@ -823,18 +1171,20 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::QKVEpilogue),
                                     0, 1, &ds, 0, nullptr);
+            pc[12] = q_heads * head_dim * 4;    // gp3.x: input stride per position
+            pc[13] = q_heads * head_dim * 4;    // gp3.y: output stride per position
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::QKVEpilogue, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, q_heads, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, q_heads * batch, 1, 1);
         }
 
-        // K Norm & RoPE
-        {
+        // K Norm & RoPE -- absent on KV-sharing layers, which have no k_norm either.
+        if (!lo.kv_shared) {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::QKVEpilogue);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_k_.buffer, 0, kv_heads * head_dim * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_k_.buffer, 0, kv_heads * head_dim * 4 * batch);
             pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_k_.buffer, 0, kv_heads * head_dim * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_k_.buffer, 0, kv_heads * head_dim * 4 * batch);
 
-            uint32_t pc[12]{0};
+            uint32_t pc[16]{0};   // gp0..gp3: the batched kernels read gp3, so it must be pushed
             pc[0] = head_dim;
             pc[1] = kv_heads;
             pc[2] = 0; // in_off (gp0.z)
@@ -852,47 +1202,70 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::QKVEpilogue),
                                     0, 1, &ds, 0, nullptr);
+            pc[12] = kv_heads * head_dim * 4;   // gp3.x: input stride per position
+            pc[13] = kv_heads * head_dim * 4;   // gp3.y: output stride per position
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::QKVEpilogue, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, kv_heads, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, kv_heads * batch, 1, 1);
         }
 
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 1, &mem_bar, 0, nullptr, 0, nullptr);
 
-        // D. Append K and V into KV Cache Ring Buffer
+        // D. Append K and V into the KV cache ring, one slot per position in the batch.
+        //
+        // Separate copies rather than one contiguous copy: the ring wraps at kv_cap, so a batch
+        // straddling the wrap point is not contiguous in the destination.
         uint32_t kv_cap = kv_cache_->layer_capacity(l);
-        uint32_t slot_idx = position % kv_cap;
-        uint64_t kv_stride = static_cast<uint64_t>(kv_heads) * head_dim * 4;
-        uint64_t kv_dst_offset = static_cast<uint64_t>(slot_idx) * kv_stride;
+        const uint32_t kv_n = kv_heads * head_dim;              // elements per position
+        const uint64_t kv_src_stride = static_cast<uint64_t>(kv_n) * 4;   // FP32 scratch
+        const uint64_t kv_stride = static_cast<uint64_t>(kv_n) * 2;       // FP16 cache slot
 
-        VkBufferCopy copy_k{};
-        copy_k.srcOffset = 0;
-        copy_k.dstOffset = kv_dst_offset;
-        copy_k.size = kv_stride;
-        vkCmdCopyBuffer(cmd_, buf_k_.buffer, kv_cache_->k_buffer(l), 1, &copy_k);
+        if (!lo.kv_shared) {
+            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::KVWrite);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_k_.buffer, 0, kv_src_stride * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 1, buf_v_.buffer, 0, kv_src_stride * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 6, kv_cache_->k_buffer(l), 0,
+                                                 static_cast<uint64_t>(kv_cap) * kv_stride);
+            pipeline_mgr_->update_storage_buffer(ds, 7, kv_cache_->v_buffer(l), 0,
+                                                 static_cast<uint64_t>(kv_cap) * kv_stride);
 
-        VkBufferCopy copy_v{};
-        copy_v.srcOffset = 0;
-        copy_v.dstOffset = kv_dst_offset;
-        copy_v.size = kv_stride;
-        vkCmdCopyBuffer(cmd_, buf_v_.buffer, kv_cache_->v_buffer(l), 1, &copy_v);
+            uint32_t pc[8]{0};
+            pc[0] = kv_n;
+            pc[1] = batch;
+            pc[2] = base_position;
+            pc[3] = kv_cap;
+            pc[4] = static_cast<uint32_t>(kv_src_stride);
+            pc[5] = static_cast<uint32_t>(kv_stride);
 
+            pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::KVWrite);
+            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipeline_mgr_->get_pipeline_layout(ComputeKernel::KVWrite),
+                                    0, 1, &ds, 0, nullptr);
+            pipeline_mgr_->push_constants(cmd_, ComputeKernel::KVWrite, pc, sizeof(pc));
+            const uint32_t kvw_total = (kv_n / 2) * batch;
+            pipeline_mgr_->dispatch(cmd_, (kvw_total + 255) / 256, 1, 1);
+        }
+
+        // KVWrite is a compute dispatch now, not a copy, so this is a shader-write barrier.
         VkMemoryBarrier xfer_bar{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        xfer_bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        xfer_bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         xfer_bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &xfer_bar, 0, nullptr, 0, nullptr);
 
         // E. Attention
         uint32_t first_pos = (position >= kv_cap && !is_global) ? (position - kv_cap + 1) : 0;
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::Attention);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_q_.buffer, 0, q_heads * head_dim * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 1, kv_cache_->k_buffer(l), 0, static_cast<uint64_t>(kv_cap) * kv_stride);
-            pipeline_mgr_->update_storage_buffer(ds, 2, kv_cache_->v_buffer(l), 0, static_cast<uint64_t>(kv_cap) * kv_stride);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_attn_out_.buffer, 0, q_heads * head_dim * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_q_.buffer, 0, q_heads * head_dim * 4 * batch);
+            // Shared layers read the donor layer's cache. Donor type always matches, so the
+            // geometry and capacity line up and nothing has to be copied.
+            const uint32_t kv_src = lo.kv_donor;
+            pipeline_mgr_->update_storage_buffer(ds, 1, kv_cache_->k_buffer(kv_src), 0, static_cast<uint64_t>(kv_cap) * kv_stride);
+            pipeline_mgr_->update_storage_buffer(ds, 2, kv_cache_->v_buffer(kv_src), 0, static_cast<uint64_t>(kv_cap) * kv_stride);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_attn_out_.buffer, 0, q_heads * head_dim * 4 * batch);
 
-            uint32_t pc[12]{0};
+            uint32_t pc[16]{0};   // gp0..gp3: the batched kernels read gp3, so it must be pushed
             pc[0] = q_heads;
             pc[1] = kv_heads;
             pc[2] = head_dim;
@@ -914,8 +1287,14 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::Attention),
                                     0, 1, &ds, 0, nullptr);
+            pc[12] = batch;                       // gp3.x
+            pc[13] = q_heads * head_dim * 4;      // gp3.y: query stride per position
+            pc[14] = q_heads * head_dim * 4;      // gp3.z: output stride per position
+            // gp3.w: the sliding window, so each query in the batch can compute its own causal
+            // start. Zero on full-attention layers, which see everything.
+            pc[15] = is_global ? 0u : kv_cap;
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::Attention, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, q_heads, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, q_heads * batch, 1, 1);
         }
 
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -930,9 +1309,9 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // G. Post-Attn Norm: proj_out -> proj_out
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::RMSNormK);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_proj_out_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_proj_out_.buffer, 0, d_model * 4 * batch);
             pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_proj_out_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_proj_out_.buffer, 0, d_model * 4 * batch);
 
             uint32_t pc[8]{0};
             pc[0] = d_model;
@@ -947,8 +1326,11 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::RMSNormK),
                                     0, 1, &ds, 0, nullptr);
+            // One threadgroup per position; gp1.z/gp1.w are the per-position strides.
+            pc[6] = d_model * 4;
+            pc[7] = d_model * 4;
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::RMSNormK, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, 1, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, batch, 1, 1);
         }
 
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -957,12 +1339,12 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // H. Residual Addition: hidden = hidden + attn_out   (unscaled)
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::ResidualAccum);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 1, buf_proj_out_.buffer, 0, d_model * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_hidden_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 1, buf_proj_out_.buffer, 0, d_model * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_hidden_.buffer, 0, d_model * 4 * batch);
 
             uint32_t pc[8]{0};
-            pc[0] = d_model;
+            pc[0] = d_model * batch;
             float res_scale = 1.0f;
             std::memcpy(&pc[1], &res_scale, 4);   // res_scale
             float attn_out_scale = 1.0f;          // layer_scalar is applied once, at layer end
@@ -973,7 +1355,7 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::ResidualAccum),
                                     0, 1, &ds, 0, nullptr);
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::ResidualAccum, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, (d_model + 255) / 256, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, (d_model * batch + 255) / 256, 1, 1);
         }
 
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -982,9 +1364,9 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // I. Pre-FFN Norm: hidden -> norm_buf
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::RMSNormK);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4 * batch);
             pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_norm_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_norm_.buffer, 0, d_model * 4 * batch);
 
             uint32_t pc[8]{0};
             pc[0] = d_model;
@@ -999,8 +1381,11 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::RMSNormK),
                                     0, 1, &ds, 0, nullptr);
+            // One threadgroup per position; gp1.z/gp1.w are the per-position strides.
+            pc[6] = d_model * 4;
+            pc[7] = d_model * 4;
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::RMSNormK, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, 1, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, batch, 1, 1);
         }
 
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1016,19 +1401,19 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // K. GeGLU
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::GeGLU);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_gate_.buffer, 0, header_.d_ff * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 1, buf_up_.buffer, 0, header_.d_ff * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_gate_.buffer, 0, header_.d_ff * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_gate_.buffer, 0, lo.gate_proj.rows * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 1, buf_up_.buffer, 0, lo.gate_proj.rows * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_gate_.buffer, 0, lo.gate_proj.rows * 4 * batch);
 
             uint32_t pc[8]{0};
-            pc[0] = header_.d_ff;
+            pc[0] = lo.gate_proj.rows * batch;
 
             pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::GeGLU);
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::GeGLU),
                                     0, 1, &ds, 0, nullptr);
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::GeGLU, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, (header_.d_ff + 255) / 256, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, (lo.gate_proj.rows * batch + 255) / 256, 1, 1);
         }
 
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1043,9 +1428,9 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // M. Post-FFN Norm: ffn_out -> ffn_out
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::RMSNormK);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_ffn_out_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_ffn_out_.buffer, 0, d_model * 4 * batch);
             pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_ffn_out_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_ffn_out_.buffer, 0, d_model * 4 * batch);
 
             uint32_t pc[8]{0};
             pc[0] = d_model;
@@ -1060,8 +1445,11 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::RMSNormK),
                                     0, 1, &ds, 0, nullptr);
+            // One threadgroup per position; gp1.z/gp1.w are the per-position strides.
+            pc[6] = d_model * 4;
+            pc[7] = d_model * 4;
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::RMSNormK, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, 1, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, batch, 1, 1);
         }
 
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1070,26 +1458,121 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // M. Residual Addition: hidden = (hidden + ffn_out) * layer_scalar   (layer end)
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::ResidualAccum);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 1, buf_ffn_out_.buffer, 0, d_model * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_hidden_.buffer, 0, d_model * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 1, buf_ffn_out_.buffer, 0, d_model * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_hidden_.buffer, 0, d_model * 4 * batch);
 
             uint32_t pc[8]{0};
-            pc[0] = d_model;
+            pc[0] = d_model * batch;
             float res_scale = 1.0f;
             std::memcpy(&pc[1], &res_scale, 4);   // res_scale
             // out_scale carries layer_scalar: upstream does `hidden_states *= self.layer_scalar`
-            // once at the END of the decoder layer. The per-layer-input block that would sit
-            // between this add and that multiply is absent here (hidden_size_per_layer_input
-            // == 0 on the 31B), so folding it into this add is exact.
-            std::memcpy(&pc[2], &layer_scalar, 4);
+            // once at the END of the decoder layer. Folding it into this add is exact ONLY
+            // when the per-layer-input block is absent -- on a PLE model that block sits
+            // between the two, so there the scale moves to its residual add instead.
+            const float ffn_out_scale = header_.ple_dim ? 1.0f : layer_scalar;
+            std::memcpy(&pc[2], &ffn_out_scale, 4);
 
             pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::ResidualAccum);
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::ResidualAccum),
                                     0, 1, &ds, 0, nullptr);
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::ResidualAccum, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, (d_model + 255) / 256, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, (d_model * batch + 255) / 256, 1, 1);
+        }
+
+        // N. Per-layer input block (E2B/E4B). Upstream, after the FFN residual add and before
+        // layer_scalar:
+        //
+        //   residual = h
+        //   h = per_layer_input_gate(h);  h = gelu(h);  h = h * per_layer_input[l]
+        //   h = per_layer_projection(h);  h = post_per_layer_input_norm(h)
+        //   h = residual + h
+        //
+        // gelu(gate) * per_layer_input is exactly what GeGLU computes, so no new kernel is
+        // needed -- the combined tensor is passed as its `up` operand, strided by layer.
+        if (header_.ple_dim) {
+            vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_bar, 0, nullptr, 0, nullptr);
+
+            dispatch_gemv(lo.ple_gate, buf_hidden_.buffer, buf_ple_g_.buffer);
+
+            vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_bar, 0, nullptr, 0, nullptr);
+
+            {
+                VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::GeGLU);
+                pipeline_mgr_->update_storage_buffer(ds, 0, buf_ple_g_.buffer, 0,
+                                                     static_cast<uint64_t>(header_.ple_dim) * 4 * batch);
+                pipeline_mgr_->update_storage_buffer(ds, 1, buf_ple_.buffer, 0,
+                                                     static_cast<uint64_t>(ple_rows) * 4 * batch);
+                pipeline_mgr_->update_storage_buffer(ds, 6, buf_ple_g_.buffer, 0,
+                                                     static_cast<uint64_t>(header_.ple_dim) * 4 * batch);
+                uint32_t pc[8]{0};
+                pc[0] = header_.ple_dim;
+                pc[2] = l * header_.ple_dim * 4;      // this layer's slice of `combined`
+                pc[4] = batch;
+                pc[5] = header_.ple_dim * 4;          // gate stride per position
+                pc[6] = ple_rows * 4;                 // combined stride per position
+                pc[7] = header_.ple_dim * 4;          // out stride per position
+                pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::GeGLU);
+                vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        pipeline_mgr_->get_pipeline_layout(ComputeKernel::GeGLU),
+                                        0, 1, &ds, 0, nullptr);
+                pipeline_mgr_->push_constants(cmd_, ComputeKernel::GeGLU, pc, sizeof(pc));
+                pipeline_mgr_->dispatch(cmd_, (header_.ple_dim * batch + 255) / 256, 1, 1);
+            }
+
+            vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_bar, 0, nullptr, 0, nullptr);
+
+            dispatch_gemv(lo.ple_proj, buf_ple_g_.buffer, buf_ffn_out_.buffer);
+
+            vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_bar, 0, nullptr, 0, nullptr);
+
+            {
+                VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::RMSNormK);
+                pipeline_mgr_->update_storage_buffer(ds, 0, buf_ffn_out_.buffer, 0, d_model * 4 * batch);
+                pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
+                pipeline_mgr_->update_storage_buffer(ds, 6, buf_ffn_out_.buffer, 0, d_model * 4 * batch);
+                uint32_t pc[8]{0};
+                pc[0] = d_model;
+                pc[2] = lo.post_ple_norm_off;
+                pc[4] = 1;
+                float eps = 1e-6f;
+                std::memcpy(&pc[5], &eps, 4);
+                pc[6] = d_model * 4;
+                pc[7] = d_model * 4;
+                pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::RMSNormK);
+                vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        pipeline_mgr_->get_pipeline_layout(ComputeKernel::RMSNormK),
+                                        0, 1, &ds, 0, nullptr);
+                pipeline_mgr_->push_constants(cmd_, ComputeKernel::RMSNormK, pc, sizeof(pc));
+                pipeline_mgr_->dispatch(cmd_, batch, 1, 1);
+            }
+
+            vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_bar, 0, nullptr, 0, nullptr);
+
+            {
+                VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::ResidualAccum);
+                pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4 * batch);
+                pipeline_mgr_->update_storage_buffer(ds, 1, buf_ffn_out_.buffer, 0, d_model * 4 * batch);
+                pipeline_mgr_->update_storage_buffer(ds, 6, buf_hidden_.buffer, 0, d_model * 4 * batch);
+                uint32_t pc[8]{0};
+                pc[0] = d_model * batch;
+                float one = 1.0f;
+                std::memcpy(&pc[1], &one, 4);
+                // layer_scalar lands here on a PLE model -- this add is the end of the layer.
+                std::memcpy(&pc[2], &layer_scalar, 4);
+                pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::ResidualAccum);
+                vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        pipeline_mgr_->get_pipeline_layout(ComputeKernel::ResidualAccum),
+                                        0, 1, &ds, 0, nullptr);
+                pipeline_mgr_->push_constants(cmd_, ComputeKernel::ResidualAccum, pc, sizeof(pc));
+                pipeline_mgr_->dispatch(cmd_, (d_model * batch + 255) / 256, 1, 1);
+            }
         }
 
         vkEndCommandBuffer(cmd_);
@@ -1123,10 +1606,16 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // position says which layer first goes wrong.
         if (const char* dump_dir = std::getenv("G4DENSE_GPU_DUMP_DIR")) {
             std::filesystem::create_directories(dump_dir);
-            const std::string name = std::string(dump_dir) + "/gpu_token" + std::to_string(position) +
-                                     "_layer" + std::to_string(l) + "_hidden.bin";
-            std::ofstream f(name, std::ios::binary);
-            f.write(static_cast<const char*>(buf_hidden_.mapped_ptr), d_model * 4);
+            // One file per position in the batch, so a batched pass can be diffed against the
+            // CPU oracle's per-position dumps layer by layer.
+            const char* hp = static_cast<const char*>(buf_hidden_.mapped_ptr);
+            for (uint32_t m = 0; m < batch; ++m) {
+                const std::string name = std::string(dump_dir) + "/gpu_token" +
+                                         std::to_string(base_position + m) + "_layer" +
+                                         std::to_string(l) + "_hidden.bin";
+                std::ofstream f(name, std::ios::binary);
+                f.write(hp + static_cast<size_t>(m) * d_model * 4, d_model * 4);
+            }
         }
 
         if (active_plan) {
@@ -1142,13 +1631,16 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         vkBeginCommandBuffer(cmd_, &begin_info);
 
         VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::RMSNormK);
-        pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4);
+        pipeline_mgr_->update_storage_buffer(ds, 0, buf_hidden_.buffer, 0, d_model * 4 * batch);
         pipeline_mgr_->update_storage_buffer(ds, 1, buf_final_norm_w_.buffer, 0, d_model * 2);
-        pipeline_mgr_->update_storage_buffer(ds, 6, buf_norm_.buffer, 0, d_model * 4);
+        pipeline_mgr_->update_storage_buffer(ds, 6, buf_norm_.buffer, 0, d_model * 4 * batch);
 
+        // Normally only the LAST position's hidden state is normed and sent to the LM head:
+        // prefill only needs the logits that follow the prompt, and the head is a 756 MB read.
+        // Speculative verification is the exception -- it needs every position.
         uint32_t pc[8]{0};
         pc[0] = d_model;
-        pc[1] = 0; // x_off
+        pc[1] = all_positions ? 0u : (batch - 1) * d_model * 4; // x_off
         pc[2] = 0; // w_off
         pc[3] = 0; // out_off
         pc[4] = 1; // has_weight
@@ -1159,8 +1651,9 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipeline_mgr_->get_pipeline_layout(ComputeKernel::RMSNormK),
                                 0, 1, &ds, 0, nullptr);
+        if (all_positions) { pc[6] = d_model * 4; pc[7] = d_model * 4; }
         pipeline_mgr_->push_constants(cmd_, ComputeKernel::RMSNormK, pc, sizeof(pc));
-        pipeline_mgr_->dispatch(cmd_, 1, 1, 1);
+        pipeline_mgr_->dispatch(cmd_, all_positions ? batch : 1, 1, 1);
 
         vkEndCommandBuffer(cmd_);
 
@@ -1202,27 +1695,39 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
 
         // 4a. logits[v] = dot(lm_head_row_v, normed_hidden)
         {
-            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::GemvInt4);
+            // Batched when every position's logits are wanted: the head is 756 MB, so running
+            // it once per position would cost more than the layers did.
+            const uint32_t lm_batch = all_positions ? batch : 1u;
+            const bool lm_batched = (lm_batch > 1);
+            const ComputeKernel lmk = lm_batched ? ComputeKernel::GemmInt4Batch : ComputeKernel::GemvInt4;
+
+            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(lmk);
             pipeline_mgr_->update_storage_buffer(ds, 0, buf_lm_head_.buffer, 0, lm_head_w_bytes_);
             pipeline_mgr_->update_storage_buffer(ds, 1, buf_lm_head_.buffer,
                                                  lm_head_w_bytes_, lm_head_s_bytes_);
             pipeline_mgr_->update_storage_buffer(ds, 2, buf_lm_head_.buffer,
                                                  lm_head_w_bytes_ + lm_head_s_bytes_, lm_head_s_bytes_);
-            pipeline_mgr_->update_storage_buffer(ds, 3, buf_norm_.buffer, 0, d_model * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_logits_.buffer, 0, vocab_size * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 3, buf_norm_.buffer, 0,
+                                                 static_cast<uint64_t>(d_model) * 4 * lm_batch);
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_logits_.buffer, 0,
+                                                 static_cast<uint64_t>(vocab_size) * 4 * lm_batch);
 
             // Byte offsets are all zero: each binding is already a sub-range view.
-            uint32_t pc[8]{0};
+            uint32_t pc[16]{0};
             pc[0] = vocab_size;   // rows
             pc[1] = d_model;      // in_dim
+            if (lm_batched) {
+                pc[8]  = lm_batch;
+                pc[9]  = d_model * 4;
+                pc[10] = vocab_size * 4;
+            }
 
-            pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::GemvInt4);
+            pipeline_mgr_->bind_kernel(cmd_, lmk);
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    pipeline_mgr_->get_pipeline_layout(ComputeKernel::GemvInt4),
-                                    0, 1, &ds, 0, nullptr);
-            pipeline_mgr_->push_constants(cmd_, ComputeKernel::GemvInt4, pc, sizeof(pc));
-            // One wave per output row, kGemvRowsPerGroup rows per threadgroup.
-            pipeline_mgr_->dispatch(cmd_, (vocab_size + kGemvRowsPerGroup - 1) / kGemvRowsPerGroup, 1, 1);
+                                    pipeline_mgr_->get_pipeline_layout(lmk), 0, 1, &ds, 0, nullptr);
+            pipeline_mgr_->push_constants(cmd_, lmk, pc, sizeof(pc));
+            const uint32_t lm_per_group = lm_batched ? kGemmRowsPerGroup : kGemvRowsPerGroup;
+            pipeline_mgr_->dispatch(cmd_, (vocab_size + lm_per_group - 1) / lm_per_group, 1, 1);
         }
 
         // The softcap reads what the GEMV just wrote.
@@ -1236,11 +1741,13 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
         // 4b. z' = cap * tanh(z / cap), in place.
         {
             VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::Softcap);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_logits_.buffer, 0, vocab_size * 4);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_logits_.buffer, 0, vocab_size * 4);
+            pipeline_mgr_->update_storage_buffer(ds, 0, buf_logits_.buffer, 0,
+                                                 static_cast<uint64_t>(vocab_size) * 4 * (all_positions ? batch : 1u));
+            pipeline_mgr_->update_storage_buffer(ds, 6, buf_logits_.buffer, 0,
+                                                 static_cast<uint64_t>(vocab_size) * 4 * (all_positions ? batch : 1u));
 
             uint32_t pc[8]{0};
-            pc[0] = vocab_size;
+            pc[0] = vocab_size * (all_positions ? batch : 1u);
             float cap = header_.final_logit_softcapping;
             std::memcpy(&pc[3], &cap, 4);
 
@@ -1249,7 +1756,7 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
                                     pipeline_mgr_->get_pipeline_layout(ComputeKernel::Softcap),
                                     0, 1, &ds, 0, nullptr);
             pipeline_mgr_->push_constants(cmd_, ComputeKernel::Softcap, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, (vocab_size + 255) / 256, 1, 1);
+            pipeline_mgr_->dispatch(cmd_, (vocab_size * (all_positions ? batch : 1u) + 255) / 256, 1, 1);
         }
 
         vkEndCommandBuffer(cmd_);
@@ -1275,7 +1782,8 @@ void ForwardRunner::forward_single_token(uint32_t token_id, uint32_t position, f
     }
 
     if (out_logits) {
-        std::memcpy(out_logits, buf_logits_.mapped_ptr, static_cast<size_t>(vocab_size) * 4);
+        std::memcpy(out_logits, buf_logits_.mapped_ptr,
+                    static_cast<size_t>(vocab_size) * 4 * (all_positions ? batch : 1u));
     }
 
     lm_ms = std::chrono::duration<double, std::milli>(clk::now() - t_lm_start).count();
@@ -1346,14 +1854,107 @@ void ForwardRunner::generate(const std::string& prompt,
     std::vector<uint32_t> history = prompt_tokens;
     std::vector<float> logits(header_.vocab_size);
 
-    // Prefill prompt tokens through GPU forward pass
-    for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-        forward_single_token(prompt_tokens[i], static_cast<uint32_t>(i), logits.data());
+    // Prefill the prompt in batches, one weight pass per chunk instead of one per token.
+    //
+    // This was the single largest end-to-end cost: a 15-token prompt ran 15 full passes over
+    // all 60 layers, and 19 of those layers stream from disk at ~859 ms per pass. Batching
+    // amortizes both the streaming and the weight reads across the whole chunk -- measured at
+    // 532 ms per position against 1,456 ms sequential.
+    for (size_t i = 0; i < prompt_tokens.size(); i += kGemmMaxBatch) {
+        const uint32_t n = static_cast<uint32_t>(
+            std::min<size_t>(kGemmMaxBatch, prompt_tokens.size() - i));
+        forward_batch(prompt_tokens.data() + i, n, static_cast<uint32_t>(i), logits.data());
     }
 
     auto ttft_time = std::chrono::high_resolution_clock::now();
     double ttft_ms = std::chrono::duration<double, std::milli>(ttft_time - start_time).count();
     TelemetryCollector::instance().record_ttft(ttft_ms);
+
+    // Speculative decoding, when a draft model is loaded.
+    //
+    // The draft proposes K tokens; the target verifies them all in ONE weight pass, and every
+    // token whose argmax matches is accepted for free.
+    //
+    // The verify batch leads with the token that has not yet been through the target -- the
+    // previous round's bonus -- rather than with the first draft. That is what keeps the round
+    // to a SINGLE target pass: verify[i] is the distribution after that token plus i drafts,
+    // which is exactly what is needed to check draft i+1. Leading with the first draft instead
+    // costs a second full pass per round to catch the target up, and measured 1.74x SLOWER
+    // than not speculating at all.
+    //
+    // Rejected drafts leave stale entries in both KV caches past the accepted length. They are
+    // never read -- attention only looks at [first, current_position) -- and the next pass
+    // overwrites those ring slots, so there is no rollback step.
+    if (options.speculative_enabled && draft_runtime_ && draft_runtime_->is_loaded() &&
+        speculator_ && options.draft_k > 0) {
+        const uint32_t vocab_size = header_.vocab_size;
+        const uint32_t K = std::min<uint32_t>(options.draft_k, kGemmMaxBatch);
+        std::vector<float> verify(static_cast<size_t>(vocab_size) * K);
+        std::vector<uint32_t> batch_tokens;
+        batch_tokens.reserve(K);
+        int emitted = 0;
+
+        // The token the target has not processed yet. history's last entry has been forwarded
+        // during prefill, so the first round leads with the token sampled from `logits`.
+        uint32_t pending = sample_token(logits.data(), vocab_size, options.sampling,
+                                        seed_for(options.sampling,
+                                                 static_cast<uint32_t>(history.size() - 1)));
+        history.push_back(pending);
+        ++emitted;
+        if (on_token && !on_token(pending, tokenizer_->decode_single(pending))) emitted = options.max_tokens;
+        if (is_stop(pending)) emitted = options.max_tokens;
+
+        while (emitted < options.max_tokens) {
+            if (cancel_flag && cancel_flag->load()) break;
+            const auto step_start = std::chrono::high_resolution_clock::now();
+
+            DraftResult dr = draft_runtime_->generate_draft_tokens(history, K - 1, options.sampling);
+            if (dr.draft_tokens.empty()) break;
+
+            batch_tokens.clear();
+            batch_tokens.push_back(pending);
+            for (uint32_t t : dr.draft_tokens) batch_tokens.push_back(t);
+            const uint32_t m = static_cast<uint32_t>(batch_tokens.size());
+
+            // Positions: `pending` sits at history.size()-1, the drafts follow it.
+            forward_batch(batch_tokens.data(), m,
+                          static_cast<uint32_t>(history.size() - 1), verify.data(), true);
+
+            // verify[i] is the distribution after batch_tokens[0..i], so verify[i] decides
+            // draft i (0-based), i.e. batch_tokens[i+1].
+            std::vector<const float*> per_pos;
+            per_pos.reserve(dr.draft_tokens.size() + 1);
+            for (uint32_t i = 0; i < m; ++i) {
+                per_pos.push_back(verify.data() + static_cast<size_t>(i) * vocab_size);
+            }
+
+            SpeculativeEvaluation ev = speculator_->evaluate_verification(
+                dr.draft_tokens, per_pos, vocab_size, options.sampling,
+                seed_for(options.sampling, static_cast<uint32_t>(history.size())),
+                dr.draft_logits);
+
+            bool stop = false;
+            for (uint32_t t : ev.accepted_tokens) {
+                if (emitted >= options.max_tokens) { stop = true; break; }
+                history.push_back(t);
+                ++emitted;
+                pending = t;
+                if (on_token && !on_token(t, tokenizer_->decode_single(t))) { stop = true; break; }
+                if (is_stop(t)) { stop = true; break; }
+            }
+            draft_runtime_->accept(history.size() - 1);
+
+            const double lat = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - step_start).count();
+            TelemetryCollector::instance().record_generation_step(
+                lat, ev.accepted_tokens.size(),
+                static_cast<uint32_t>(dr.draft_tokens.size()), ev.num_accepted);
+            if (stop) break;
+        }
+
+        is_generating_ = false;
+        return;
+    }
 
     for (int step = 0; step < options.max_tokens; ++step) {
         if (cancel_flag && cancel_flag->load()) break;

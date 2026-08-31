@@ -186,6 +186,12 @@ int main(int argc, char** argv) {
     // Initialize Forward Runner
     std::cout << "Loading model container: " << resolved_path << std::endl;
     auto runner = std::make_shared<g4dense::ForwardRunner>(ctx, tok, resolved_path);
+    // Speculative decoding keeps a second model resident. Reserve for it before the target's
+    // layer import runs, because that import takes everything it is allowed to.
+    if (speculative && std::filesystem::exists("models/gemma-4-e2b-dense.g4dense")) {
+        // E2B needs ~1 GiB of imports plus its own activations, KV cache and LM head.
+        runner->set_import_reserve(1536ull * 1024 * 1024);
+    }
     runner->initialize();
     runner->switch_memory_tier(tier_id);
     std::cout << "Activated Memory Tier " << tier_id << " (Pinned layers active)." << std::endl;
@@ -224,6 +230,12 @@ int main(int argc, char** argv) {
     opts.speculative_enabled = speculative;
     opts.draft_k = draft_k;
 
+    // Speculative decoding needs a draft model resident beside the target. It is loaded only
+    // when asked for, because it costs ~1 GiB of the same budget the target's layers use.
+    if (opts.speculative_enabled) {
+        runner->load_draft_model("models/gemma-4-e2b-dense.g4dense");
+    }
+
     auto t0 = std::chrono::high_resolution_clock::now();
     int tok_count = 0;
 
@@ -244,6 +256,7 @@ int main(int argc, char** argv) {
               << "\n  Throughput (TPS): " << (tok_count / (total_sec > 0.0 ? total_sec : 1.0)) << " tokens/s"
               << "\n  RAM Footprint:    " << tele.ram_footprint_mb << " MB / " << tele.ram_total_mb << " MB"
               << "\n  Memory Tier:      Tier " << tele.active_tier_id
+              << "\n  Draft acceptance: " << (tele.speculative_acceptance_rate * 100.0) << " %"
               // Per-forward-pass attribution. Printed so an optimization can be credited to a
               // phase instead of guessed at; the numbers are an EMA over the pass, so a single
               // cold pass does not dominate them.

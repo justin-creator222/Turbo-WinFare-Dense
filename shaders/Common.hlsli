@@ -69,6 +69,17 @@ float bf16_load(ByteAddressBuffer buf, uint byte_off) {
     return asfloat(half_bits << 16);
 }
 
+// Reads an IEEE FP16 at an arbitrary 2-byte-aligned offset.
+//
+// Used for the KV cache, which is stored at half precision: a 4096-position context costs
+// 1.10 GiB instead of 2.19 GiB, and the difference is worth about four more resident layers.
+// f32tof16/f16tof32 are hardware conversions, so this is a load plus a shift.
+float f16_load(ByteAddressBuffer buf, uint byte_off) {
+    const uint word = buf.Load(byte_off & ~3u);
+    const uint h = ((byte_off & 2u) != 0u) ? (word >> 16) : (word & 0xFFFFu);
+    return f16tof32(h);
+}
+
 // Reads a 32-bit uint at an arbitrary 2-byte-aligned offset.
 uint u32_load(ByteAddressBuffer buf, uint byte_off) {
     uint base = byte_off & ~3u;
@@ -89,6 +100,15 @@ float f32_load(ByteAddressBuffer buf, uint byte_off) {
 // AllMemoryBarrierWithGroupSync() between the store and the load.
 float f32_load(RWByteAddressBuffer buf, uint byte_off) {
     return asfloat(buf.Load(byte_off));
+}
+
+// Four consecutive FP32s in one instruction. `byte_off` must be 16-byte aligned.
+//
+// The gemv inner loop is dominated by ACTIVATION loads, not weight loads: every output row
+// re-reads the whole activation vector, so a group of 64 weights costs 8 weight loads and 64
+// activation loads. Fetching four at a time cuts that 64 to 16.
+float4 f32x4_load(ByteAddressBuffer buf, uint byte_off) {
+    return asfloat(buf.Load4(byte_off));
 }
 
 void f32_store(RWByteAddressBuffer buf, uint byte_off, float v) {
@@ -129,14 +149,11 @@ float gemv_int4_row_lane(ByteAddressBuffer W, uint w_base,
             const uint packed = u32_load(W, g_w_base + word_idx * 4u);
             const uint x_off  = g_x_base + word_idx * 32u;
 
-            const float x0 = f32_load(X, x_off + 0u);
-            const float x1 = f32_load(X, x_off + 4u);
-            const float x2 = f32_load(X, x_off + 8u);
-            const float x3 = f32_load(X, x_off + 12u);
-            const float x4 = f32_load(X, x_off + 16u);
-            const float x5 = f32_load(X, x_off + 20u);
-            const float x6 = f32_load(X, x_off + 24u);
-            const float x7 = f32_load(X, x_off + 28u);
+            // x_off is a multiple of 32, so both halves are 16-byte aligned.
+            const float4 xa = f32x4_load(X, x_off + 0u);
+            const float4 xb = f32x4_load(X, x_off + 16u);
+            const float x0 = xa.x, x1 = xa.y, x2 = xa.z, x3 = xa.w;
+            const float x4 = xb.x, x5 = xb.y, x6 = xb.z, x7 = xb.w;
 
             const uint q0 = (packed >>  0) & 0xFu;
             const uint q1 = (packed >>  4) & 0xFu;

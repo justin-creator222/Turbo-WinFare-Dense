@@ -71,11 +71,41 @@ struct G4DenseHeader {
     uint32_t global_head_dim;       // 512 on the 31B; 0 = unspecified (legacy container)
     uint32_t global_kv_heads;       // 4 on the 31B;   0 = unspecified (legacy container)
 
-    uint8_t  reserved[2984];        // Padding to exactly 4096 bytes
+    // Per-layer embeddings (PLE) and KV sharing -- the E2B/E4B architecture.
+    //
+    // Zero on every model that does not use them, and the per-layer block layout is then
+    // byte-for-byte what it was, so existing containers stay valid and no version bump is
+    // needed. `ple_dim != 0` is the discriminator.
+    uint32_t ple_dim;               // hidden_size_per_layer_input (256 on E2B), 0 = no PLE
+    uint32_t ple_vocab;             // vocab_size_per_layer_input
+    uint32_t num_kv_shared_layers;  // trailing layers that reuse an earlier layer's K/V
+    uint32_t ple_reserved;          // padding, keeps the block 8-byte aligned
+    uint64_t ple_offset;            // model-level PLE block: embed_tokens_per_layer,
+    uint64_t ple_size;              // per_layer_model_projection, per_layer_projection_norm
+
+    // Feed-forward width per layer.
+    //
+    // Not derivable from `d_ff`: E2B's config says intermediate_size = 6144, but its last 20
+    // layers -- exactly the KV-sharing ones -- have 12288, and nothing in config.json states
+    // that. Upstream carries it in per_layer_config. Recording the measured width per layer is
+    // the only way to read such a container back correctly. Zero means "use d_ff", so existing
+    // containers keep working.
+    uint32_t layer_d_ff[MAX_LAYERS];
+
+    uint8_t  reserved[2712];        // Padding to exactly 4096 bytes
 };
 #pragma pack(pop)
 
 static_assert(sizeof(G4DenseHeader) == 4096, "G4DenseHeader must be exactly 4096 bytes");
+
+// This layer's feed-forward width. Falls back to the model-wide d_ff for containers written
+// before the per-layer array existed.
+inline uint32_t layer_ffn_width(const G4DenseHeader& h, uint32_t layer_idx) {
+    if (layer_idx < G4DenseHeader::MAX_LAYERS && h.layer_d_ff[layer_idx] != 0) {
+        return h.layer_d_ff[layer_idx];
+    }
+    return h.d_ff;
+}
 
 // Per-layer attention geometry. `head_dim`/`num_kv_heads` in the header describe the sliding
 // layers; full-attention layers carry their own. Both the GPU runner and the CPU reference go
@@ -85,6 +115,28 @@ struct LayerGeometry {
     uint32_t q_heads;
     uint32_t kv_heads;
 };
+
+// True when this layer reuses an earlier layer's K/V instead of projecting its own. Upstream:
+// `layer_idx >= num_hidden_layers - num_kv_shared_layers`. Such a layer carries no k_proj,
+// v_proj or k_norm at all -- E2B has 15 of each for 35 layers.
+inline bool is_kv_shared_layer(const G4DenseHeader& h, uint32_t layer_idx) {
+    if (h.num_kv_shared_layers == 0 || h.num_kv_shared_layers > h.num_layers) return false;
+    return layer_idx >= (h.num_layers - h.num_kv_shared_layers);
+}
+
+// The layer a shared layer takes its K/V from: the LAST non-shared layer of the SAME attention
+// type. Donor type always matches, so a sliding layer never reads a full-attention cache and
+// the cache geometry lines up without any copying. Returns layer_idx itself when not shared.
+inline uint32_t kv_donor_layer(const G4DenseHeader& h, uint32_t layer_idx) {
+    if (!is_kv_shared_layer(h, layer_idx)) return layer_idx;
+    const bool want_global = ((h.global_layer_mask >> layer_idx) & 1ull) != 0;
+    const uint32_t first_shared = h.num_layers - h.num_kv_shared_layers;
+    for (uint32_t l = first_shared; l-- > 0;) {
+        const bool is_global = ((h.global_layer_mask >> l) & 1ull) != 0;
+        if (is_global == want_global) return l;
+    }
+    return 0;
+}
 
 inline LayerGeometry resolve_layer_geometry(const G4DenseHeader& h, uint32_t layer_idx) {
     const bool is_global = (h.global_layer_mask >> layer_idx) & 1ull;

@@ -8,6 +8,10 @@
 //   u0 out (FP32)
 //
 //   gp0 = (n, x_byte_off, w_byte_off, out_byte_off)
+//
+// Batched: one threadgroup per position, gp1.z/gp1.w giving the per-position input and
+// output strides in bytes. Dispatch M groups. A single-token pass dispatches one group
+// with zero strides and is bit-identical to the unbatched kernel.
 //   gp1 = (has_weight, eps_bits, 0, 0)
 //
 // One threadgroup of 256 for the whole vector.
@@ -23,11 +27,11 @@
 groupshared float s_partial[RMS_THREADS / 4];
 
 [numthreads(RMS_THREADS, 1, 1)]
-void main(uint tid : SV_GroupIndex) {
+void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     const uint n          = gp0.x;
-    const uint x_off      = gp0.y;
     const uint w_off      = gp0.z;
-    const uint out_off    = gp0.w;
+    const uint x_off      = gp0.y + gid.x * gp1.z;
+    const uint out_off    = gp0.w + gid.x * gp1.w;
     const bool has_weight = (gp1.x != 0u);
     const float eps       = asfloat(gp1.y);
 

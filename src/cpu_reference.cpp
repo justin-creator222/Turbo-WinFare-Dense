@@ -43,6 +43,46 @@ inline float bf16_to_f32(uint16_t val) {
     return f;
 }
 
+// Round-trip through IEEE FP16.
+//
+// The GPU stores its KV cache at half precision, so this reference must too -- otherwise the
+// oracle diff reports the cache's quantization error as an engine defect, and the tolerance
+// would have to be loosened to ~0.5, which is wide enough to hide a real bug.
+inline float round_to_f16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = static_cast<int32_t>((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t man = x & 0x7FFFFFu;
+    uint16_t h;
+    if (exp <= 0)        h = static_cast<uint16_t>(sign);
+    else if (exp >= 31)  h = static_cast<uint16_t>(sign | 0x7C00u);
+    else {
+        const uint32_t round_bit = (man >> 12) & 1u;
+        const uint32_t sticky = (man & 0xFFFu) != 0u;
+        uint32_t v = sign | (static_cast<uint32_t>(exp) << 10) | (man >> 13);
+        if (round_bit && (sticky || (v & 1u))) ++v;
+        h = static_cast<uint16_t>(v);
+    }
+    const uint32_t s2 = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t e2 = (h >> 10) & 0x1Fu;
+    uint32_t m2 = h & 0x3FFu;
+    uint32_t bits;
+    if (e2 == 0) {
+        if (m2 == 0) bits = s2;
+        else {
+            e2 = 1;
+            while ((m2 & 0x400u) == 0) { m2 <<= 1; --e2; }
+            m2 &= 0x3FFu;
+            bits = s2 | ((e2 + 127 - 15) << 23) | (m2 << 13);
+        }
+    } else if (e2 == 0x1Fu) bits = s2 | 0x7F800000u | (m2 << 13);
+    else bits = s2 | ((e2 + 127 - 15) << 23) | (m2 << 13);
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
 // Gemma GELU tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 inline float gelu_tanh(float x) {
     constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
@@ -427,6 +467,9 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
         }
 
         // 4. Update KV Cache
+        // Stored at half precision, matching the GPU's KV cache.
+        for (float& kv : k_buf) kv = round_to_f16(kv);
+        for (float& kv : v_buf) kv = round_to_f16(kv);
         k_cache_[l].insert(k_cache_[l].end(), k_buf.begin(), k_buf.end());
         v_cache_[l].insert(v_cache_[l].end(), v_buf.begin(), v_buf.end());
 
