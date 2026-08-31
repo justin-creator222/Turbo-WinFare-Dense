@@ -25,7 +25,14 @@ struct GenerationOptions {
     int max_tokens{512};
     SamplingParams sampling{};
     bool speculative_enabled{true};
-    uint32_t draft_k{6};
+    // 8, and capped there by kGemmMaxBatch because the verify batch is K wide. Measured on
+    // the 31B, 24 tokens greedy: K=8 takes 20.58-20.81 s against K=4's 26.06-26.45 s, because
+    // the target pass costs ~1,330 ms and a draft pass ~65 ms.
+    //
+    // This is the SERVER's value -- it builds GenerationOptions and never sets draft_k, so
+    // this default is what the GUI runs. It said 6 while the CLI said 4, which meant no
+    // measurement taken on the CLI described what the GUI was doing.
+    uint32_t draft_k{8};
     uint32_t active_tier_id{1};
 
     // Wrap the prompt in the Gemma 4 turn structure before encoding.
