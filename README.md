@@ -49,6 +49,28 @@ Useful flags: `--no-spec` (disable speculation), `--draft-k N` (drafts per verif
 at 8), `--max-context N` (default 4096; 8192 costs ~336 MB of KV cache, about one resident
 layer), `--temp`, `--top-p`, `--top-k`.
 
+### The web UI
+
+`--gui` serves a control panel and an OpenAI-compatible API on the same port. Everything the
+CLI can set is settable there — sampling (temperature, top-p, top-k, repetition penalty, seed),
+generation length, speculation on/off and its K, and context length — plus live telemetry:
+per-token phase breakdown, memory by pool, which layers are resident against which stream, and
+speculative acceptance with its denominator.
+
+Two things it deliberately does not do: it never substitutes a plausible value for telemetry it
+does not have (missing readings show `—`), and it does not claim a speculative speedup, because
+measuring one honestly means running the same prompt both ways and the server does not do that.
+
+| endpoint | |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI-compatible, streaming or not |
+| `GET /v1/models`, `GET /api/models` | available containers |
+| `GET/POST /api/config` | sampling, speculation, context; a context change reports `requires_reload` |
+| `GET /api/telemetry` | throughput, phase breakdown, memory, speculation counters |
+| `GET /api/model_info` | geometry, and which layers stream |
+| `POST /api/load_model`, `/api/unload_model` | swap the container in place |
+| `POST /api/reset_kv`, `/api/clear_cache`, `/api/stop` | reset context, drop stream slots, cancel |
+
 ## Models
 
 Containers are `.g4dense` v3, built from MLX 4-bit HuggingFace checkpoints:
