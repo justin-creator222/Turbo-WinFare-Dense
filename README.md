@@ -1,4 +1,19 @@
-# Turbo-WinFare Dense
+<div align="center">
+  <img src="docs/assets/banner.png" alt="Turbo-WinFare Dense" width="800" />
+
+  # Turbo-WinFare Dense
+
+  **APU-Optimized Native Vulkan Streaming Inference Engine for Gemma 4 31B Dense**
+
+  [![Vulkan 1.3](https://img.shields.io/badge/Vulkan-1.3-red?style=flat-square&logo=vulkan&logoColor=white)](https://www.vulkan.org/)
+  [![Gemma 4 31B](https://img.shields.io/badge/Target_Model-Gemma_4_31B_Dense-blue?style=flat-square)](https://huggingface.co/google/gemma-4-31b-it)
+  [![Gemma 4 E2B](https://img.shields.io/badge/Draft_Model-Gemma_4_E2B-green?style=flat-square)]()
+  [![AMD Radeon 780M](https://img.shields.io/badge/Hardware-AMD_Radeon_780M-ED1C24?style=flat-square&logo=amd&logoColor=white)](https://www.amd.com/)
+  [![INT4 Quant](https://img.shields.io/badge/Quantization-MLX_INT4_G64-blueviolet?style=flat-square)]()
+
+</div>
+
+---
 
 An APU-optimized Vulkan inference engine for **Gemma 4 31B Dense**, targeting a Lenovo Legion Go
 S (Ryzen Z1 Extreme, Radeon 780M, 32 GB LPDDR5X). It also runs **Gemma 4 E2B**, which serves as

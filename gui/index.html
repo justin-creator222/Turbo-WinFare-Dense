@@ -5,6 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Turbo-WinFare Dense | Gemma 4 31B Streaming Inference Engine</title>
     <link rel="icon" type="image/svg+xml" href="logo.svg">
+    <link rel="alternate icon" type="image/png" href="logo.png">
+    <link rel="apple-touch-icon" href="logo.png">
+    <meta name="theme-color" content="#080a0f">
+    <meta name="description" content="Turbo-WinFare Dense — APU-optimized Vulkan 1.3 streaming inference engine for Gemma 4 31B Dense">
+    <meta property="og:title" content="Turbo-WinFare Dense">
+    <meta property="og:description" content="APU-optimized Vulkan 1.3 streaming inference engine for Gemma 4 31B Dense">
+    <meta property="og:image" content="banner.png">
     <link rel="stylesheet" href="styles.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -14,7 +21,7 @@
     <div id="app">
         <!-- Top Header & Hardware HUD -->
         <header>
-            <div class="brand">
+            <div class="brand" onclick="openAboutModal()" title="About Turbo-WinFare Dense (Click for System & Brand Details)">
                 <div class="brand-icon">
                     <img src="logo.svg" alt="Turbo-WinFare Logo" />
                 </div>
@@ -101,10 +108,16 @@
                 <!-- Chat Transcript Area -->
                 <div class="transcript-area" id="transcript">
                     <div class="msg assistant welcome-msg">
-                        <div class="avatar">⚡</div>
+                        <div class="avatar"><img src="logo.svg" alt="Turbo-WinFare" class="avatar-brand-img" /></div>
                         <div class="msg-content">
                             <div class="bubble">
-                                <h3>Welcome to <strong>Turbo-WinFare Dense</strong>!</h3>
+                                <div class="welcome-branding-header">
+                                    <div class="wbh-badge">
+                                        <span class="wbh-tag">⚡ ENGINE ONLINE</span>
+                                        <span class="wbh-sub">VULKAN 1.3 • ASYNC DMA</span>
+                                    </div>
+                                    <h3>Welcome to <strong>Turbo-WinFare Dense</strong></h3>
+                                </div>
                                 <p>Engineered for real-time <strong>Gemma 4 31B Dense</strong> LLM streaming inference on AMD APUs & Windows 11 using native Vulkan 1.3 compute.</p>
                                 
                                 <div class="welcome-features-grid">
@@ -457,6 +470,7 @@
                     <div class="control-group">
                         <button class="btn-secondary" onclick="openTierModal()">📊 Memory Tier Feasibility Matrix</button>
                         <button class="btn-secondary" onclick="openLayerInspectorModal()">🔬 Interactive 60-Layer Inspector</button>
+                        <button class="btn-secondary" onclick="openAboutModal()">ℹ️ About Engine & Branding</button>
                     </div>
                 </div>
             </aside>
@@ -585,6 +599,64 @@
                     <button class="btn-primary" onclick="copyExportText()">📋 Copy to Clipboard</button>
                     <button class="btn-secondary" onclick="downloadExportMarkdown()">💾 Download Markdown (.md)</button>
                     <button class="btn-secondary" onclick="downloadExportJson()">💾 Download JSON</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal 4: About Turbo-WinFare Dense & Branding Modal -->
+    <div class="modal-overlay" id="about-modal">
+        <div class="modal-card modal-large">
+            <div class="modal-header">
+                <div>
+                    <h2>About Turbo-WinFare Dense</h2>
+                    <p class="modal-subtitle">APU-Optimized Gemma 4 31B Streaming Inference Engine</p>
+                </div>
+                <button class="btn-close" onclick="closeAboutModal()">✕</button>
+            </div>
+            
+            <div class="about-modal-body">
+                <div class="about-hero-banner-wrap">
+                    <img src="banner.png" alt="Turbo-WinFare Dense Banner" class="about-banner-img" />
+                </div>
+
+                <div class="about-brand-grid">
+                    <div class="about-brand-card">
+                        <div class="abc-icon"><img src="logo.svg" alt="Logo Mark" /></div>
+                        <div class="abc-info">
+                            <h4>Turbo-WinFare Dense Identity</h4>
+                            <p>Aerodynamic cyber falcon fused with a high-speed turbocharger compressor turbine and high-voltage lightning discharge vectors, representing high-throughput APU inference.</p>
+                        </div>
+                    </div>
+                    <div class="about-brand-card">
+                        <div class="abc-info">
+                            <h4>System Target</h4>
+                            <p>Optimized for AMD Ryzen Z1 Extreme / Radeon 780M (Lenovo Legion Go S) with 32 GB LPDDR5X unified memory architecture under Vulkan 1.3.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="about-specs-table">
+                    <div class="about-spec-row">
+                        <span class="as-lbl">Target Model:</span>
+                        <span class="as-val">Gemma 4 31B Dense (60 Layers, INT4 Group-64, 5,376 Dim)</span>
+                    </div>
+                    <div class="about-spec-row">
+                        <span class="as-lbl">Speculative Draft:</span>
+                        <span class="as-val">Gemma 4 E2B Dense (Batched Rejection Sampling)</span>
+                    </div>
+                    <div class="about-spec-row">
+                        <span class="as-lbl">Memory Architecture:</span>
+                        <span class="as-val">Two-Tier Streaming (Device Heap 0 VRAM + Host Heap 1 NVMe DMA)</span>
+                    </div>
+                    <div class="about-spec-row">
+                        <span class="as-lbl">Compute Backend:</span>
+                        <span class="as-val">Vulkan 1.3 (15 DXC SPIR-V Shaders, Subgroup Math, Async Compute)</span>
+                    </div>
+                </div>
+
+                <div class="modal-actions-row">
+                    <button class="btn-secondary" onclick="closeAboutModal()">Close</button>
                 </div>
             </div>
         </div>

@@ -296,6 +296,16 @@ function closeTierModal() {
     if (modal) modal.classList.remove('active');
 }
 
+function openAboutModal() {
+    const modal = document.getElementById('about-modal');
+    if (modal) modal.classList.add('active');
+}
+
+function closeAboutModal() {
+    const modal = document.getElementById('about-modal');
+    if (modal) modal.classList.remove('active');
+}
+
 // ============================================================================
 // Real-Time Telemetry & Hardware Profiler
 // ============================================================================
@@ -666,7 +676,7 @@ function clearTranscript() {
     if (transcript) {
         transcript.innerHTML = `
             <div class="msg assistant welcome-msg">
-                <div class="avatar">⚡</div>
+                <div class="avatar"><img src="logo.svg" alt="Turbo-WinFare" class="avatar-brand-img" /></div>
                 <div class="msg-content">
                     <div class="bubble">
                         Transcript cleared. <strong>Turbo-WinFare Dense</strong> is ready for your next prompt!
@@ -863,7 +873,11 @@ function appendMessage(role, content) {
 
     const avatarDiv = document.createElement('div');
     avatarDiv.className = 'avatar';
-    avatarDiv.innerText = role === 'user' ? '👤' : '⚡';
+    if (role === 'user') {
+        avatarDiv.innerText = '👤';
+    } else {
+        avatarDiv.innerHTML = '<img src="logo.svg" alt="Turbo-WinFare" class="avatar-brand-img" />';
+    }
 
     const contentDiv = document.createElement('div');
     contentDiv.className = 'msg-content';
