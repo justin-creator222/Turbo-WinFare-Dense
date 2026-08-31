@@ -615,9 +615,44 @@ void ForwardRunner::load_resident_layers() {
     uint64_t resident_bytes = 0;
     bool ceiling_hit = false;
 
+    // WHICH layers stream matters as much as how many.
+    //
+    // Importing greedily from layer 0 leaves the tail streaming back to back: at 45 of 60
+    // resident, layers 45-59 each waited on a ~35 ms read with only the 3-deep prefetch queue
+    // (~35 ms of GPU work) to hide behind, and the pass spent 522 ms blocked on I/O.
+    //
+    // Spreading the streamed layers evenly puts several resident layers' compute between
+    // consecutive reads, so each read overlaps work that was going to happen anyway. The
+    // streamer needs no change: issue_next_stream() already runs 3 reads ahead, which now
+    // spans roughly 4x as many layers.
+    //
+    // The plan is an estimate -- a layer that fails to import still falls through to the
+    // streamed set, so a wrong guess degrades to the old behaviour rather than breaking.
+    std::vector<bool> plan_streamed(header_.num_layers, false);
+    {
+        uint64_t budget_left = import_budget;
+        uint32_t fit = 0;
+        for (uint32_t l = 0; l < header_.num_layers && l < max_resident; ++l) {
+            if (budget_left < header_.layer_sizes[l]) break;
+            budget_left -= header_.layer_sizes[l];
+            ++fit;
+        }
+        const uint32_t to_stream = header_.num_layers - std::min(fit, header_.num_layers);
+        if (to_stream > 0) {
+            // Evenly spaced: layer floor((i + 0.5) * num_layers / to_stream) for each i, which
+            // puts them at the centres of `to_stream` equal buckets rather than clumped at
+            // either end.
+            for (uint32_t i = 0; i < to_stream; ++i) {
+                const uint32_t idx = static_cast<uint32_t>(
+                    ((2ull * i + 1ull) * header_.num_layers) / (2ull * to_stream));
+                plan_streamed[std::min(idx, header_.num_layers - 1)] = true;
+            }
+        }
+    }
+
     for (uint32_t l = 0; l < header_.num_layers; ++l) {
         const uint64_t sz = header_.layer_sizes[l];
-        if (ceiling_hit) { streamed_layers_.push_back(l); continue; }
+        if (ceiling_hit || plan_streamed[l]) { streamed_layers_.push_back(l); continue; }
         if (l >= max_resident || resident_bytes + sz > import_budget) {
             ceiling_hit = true;
             streamed_layers_.push_back(l);
