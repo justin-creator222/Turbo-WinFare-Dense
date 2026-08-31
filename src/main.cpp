@@ -49,6 +49,19 @@ void print_usage() {
 // The draft model for speculative decoding, and what to hold back from the target's layer
 // import so it has room. E2B imports 0.977 GiB of layer blocks plus its own activations, KV
 // cache and LM head.
+//
+// 1.5 GiB looks generous against 0.977 GiB of layers, and trimming it was expected to buy the
+// target a couple of layers. Measured, it does not -- the reserve is what keeps the DRAFT fully
+// resident, and the draft runs K times per verify round:
+//
+//   reserve   target   draft        24 tokens
+//   1536 MiB   39/60   35/35        26.2 s
+//   1280 MiB   40/60   32/35        26.1 s
+//   1152 MiB   41/60   27/35        29.2 s
+//   1024 MiB   41/60   27/35        29.6 s
+//
+// A streamed draft costs more than an extra resident target layer gains, and 1280 is a tie
+// within noise. 1536 keeps the draft entirely resident, which is the predictable end.
 static const char* kDraftModelPath = "models/gemma-4-e2b-dense.g4dense";
 static constexpr unsigned long long kDraftImportReserveBytes = 1536ull * 1024 * 1024;
 
