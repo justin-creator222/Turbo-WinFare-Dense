@@ -184,6 +184,76 @@ header {
     font-family: var(--mono);
 }
 
+/* Residency readout -- replaced the Tier 1-4 selector, which chose a label and nothing else. */
+.residency-readout {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: rgba(0, 0, 0, 0.5);
+    padding: 6px 14px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    position: relative;
+}
+
+.res-figure {
+    display: flex;
+    align-items: baseline;
+    gap: 2px;
+    font-family: var(--mono);
+}
+
+.res-num {
+    font-size: 20px;
+    font-weight: 700;
+    color: #93c5fd;
+    line-height: 1;
+}
+
+.res-sep, .res-total {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1;
+}
+
+.res-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.res-label {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+}
+
+.res-sub {
+    font-size: 10px;
+    font-family: var(--mono);
+    color: var(--text-secondary);
+    opacity: 0.85;
+}
+
+.res-bar {
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    bottom: 3px;
+    height: 2px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.res-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #3b82f6, #93c5fd);
+    transition: width 0.4s ease;
+}
+
 /* HUD Metrics */
 .hud-metrics {
     display: flex;

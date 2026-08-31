@@ -261,27 +261,22 @@ function closeLayerInspectorModal() {
 // Memory Tiers & Feasibility Matrix
 // ============================================================================
 
+// The tier selector was removed from the header: tier pinning went away in round 6, so the
+// buttons chose a label and changed nothing about residency. The endpoint still exists and the
+// engine still records an active tier id, so this remains callable, but nothing in the UI
+// drives it any more.
 function selectTier(tierId) {
     currentTier = tierId;
-    document.querySelectorAll('.tier-btn').forEach(btn => btn.classList.remove('active'));
-    const targetBtn = document.getElementById(`tier-btn-${tierId}`);
-    if (targetBtn) targetBtn.classList.add('active');
-
     fetch('/api/switch_tier', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tier_id: tierId })
     })
     .then(r => r.json())
-    .then(data => {
-        const pinnedCount = TOTAL_LAYERS - streamedLayerSet.size;
-        update60LayerState(pinnedCount);
-        updateLayerSummaryText(pinnedCount);
-        renderTierMatrix();
-        fetchTelemetry();
-    })
+    .then(() => { renderTierMatrix(); fetchTelemetry(); })
     .catch(err => console.warn('Tier switch error:', err));
 }
+
 
 function renderTierMatrix() {
     const tbody = document.getElementById('tier-table-body');
@@ -343,6 +338,7 @@ function fetchTelemetry() {
         .then(t => {
             if (!t) return;
             updateHUD(t);
+            updateResidencyReadout(t);
             updateMemoryProfiler(t);
             updatePhaseProfiler(t);
             updateSpeculativeCoordinator(t);
@@ -428,6 +424,31 @@ function updateHUD(t) {
             hudStatus.style.borderColor = 'rgba(52, 211, 153, 0.3)';
         }
     }
+}
+
+// The header readout: how many layers the driver accepted, and how many stream every token.
+// This is the number the Tier 1-4 buttons were pretending to let you choose.
+function updateResidencyReadout(t) {
+    const total = num(t.total_layers, 0);
+    const resident = num(t.pinned_layers, 0);
+    const streamed = num(t.streamed_layers, Math.max(0, total - resident));
+
+    const setTxt = (id, txt) => { const el = document.getElementById(id); if (el) el.innerText = txt; };
+    setTxt('res-resident', total > 0 ? String(resident) : '—');
+    setTxt('res-total', total > 0 ? String(total) : '—');
+
+    if (total > 0) {
+        const layerMb = num(t.layer_mb, 0);
+        const gib = layerMb > 0 ? ((resident * layerMb) / 1024).toFixed(1) + ' GiB in memory' : '';
+        setTxt('res-streamed', streamed > 0
+            ? `${streamed} streaming${gib ? ' · ' + gib : ''}`
+            : `fully resident${gib ? ' · ' + gib : ''}`);
+    } else {
+        setTxt('res-streamed', '—');
+    }
+
+    const fill = document.getElementById('res-bar-fill');
+    if (fill) fill.style.width = total > 0 ? `${(resident / total) * 100}%` : '0%';
 }
 
 function updateMemoryProfiler(t) {

@@ -31,28 +31,26 @@
                 </div>
             </div>
 
-            <!-- Memory tier selector.
-                 The tier is a label, not a residency policy. How many layers stay resident is
-                 decided at load time by how much host memory the driver will accept, and is the
-                 same whichever tier is selected -- so these no longer claim per-tier layer
-                 counts and memory ceilings, which were a planning model, not the engine. -->
-            <div class="tier-selector-group" title="Residency is set by the driver's import limit and is identical for every tier. See the layer map for what is actually resident.">
-                <button class="tier-btn active" id="tier-btn-1" onclick="selectTier(1)" title="Tier 1 -- a label only; it does not change how many layers stay resident.">
-                    <span class="tier-badge">Tier 1</span>
-                    <span class="tier-desc">6.0 GB plan</span>
-                </button>
-                <button class="tier-btn" id="tier-btn-2" onclick="selectTier(2)" title="Tier 2 -- a label only; it does not change how many layers stay resident.">
-                    <span class="tier-badge">Tier 2</span>
-                    <span class="tier-desc">10.0 GB plan</span>
-                </button>
-                <button class="tier-btn" id="tier-btn-3" onclick="selectTier(3)" title="Tier 3 -- a label only; it does not change how many layers stay resident.">
-                    <span class="tier-badge">Tier 3</span>
-                    <span class="tier-desc">16.0 GB plan</span>
-                </button>
-                <button class="tier-btn" id="tier-btn-4" onclick="selectTier(4)" title="Tier 4 -- a label only; it does not change how many layers stay resident.">
-                    <span class="tier-badge">Tier 4</span>
-                    <span class="tier-desc">22.0 GB plan</span>
-                </button>
+            <!-- Residency readout.
+                 This was a Tier 1-4 selector. Tier pinning was removed in round 6 (a pinned
+                 slot still cost a full layer read per token while a resident layer costs
+                 nothing, and pinning starved the prefetch queue), so the buttons chose a label
+                 and nothing else. What they were pretending to show is this: how many layers
+                 the driver accepted into memory, and how many therefore stream every token. -->
+            <div class="residency-readout" id="residency-readout"
+                 title="Layers held in memory vs streamed from disk each token. Set at load time by how much host memory the driver accepts -- it is not a user setting.">
+                <div class="res-figure">
+                    <span class="res-num" id="res-resident">—</span>
+                    <span class="res-sep">/</span>
+                    <span class="res-total" id="res-total">—</span>
+                </div>
+                <div class="res-meta">
+                    <span class="res-label">LAYERS RESIDENT</span>
+                    <span class="res-sub" id="res-streamed">—</span>
+                </div>
+                <div class="res-bar" aria-hidden="true">
+                    <div class="res-bar-fill" id="res-bar-fill" style="width: 0%;"></div>
+                </div>
             </div>
 
             <!-- Top Hardware HUD Metrics -->
