@@ -15,16 +15,49 @@
 
 ---
 
-An APU-optimized Vulkan inference engine for **Gemma 4 31B Dense**, targeting a Lenovo Legion Go
-S (Ryzen Z1 Extreme, Radeon 780M, 32 GB LPDDR5X). It also runs **Gemma 4 E2B**, which serves as
-the speculative draft model.
+**Run a 31-billion-parameter model on a handheld gaming PC.**
 
-The 31B's weights are 15.06 GiB in INT4 and the driver stops accepting host-memory imports at
-about 11.75 GiB, so **45 of 60 layers are resident and 15 stream from disk on every token**.
-Most of this engine's design follows from that one fact.
+Turbo-WinFare Dense is a Vulkan 1.3 inference engine for **Gemma 4 31B Dense**, built for AMD
+APUs — specifically a Lenovo Legion Go S (Ryzen Z1 Extreme, Radeon 780M, 32 GB LPDDR5X). It also
+runs **Gemma 4 E2B**, both on its own and as a speculative draft model for the 31B.
 
-**Current throughput: 1.13 tok/s** greedy decode at 45/60 resident, 4096 context —
-[the full breakdown is in PERFORMANCE.md](docs/PERFORMANCE.md).
+### The problem, and the approach
+
+Quantized to 4 bits the 31B still needs **15 GiB** of weights, and the graphics driver stops
+accepting memory around **11.75 GiB**. The model does not fit. There is no configuration of this
+hardware where it fits.
+
+So the engine does not try to hold it all. **45 of the 60 transformer layers stay resident in
+memory, and the other 15 are read from NVMe on every single token** — about 4 GB per token,
+continuously, while the GPU is working. The whole design follows from that one constraint:
+
+- **Nothing is copied twice.** On an APU the CPU and GPU share physical memory, so resident
+  layers are handed to the GPU as ordinary system memory it reads in place, rather than being
+  uploaded to a separate pool.
+- **The layers that stream are chosen, not left over.** They are spread evenly through the
+  stack so each disk read overlaps the compute of the layers around it, instead of arriving in
+  one stall at the end.
+- **Reading and computing happen at once.** Disk reads run on their own threads, so the GPU
+  never waits on the filesystem, and a read served from the OS cache costs nothing on the
+  critical path.
+- **A small model guesses ahead.** Gemma 4 E2B drafts several tokens at ~15 tok/s and the 31B
+  verifies them all in a single pass, so an accepted guess is effectively free.
+
+### What that costs
+
+Streaming a quarter of the model from disk every token gives up **roughly a third of the speed**
+full residency would deliver. That is the interesting part: the weights are 28% larger than the
+memory the driver will give them, and the penalty is nowhere near proportionate.
+
+**Measured: 1.08–1.13 tok/s** greedy decode, 4096 context, at 45 of 60 layers resident — the
+spread is between sessions on the same machine, which is why nothing here is concluded from a
+single run. Full residency is estimated at **1.7–2.0 tok/s** and is *not reachable on this
+hardware*: the driver refuses long before 60 layers, so that figure is an extrapolation from
+two measured endpoints rather than something anyone has observed.
+[PERFORMANCE.md](docs/PERFORMANCE.md) shows the working.
+
+It also ships an **OpenAI-compatible API and a web UI**, so anything that speaks to a local LLM
+server speaks to this.
 
 ## Documentation
 
