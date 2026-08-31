@@ -61,6 +61,11 @@ public:
     void record_model_state(uint32_t resident_layers, uint32_t streamed_layers,
                             uint32_t max_context, const std::string& gpu_name,
                             bool has_draft, uint32_t draft_k);
+
+    // Reported separately from record_model_state: at load time no request has run, so the
+    // K the verify loop will use is not known yet. Without this the endpoint showed
+    // draft_k 0 beside has_draft true and a non-zero acceptance rate.
+    void record_draft_k(uint32_t draft_k);
     void record_heap_usage(double heap0_used_mb, double heap0_budget_mb,
                            double heap1_used_mb, double heap1_budget_mb);
 

@@ -1962,6 +1962,7 @@ void ForwardRunner::generate(const std::string& prompt,
         speculator_ && options.draft_k > 0) {
         const uint32_t vocab_size = header_.vocab_size;
         const uint32_t K = std::min<uint32_t>(options.draft_k, kGemmMaxBatch);
+        TelemetryCollector::instance().record_draft_k(K);
         std::vector<float> verify(static_cast<size_t>(vocab_size) * K);
         std::vector<uint32_t> batch_tokens;
         batch_tokens.reserve(K);

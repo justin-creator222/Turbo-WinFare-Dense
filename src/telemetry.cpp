@@ -88,6 +88,11 @@ void TelemetryCollector::record_model_state(uint32_t resident_layers, uint32_t s
     g_snapshot.draft_k = draft_k;
 }
 
+void TelemetryCollector::record_draft_k(uint32_t draft_k) {
+    std::lock_guard<std::mutex> lock(g_telemetry_mutex);
+    g_snapshot.draft_k = draft_k;
+}
+
 void TelemetryCollector::record_heap_usage(double heap0_used_mb, double heap0_budget_mb,
                                            double heap1_used_mb, double heap1_budget_mb) {
     std::lock_guard<std::mutex> lock(g_telemetry_mutex);
