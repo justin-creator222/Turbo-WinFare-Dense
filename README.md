@@ -45,6 +45,46 @@ the ideas that did not work:
 [3](docs/ROUND3_REPORT.md). Earlier planning documents are archived in
 [docs/history/](docs/history/).
 
+## System requirements
+
+The engine streams whatever it cannot hold, so it runs on far less memory than the model's
+size suggests — it just gets slower. Measured on this machine, forcing residency down with
+`G4DENSE_MAX_RESIDENT_LAYERS`:
+
+| resident layers | process RAM | throughput | |
+|---:|---:|---:|---|
+| 0 / 60 | 3.9 GB | 0.40 tok/s | reads all 16.8 GB of weights every token |
+| 8 / 60 | 4.2 GB | 0.43 tok/s | |
+| 21 / 60 | 5.7 GB | 0.46 tok/s | what a 16 GB machine allows |
+| **45 / 60** | **~9.7 GB** | **1.13 tok/s** | 32 GB, the configuration this was built for |
+
+**~3.9 GB is the floor**, and it is not the layers — it is the KV cache (1,120 MB at 4096
+context), the LM head (756 MB) and the four streaming slots (1,146 MB), all allocated whatever
+the residency. Below that the engine cannot start.
+
+In practice:
+
+- **32 GB** — what this targets. 45 of 60 layers resident.
+- **16 GB** — works. Residency is capped at 38% of system RAM, so ~21 layers, and expect
+  roughly **0.45 tok/s**. Most of the model is read from disk every token, so the result
+  depends heavily on your SSD and on how much of the 16.5 GB file the OS can keep cached.
+- **8 GB** — the process fits, but only just, and with almost nothing left for page cache
+  every token reads the whole model from storage. Treat it as possible, not usable.
+
+Note the flat part of that curve: 0 → 21 resident layers barely moves throughput, because at
+low residency the pass is bound by reading weights, not by computing with them. Residency only
+starts paying once enough layers stay put to leave the disk idle.
+
+**On a small machine, run E2B instead.** It is fully resident in **1.8 GB** and generates at
+**15.1 tok/s** — 13× the 31B's speed:
+
+```powershell
+.\build\run_turbo_dense.exe --model models\gemma-4-e2b-dense.g4dense --prompt "Hi" --max-tokens 24
+```
+
+Also needed, regardless of RAM: a **Vulkan 1.3** GPU with subgroup intrinsics (this targets an
+AMD Radeon 780M), **Windows**, and about **20 GB of disk** for the two containers.
+
 ## Build
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full setup. In short:
