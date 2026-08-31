@@ -23,12 +23,31 @@ The 31B's weights are 15.06 GiB in INT4 and the driver stops accepting host-memo
 about 11.75 GiB, so **45 of 60 layers are resident and 15 stream from disk on every token**.
 Most of this engine's design follows from that one fact.
 
-**Current throughput: 1.13 tok/s** greedy decode at 45/60 resident, 4096 context.
-`docs/PERFORMANCE.md` has the breakdown and `docs/ROUND9_REPORT.md` the most recent changes.
+**Current throughput: 1.13 tok/s** greedy decode at 45/60 resident, 4096 context —
+[the full breakdown is in PERFORMANCE.md](docs/PERFORMANCE.md).
+
+## Documentation
+
+| | |
+|---|---|
+| [**Performance**](docs/PERFORMANCE.md) | Every measured number: where the time goes, hardware baselines, memory footprint, throughput, and the benchmarking rules. |
+| [**Architecture**](docs/ARCHITECTURE.md) | How the engine is put together, and the constraint the design follows from. |
+| [**Forward pass**](docs/FORWARD_PASS.md) | The arithmetic, constant by constant, against the upstream modelling source. |
+| [**Container format**](docs/G4DENSE_FORMAT.md) | The `.g4dense` v3 spec. |
+| [**Model sources**](docs/MODEL_SOURCES.md) | Pinned checkpoint revisions. |
+| [**Hardware ground truth**](docs/GROUND_TRUTH.md) | What `tools/probe_apu` measured on this machine. |
+| [**Contributing**](CONTRIBUTING.md) | Build setup, the correctness gate, and rules that exist because something broke. |
+
+**Round reports** — what changed and why, newest first. These carry the reasoning, including
+the ideas that did not work:
+[9](docs/ROUND9_REPORT.md) · [8](docs/ROUND8_REPORT.md) · [7](docs/ROUND7_REPORT.md) ·
+[6](docs/ROUND6_REPORT.md) · [5](docs/ROUND5_REPORT.md) · [4](docs/ROUND4_REPORT.md) ·
+[3](docs/ROUND3_REPORT.md). Earlier planning documents are archived in
+[docs/history/](docs/history/).
 
 ## Build
 
-See `CONTRIBUTING.md` for the full setup. In short:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full setup. In short:
 
 ```powershell
 python tools/bootstrap.py          # fetch w64devkit, DXC, Vulkan headers
@@ -80,7 +99,7 @@ python tools/convert_hf_to_g4dense.py --input models\gemma-4-31b-it-4bit --out m
 python tools/verify_weights.py models\gemma-4-31b-dense.g4dense
 ```
 
-`docs/G4DENSE_FORMAT.md` is the format spec. **A v2 container is rejected, not upgraded** — v3
+[docs/G4DENSE_FORMAT.md](docs/G4DENSE_FORMAT.md) is the format spec. **A v2 container is rejected, not upgraded** — v3
 16-byte-aligns the packed-weight blocks, so a v2 file read as v3 decodes at the wrong offsets
 and produces plausible-looking garbage. Weights and `.g4dense` bundles are gitignored and never
 committed.
@@ -103,7 +122,7 @@ python tools\make_synthetic_model.py --out tests\fixtures\tiny.g4dense --verify
 ```
 
 **Regenerate both after any change to the container layout.** The per-layer layout is spelled
-out in five places (`docs/G4DENSE_FORMAT.md` §4.2 lists them) and they must move together.
+out in five places ([G4DENSE_FORMAT.md §4.2](docs/G4DENSE_FORMAT.md#42-where-this-layout-is-written-down) lists them) and they must move together.
 
 ## Verifying a change
 
@@ -118,7 +137,7 @@ ctest --test-dir build --output-on-failure     # 16 of 16
 Both models must stay argmax- and top-5-exact against their oracles. `run_real_generation_test`
 cannot judge coherence; a human has to read the output.
 
-**On benchmarking**, from `docs/PERFORMANCE.md` §6 — each rule cost a wrong conclusion:
+**On benchmarking**, from [PERFORMANCE.md](docs/PERFORMANCE.md) §6 — each rule cost a wrong conclusion:
 three runs minimum per variant, compare variants within one session, confirm the disk is idle
 first, and never pipe a verification command (`| head` once reported exit 0 for a process
 crashing with exit 29).
@@ -127,7 +146,7 @@ crashing with exit 29).
 
 | | |
 |---|---|
-| `src/`, `include/g4dense/` | engine — `runner.cpp` is the forward pass, `streamer.cpp` the layer I/O |
-| `shaders/` | HLSL compiled to SPIR-V by `tools/compile_shaders.py` |
-| `tools/` | conversion, verification, the NumPy reference, benchmarks |
-| `docs/` | `PERFORMANCE.md`, `G4DENSE_FORMAT.md`, `FORWARD_PASS.md`, per-round reports |
+| [`src/`](src/), [`include/g4dense/`](include/g4dense/) | engine — [`runner.cpp`](src/runner.cpp) is the forward pass, [`streamer.cpp`](src/streamer.cpp) the layer I/O |
+| [`shaders/`](shaders/) | HLSL compiled to SPIR-V by [`tools/compile_shaders.py`](tools/compile_shaders.py) |
+| [`tools/`](tools/) | conversion, verification, the NumPy reference, benchmarks |
+| [`docs/`](docs/) | [PERFORMANCE.md](docs/PERFORMANCE.md), [G4DENSE_FORMAT.md](docs/G4DENSE_FORMAT.md), [FORWARD_PASS.md](docs/FORWARD_PASS.md), per-round reports |
