@@ -142,19 +142,21 @@ Three results that contradicted expectation, all measured:
 
 ### Still on the table
 
-- **19 layers still stream, costing ~850 ms per token.** They cannot be pinned: the driver
-  stops accepting imports at ~10.5 GiB on this machine, and going past that breaks submission
-  outright. Section 2 has the measurements. Reducing the KV cache from FP32 to FP16 would free
-  ~1.1 GiB of the same budget (about 4 more layers), but the attention kernel reads the cache as
-  FP32, so that is a shader change and a numerics change.
-- **The GPU phase is 495 ms** for ~16 GB of weight reads, i.e. ~33 GB/s, against 65-74 GB/s for
-  a pure streaming copy. The gap is the kernel's access pattern, and the occupancy experiment
-  above says it is not simply workgroup count.
-- **Prefill still runs one full weight pass per prompt token.** A 15-token prompt reads the
-  whole model 15 times, which is most of the 22 s end-to-end above. Fixing it needs a batched
-  INT4 GEMM; `ComputeKernel::GemmInt4Batch` is in the enum but no shader exists.
-- **The embedding lookup is still on the CPU** (`EmbedLookup.hlsl` exists and is parity-tested
-  but unreferenced), and `PostAttn.hlsl` / `LayerTail.hlsl` are unused fused epilogues.
+Rewritten at the end of round 8; the round-6 version of this list is superseded by
+`docs/ROUND7_REPORT.md` and `docs/ROUND8_REPORT.md`.
+
+- **15 layers still stream**, now costing ~322 ms per token rather than ~850. They cannot be
+  pinned: the driver stops accepting imports at ~11.75 GiB. Choosing *which* layers stream —
+  evenly spaced rather than the tail — was worth 12% and is the round's largest win, but the
+  remaining I/O is a hard memory ceiling on this machine.
+- **`GemvInt4` is explained, and now ~12% faster.** Eight 4-byte weight loads per quantization
+  group became two `Load4`s. It does not show up as throughput at this residency because the
+  pass is streaming-bound; it converts the moment that stops being true.
+- **Draft acceptance is lower than round 7 reported** (46.7–55.6% against 76.2%) and the
+  discrepancy is not explained. It is a throughput question only — speculative output is
+  token-for-token identical to non-speculative.
+- **The embedding lookup is still on the CPU** (`EmbedLookup.hlsl` is parity-tested but
+  unreferenced). It is ~0.1 ms of a ~1,300 ms pass.
 
 ## 2. Hardware baselines
 
@@ -162,9 +164,9 @@ From `tools/probe_apu`, re-verified independently during validation:
 
 | Measurement | Value |
 |---|---:|
-| NVMe buffered read, cold | 6.52 GB/s |
-| NVMe buffered read, warm | 5.68 GB/s |
-| NVMe `NO_BUFFERING` overlapped, QD 4–16 | 5.73–5.75 GB/s |
+| NVMe buffered read, cold | 8.19 GB/s |
+| NVMe buffered read, warm | 7.14 GB/s |
+| NVMe `NO_BUFFERING` overlapped, QD 4–16 | 3.08–3.09 GB/s |
 | GPU read bandwidth, heap 0 (device-local) | 73.57 GB/s |
 | GPU read bandwidth, heap 1 (host-visible) | 65.30 GB/s |
 | Staging copy, heap 1 → heap 0 | 26.94 GB/s |
@@ -226,23 +228,70 @@ not reach 8k context, so they are not a Tier 1 measurement — they are the only
 figures that exist. `config/tiers.json` projects a Tier 1 footprint of 4,739.7 MB, which
 remains unverified in practice.
 
-## 5. Throughput — measured, and short of gate
+## 5. Throughput — measured, and the target re-based
 
-At 9,614 ms per forward pass, single-token throughput is **0.104 TPS** against a 2.50 TPS gate.
+**Measured, three runs, `--prompt "Hi" --max-tokens 14 --temp 0 --no-spec`, 45 of 60 layers
+resident:**
 
-`config/tiers.json` reports `meets_target: false` for **every** tier:
+| | round 7 | round 8 |
+|---|---:|---:|
+| stream I/O | 566–585 ms | **318–326 ms** |
+| GPU queue | 625–631 ms | 746–752 ms |
+| LM head | 38 ms | 32 ms |
+| CPU other | 110 ms | 100 ms |
+| **throughput** | **0.667–0.677 tok/s** | **0.750–0.760 tok/s** |
 
-| Tier | Pinned | Projected TPS (α = 0.78) | Target | Meets |
-|---|---:|---:|---:|:---:|
-| 1 | 6 | 1.46 | 2.50 | ✘ |
-| 2 | 21 | 1.97 | 3.85 | ✘ |
-| 3 | 48 | 5.28 | 6.00 | ✘ |
-| 4 | 60 | 9.36 | 18.0 | ✘ (infeasible: needs 15,414 MiB of a 13,414 MiB heap) |
+Stream I/O and GPU overlap, so the phases do not sum to the reciprocal of the throughput;
+faster GPU work at a fixed residency simply returns time to I/O wait.
 
-Those projections additionally assume a batched K+1 speculative verification pass that **does
-not exist** — `ComputeKernel::GemmInt4Batch` currently maps to `GemvInt4.spv`, the unbatched
-kernel. Until that is built and `runner.cpp` reads `options.speculative_enabled`, the
-speculative multiplier in these projections is unearned.
+### The 2.50 TPS gate was unreachable and has been replaced
+
+Full residency needs **15.06 GiB** of layer imports. The driver stops accepting them at about
+**11.75 GiB**, and that is a heap ceiling rather than a tuning problem:
+
+```
+imports 11.75 + KV (FP16, 4096) 1.17 + LM head 0.79 + streaming pool 1.05  ≈  14.8 GiB
+                                                         of a 15.90 GiB heap
+```
+
+All three BIOS UMA settings were measured. **Minimum is the best of them** — 45 of 60 resident
+at 1,456 ms/pass, against 26 of 60 and 2,428 ms at 8 GB, where the larger device-local heap
+comes with only 23.81 GiB of visible RAM and the import broke down around 30 layers. 4 GB is
+worse on both counts.
+
+So the reachable ceiling with the current kernels is the pass with streaming perfectly hidden:
+GPU 748 + LM 32 + CPU 100 = **880 ms, or 1.14 tok/s**. `config/tiers.json` now carries that as
+the tier-3 target and a `measured_operating_point` block beside the projections.
+
+### The projection model is superseded, not merely unmet
+
+Round 8 checked `config/tiers.json`'s projections against the engine. They are wrong in **both**
+directions:
+
+- they mark tier 3 (45 pinned layers) **infeasible** — which is the configuration the engine
+  actually runs — because the two-tier heap accounting does not match how the driver assigns
+  imported host memory;
+- they project **5.30 TPS** for that same configuration against a measured **0.75**, an
+  overestimate of about 7×, because the α model prices streaming bandwidth and nothing else.
+  The GPU phase alone is 748 ms/token, a hard 1.34 TPS ceiling for which the model has no term.
+
+`projected_tps` is kept as a record of what was assumed before anything ran. Plan against
+`measured_operating_point`.
+
+### Speculative decoding
+
+Measured on "Write one sentence explaining what a ring buffer is", greedy:
+
+| tokens | 4 | 8 | 12 | 16 | 24 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| `--no-spec` | 10.1 | 14.3 | 18.5 | 22.6 | 30.8 | 38.1 s |
+| speculative | 9.2 | 13.0 | 16.6 | 20.5 | 26.2 | 30.1 s |
+| ratio | 1.10× | 1.10× | 1.11× | 1.10× | 1.18× | 1.26× |
+
+Round 7 measured a *loss* at 8 tokens. Spreading the streamed layers and the cheaper gemv
+removed enough per-layer cost that the six resident layers the draft displaces no longer
+dominate, so a length gate would only ever switch off a win. Acceptance measures 46.7% greedy /
+55.6% at default temperature, below the 76.2% recorded in round 7 from a single run.
 
 ## 6. Benchmark methodology
 
