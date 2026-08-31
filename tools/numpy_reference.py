@@ -147,6 +147,21 @@ def stats(name, a):
         name, a.mean(), a.std(), a.min(), a.max(), np.sqrt(np.mean(a * a)))
 
 
+SAVE_DIR = None
+
+
+def save(ours, filename):
+    """Write this reference's own tensor, so the GPU can be diffed against it directly.
+
+    Needed for E2B: there is no C++ CPU oracle for the PLE architecture, and writing one would
+    be a third implementation of the same assumptions. This reference is built from the
+    upstream source and shares no code with the engine, which is the property that matters."""
+    if not SAVE_DIR:
+        return
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    ours.astype(np.float32).tofile(os.path.join(SAVE_DIR, filename))
+
+
 def compare(name, ours, dump_dir, filename):
     path = os.path.join(dump_dir, filename)
     if not os.path.exists(path):
@@ -171,7 +186,12 @@ def main():
     ap.add_argument("--tokens", default=None,
                     help="comma-separated token sequence to prefill. Attention over history is "
                          "only exercised with two or more. Defaults to the single --token.")
+    ap.add_argument("--save-dir", default=None,
+                    help="write this reference's own tensors here, for the GPU to diff against")
     args = ap.parse_args()
+
+    global SAVE_DIR
+    SAVE_DIR = args.save_dir
 
     if args.tokens:
         tokens = [int(t) for t in args.tokens.split(",") if t.strip()]
@@ -204,14 +224,51 @@ def main():
     for pos, x in enumerate(xs):
         print("  pos %d token %-7d %s" % (pos, tokens[pos], stats("embed (scaled)", x)))
         compare("embed@%d" % pos, x, args.dump_dir, "token%d_embed.bin" % pos)
+        save(x, "token%d_embed.bin" % pos)
 
     # ---- Layers -----------------------------------------------------------------------
     layer_types = tc["layer_types"]
-    n_global_kv = tc.get("num_global_key_value_heads", 4)
+    _gkv = tc.get("num_global_key_value_heads")
+    n_global_kv = int(_gkv) if _gkv else n_kv
     global_hd = tc.get("global_head_dim", 512)
+
+    # Per-layer embeddings and KV sharing (the E2B/E4B architecture). Both are absent on the
+    # 31B, where ple_dim is 0 and no layer shares KV, so this file behaves exactly as before.
+    ple_dim = int(tc.get("hidden_size_per_layer_input", 0) or 0)
+    kv_shared = int(tc.get("num_kv_shared_layers", 0) or 0)
+    n_layers_cfg = tc["num_hidden_layers"]
+    first_shared = n_layers_cfg - kv_shared if kv_shared else n_layers_cfg
     theta_glob = tc["rope_parameters"]["full_attention"]["rope_theta"]
     prf = tc["rope_parameters"]["full_attention"].get("partial_rotary_factor", 0.25)
     sliding_window = tc.get("sliding_window", 1024)
+
+    # ---- Per-layer embeddings ---------------------------------------------------------
+    #
+    # Upstream (Gemma4TextModel.get_per_layer_inputs / project_per_layer_inputs):
+    #
+    #   per_layer_inputs     = embed_tokens_per_layer(token) * sqrt(ple_dim)
+    #   per_layer_projection = per_layer_model_projection(embeds) * hidden^-0.5
+    #   per_layer_projection = per_layer_projection_norm(per_layer_projection)   # RMSNorm(ple_dim)
+    #   combined             = (per_layer_projection + per_layer_inputs) * 2^-0.5
+    #
+    # The hidden^-0.5 scale is applied before an RMSNorm over each ple_dim slice, so it cancels
+    # exactly; it is written here anyway to keep the correspondence with upstream obvious.
+    ple = None
+    if ple_dim:
+        print("\nPer-layer embeddings (ple_dim=%d)" % ple_dim)
+        ple_emb_mat = dequant(idx, "model.embed_tokens_per_layer")
+        ple_proj_mat = dequant(idx, "model.per_layer_model_projection")
+        ple_norm_w = norm_weight(idx, "model.per_layer_projection_norm.weight")
+        ple = []
+        for pos, t in enumerate(tokens):
+            token_part = ple_emb_mat[t].astype(np.float32) * np.sqrt(np.float32(ple_dim))
+            proj = (ple_proj_mat @ xs[pos]) * (np.float32(d_model) ** -0.5)
+            token_part = token_part.reshape(n_layers_cfg, ple_dim)
+            proj = proj.reshape(n_layers_cfg, ple_dim)
+            for l in range(n_layers_cfg):
+                proj[l] = rms_norm(proj[l], ple_norm_w, eps, False)
+            ple.append(((proj + token_part) * np.float32(2.0 ** -0.5)).astype(np.float32))
+        print("  " + stats("combined[0]", ple[0]))
 
     print("\nLayers 0..%d over %d position(s), each diffed against the engine dump"
           % (args.layers - 1, len(xs)))
@@ -220,6 +277,7 @@ def main():
     # every position, which matters: dequantizing all 60 layers is already the bulk of the
     # runtime. The ordering is valid because layer l at position p needs only the layer l-1
     # output at position p (kept in `xs`) plus layer l's own K/V at positions <= p.
+    kv_store = {}
     for l in range(args.layers):
         P = "model.layers.%d." % l
         is_global = layer_types[l] == "full_attention"
@@ -228,23 +286,40 @@ def main():
         theta_l = theta_glob if is_global else theta
         pairs = (int(prf * hd) // 2) if is_global else (hd // 2)
 
+        shared = l >= first_shared
+        donor = l
+        if shared:
+            # The donor is the last NON-shared layer of the same attention type, so a sliding
+            # layer never reads a full-attention cache.
+            for d in range(first_shared - 1, -1, -1):
+                if (layer_types[d] == "full_attention") == is_global:
+                    donor = d
+                    break
+
         W_in_norm = norm_weight(idx, P + "input_layernorm.weight")
         W_post_attn = norm_weight(idx, P + "post_attention_layernorm.weight")
         W_pre_ffn = norm_weight(idx, P + "pre_feedforward_layernorm.weight")
         W_post_ffn = norm_weight(idx, P + "post_feedforward_layernorm.weight")
         qn = norm_weight(idx, P + "self_attn.q_norm.weight")
-        kn = norm_weight(idx, P + "self_attn.k_norm.weight")
+        # A KV-sharing layer has no k_proj/v_proj/k_norm at all; it reuses the donor's cache.
+        kn = None if shared else norm_weight(idx, P + "self_attn.k_norm.weight")
         W_q = dequant(idx, P + "self_attn.q_proj")
-        W_k = dequant(idx, P + "self_attn.k_proj")
-        W_v = None if is_global else dequant(idx, P + "self_attn.v_proj")
+        W_k = None if shared else dequant(idx, P + "self_attn.k_proj")
+        has_v = (not shared) and ((not is_global) or ple_dim != 0)
+        W_v = dequant(idx, P + "self_attn.v_proj") if has_v else None
         W_o = dequant(idx, P + "self_attn.o_proj")
+        W_ple_gate = dequant(idx, P + "per_layer_input_gate") if ple_dim else None
+        W_ple_proj = dequant(idx, P + "per_layer_projection") if ple_dim else None
+        W_post_ple = norm_weight(idx, P + "post_per_layer_input_norm.weight") if ple_dim else None
         W_gate = dequant(idx, P + "mlp.gate_proj")
         W_up = dequant(idx, P + "mlp.up_proj")
         W_down = dequant(idx, P + "mlp.down_proj")
         layer_scalar = as_bf16(raw(idx, P + "layer_scalar")[0])[0]
 
-        k_cache = []   # one [nkv*hd] vector per position
-        v_cache = []
+        # Keyed by donor: a shared layer reads the cache its donor built rather than its own.
+        if not shared:
+            kv_store[l] = ([], [])
+        k_cache, v_cache = kv_store[donor]
 
         for pos in range(len(xs)):
             x = xs[pos]
@@ -252,28 +327,30 @@ def main():
             h = rms_norm(x, W_in_norm, eps, False)
 
             q = W_q @ h
-            k = W_k @ h
+            k = (W_k @ h) if not shared else None
             # Full-attention layers have no v_proj (attention_k_eq_v), so upstream binds
             # value_states to the RAW k_proj output; k_norm then returns a NEW tensor and
             # rebinds key_states, leaving V untouched by it. Copy before touching k.
-            v = k.copy() if is_global else (W_v @ h)
+            v = None
+            if not shared:
+                v = (W_v @ h) if W_v is not None else k.copy()
 
             for i in range(n_q):
                 sl = slice(i * hd, (i + 1) * hd)
                 q[sl] = rope(rms_norm(q[sl], qn, eps, False), pos, hd, pairs, theta_l)
-            for i in range(nkv):
-                sl = slice(i * hd, (i + 1) * hd)
-                k[sl] = rms_norm(k[sl], kn, eps, False)
-                # v_norm = Gemma4RMSNorm(head_dim, with_scale=False): UNWEIGHTED, and applied
-                # on every layer -- only is_kv_shared_layer skips it, and this config sets
-                # num_kv_shared_layers = 0.
-                v[sl] = rms_norm(v[sl], 1.0, eps, False)
-            for i in range(nkv):
-                sl = slice(i * hd, (i + 1) * hd)
-                k[sl] = rope(k[sl], pos, hd, pairs, theta_l)
+            if not shared:
+                for i in range(nkv):
+                    sl = slice(i * hd, (i + 1) * hd)
+                    k[sl] = rms_norm(k[sl], kn, eps, False)
+                    # v_norm = Gemma4RMSNorm(head_dim, with_scale=False): UNWEIGHTED. Skipped
+                    # entirely on KV-sharing layers, which is the only thing that skips it.
+                    v[sl] = rms_norm(v[sl], 1.0, eps, False)
+                for i in range(nkv):
+                    sl = slice(i * hd, (i + 1) * hd)
+                    k[sl] = rope(k[sl], pos, hd, pairs, theta_l)
 
-            k_cache.append(k)
-            v_cache.append(v)
+                k_cache.append(k)
+                v_cache.append(v)
 
             # Causal attention over [first, pos]. Sliding layers see only the last
             # `sliding_window` positions; full-attention layers see everything.
@@ -308,6 +385,18 @@ def main():
             ffn = rms_norm(ffn, W_post_ffn, eps, False)
             x = residual + ffn
 
+            if ple_dim:
+                # Upstream, between the FFN residual add and layer_scalar:
+                #   h = per_layer_projection(gelu(per_layer_input_gate(h)) * per_layer_input)
+                #   h = residual + post_per_layer_input_norm(h)
+                res_ple = x.copy()
+                g = W_ple_gate @ x
+                g = 0.5 * g * (1.0 + np.tanh(0.7978845608028654 * (g + 0.044715 * g ** 3)))
+                g = g * ple[pos][l]
+                pp = W_ple_proj @ g
+                pp = rms_norm(pp, W_post_ple, eps, False)
+                x = res_ple + pp
+
             # `hidden_states *= self.layer_scalar` -- the last statement of the decoder layer,
             # after both residual adds. The per-layer-input block that would otherwise sit
             # between them is skipped when hidden_size_per_layer_input == 0, as it is here.
@@ -320,6 +409,7 @@ def main():
                   % (l, "GLOBAL" if is_global else "sliding", pos, np.sqrt(np.mean(x * x))))
             compare("layer%d@%d" % (l, pos), x, args.dump_dir,
                     "token%d_layer%d_hidden.bin" % (pos, l))
+            save(x, "token%d_layer%d_hidden.bin" % (pos, l))
 
     # ---- Final norm + LM head (only meaningful once every layer has run) ---------------
     if args.layers >= len(layer_types):
@@ -331,6 +421,7 @@ def main():
             print("  pos %d %s" % (pos, stats("final_normed", normed)))
             compare("final_normed@%d" % pos, normed, args.dump_dir,
                     "token%d_final_normed.bin" % pos)
+            save(normed, "token%d_final_normed.bin" % pos)
 
             # Tied head: the embedding matrix reused as the output projection.
             logits = embed_mat @ normed
@@ -340,6 +431,7 @@ def main():
             top = np.argsort(logits)[::-1][:5]
             print("  pos %d numpy top-5 token ids: %s" % (pos, top.tolist()))
             compare("logits@%d" % pos, logits, args.dump_dir, "token%d_logits.bin" % pos)
+            save(logits, "token%d_logits.bin" % pos)
 
     print("\nThe FIRST tensor that DIVERGES localizes the defect.")
     return 0

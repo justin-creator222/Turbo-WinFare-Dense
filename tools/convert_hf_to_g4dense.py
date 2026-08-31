@@ -56,7 +56,10 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
     num_kv_heads = int(text_cfg.get("num_key_value_heads", 16))
     head_dim = int(text_cfg.get("head_dim", 256))
     global_head_dim = int(text_cfg.get("global_head_dim", 512))
-    global_kv_heads = int(text_cfg.get("num_global_key_value_heads", 4))
+    # Falls back to the sliding KV-head count: E2B leaves num_global_key_value_heads null
+    # and its full-attention layers use the same single KV head (k_proj is 512 = 1 x 512).
+    _gkv = text_cfg.get("num_global_key_value_heads")
+    global_kv_heads = int(_gkv) if _gkv else num_kv_heads
     vocab_size = int(text_cfg.get("vocab_size", 262144))
     sliding_window = int(text_cfg.get("sliding_window", 1024))
     quant_group_size = 64
@@ -71,29 +74,13 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
     if not layer_types:
         raise ValueError(f"Missing 'layer_types' in checkpoint config at {config_file}")
 
-    # Reject architectures the engine does not implement, at conversion time.
-    #
-    # This matters because the converter has already produced a container that loads cleanly
-    # and computes nonsense: a 1.19 GiB E2B bundle built from a checkpoint carrying only 15 of
-    # its 35 k_proj tensors. Emitting a plausible-looking container for a model we cannot run
-    # costs far more than refusing to convert it.
-    per_layer_dim = int(text_cfg.get("hidden_size_per_layer_input", 0))
-    if per_layer_dim != 0:
-        raise ValueError(
-            f"unsupported architecture: hidden_size_per_layer_input={per_layer_dim}. "
-            "This model uses per-layer embeddings (PLE): the decoder layer applies a gate, "
-            "projection and norm against a per-layer input before layer_scalar, and neither "
-            "the runner nor the container format carries those tensors."
-        )
-
-    kv_shared = int(text_cfg.get("num_kv_shared_layers", 0))
-    if kv_shared != 0:
-        raise ValueError(
-            f"unsupported architecture: num_kv_shared_layers={kv_shared}. The last {kv_shared} "
-            "layers reuse an earlier layer's K/V and carry no k_proj, v_proj, k_norm or v_norm "
-            "of their own. The runner projects K and V on every layer, so it would read "
-            "tensors that are not in the checkpoint."
-        )
+    # Per-layer embeddings and KV sharing are the E2B/E4B architecture. They used to be
+    # rejected here; they are supported now, and the container records enough to read them
+    # back. A model with neither is written byte-for-byte as before.
+    ple_dim = int(text_cfg.get("hidden_size_per_layer_input", 0) or 0)
+    ple_vocab = int(text_cfg.get("vocab_size_per_layer_input", 0) or 0)
+    kv_shared = int(text_cfg.get("num_kv_shared_layers", 0) or 0)
+    first_shared_layer = num_layers - kv_shared if kv_shared else num_layers
 
     moe_declared = text_cfg.get("moe_layers") or text_cfg.get("num_experts")
     if moe_declared:
@@ -171,8 +158,27 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
     embed_bytes += read_tensor_bytes("model.norm.weight")
     embed_payload = pad_to_alignment(bytes(embed_bytes))
 
+    # Model-level PLE tensors. embed_tokens_per_layer is a second embedding table holding
+    # num_layers * ple_dim values per token; per_layer_model_projection maps the main embedding
+    # into the same shape; per_layer_projection_norm normalizes the latter.
+    ple_payload = b""
+    if ple_dim:
+        print(f"  Packing per-layer embeddings (ple_dim={ple_dim}, vocab={ple_vocab})...")
+        pb = bytearray()
+        pb += read_tensor_bytes("model.embed_tokens_per_layer.weight")
+        pb += read_tensor_bytes("model.embed_tokens_per_layer.scales")
+        pb += read_tensor_bytes("model.embed_tokens_per_layer.biases")
+        pb += read_tensor_bytes("model.per_layer_model_projection.weight")
+        pb += read_tensor_bytes("model.per_layer_model_projection.scales")
+        pb += read_tensor_bytes("model.per_layer_model_projection.biases")
+        pb += read_tensor_bytes("model.per_layer_projection_norm.weight")
+        ple_payload = pad_to_alignment(bytes(pb))
+
     # Assemble Layers 0..num_layers-1
     print(f"  Packing {num_layers} transformer blocks...")
+    # Measured feed-forward width per layer. E2B's last 20 layers are twice as wide as
+    # intermediate_size claims, and config.json does not say so anywhere.
+    layer_d_ff = [0] * 60
     layer_payloads = []
     for l in range(num_layers):
         l_bytes = bytearray()
@@ -180,28 +186,48 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
         is_global = (layer_types[l] == "full_attention")
 
         # Norms + Layer Scalar (BF16)
+        shared_kv = l >= first_shared_layer
+
+        # A KV-sharing layer keeps its own q_norm but has no k_norm, because it has no k_proj.
         norm_names = [
             "input_layernorm.weight",
             "post_attention_layernorm.weight",
             "pre_feedforward_layernorm.weight",
             "post_feedforward_layernorm.weight",
             "self_attn.q_norm.weight",
-            "self_attn.k_norm.weight",
-            "layer_scalar"
         ]
+        if not shared_kv:
+            norm_names.append("self_attn.k_norm.weight")
+        norm_names.append("layer_scalar")
+        if ple_dim:
+            norm_names.append("post_per_layer_input_norm.weight")
         for n in norm_names:
             l_bytes += read_tensor_bytes(prefix + n)
 
         # Projections
-        proj_names = [
-            ("self_attn.q_proj", False),
-            ("self_attn.k_proj", False),
-            ("self_attn.v_proj", is_global), # v_proj is absent in global attention layers
+        proj_names = [("self_attn.q_proj", False)]
+        if not shared_kv:
+            proj_names += [
+                ("self_attn.k_proj", False),
+                # v_proj is absent on full-attention layers when attention_k_eq_v is set
+                ("self_attn.v_proj", True),
+            ]
+        proj_names += [
             ("self_attn.o_proj", False),
             ("mlp.gate_proj", False),
             ("mlp.up_proj", False),
-            ("mlp.down_proj", False)
+            ("mlp.down_proj", False),
         ]
+        if ple_dim:
+            proj_names += [
+                ("per_layer_input_gate", False),
+                ("per_layer_projection", False),
+            ]
+        if l < 60:
+            gate_shape = tensor_index.get(f"{prefix}mlp.gate_proj.weight") or \
+                         tensor_index.get(f"language_model.{prefix}mlp.gate_proj.weight")
+            layer_d_ff[l] = int(gate_shape["shape"][0]) if gate_shape else d_ff
+
         for p, opt in proj_names:
             if opt and not has_tensor(prefix + p + ".weight"):
                 continue
@@ -213,11 +239,13 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
 
     # Compute Offsets (Support up to 60 layers)
     embed_offset = HEADER_SIZE
+    ple_offset = (embed_offset + len(embed_payload)) if ple_payload else 0
+    ple_size = len(ple_payload)
     embed_size = len(embed_payload)
     layer_offsets = [0] * 60
     layer_sizes = [0] * 60
 
-    cur_offset = HEADER_SIZE + embed_size
+    cur_offset = HEADER_SIZE + embed_size + len(ple_payload)
     for l in range(num_layers):
         if l < 60:
             layer_offsets[l] = cur_offset
@@ -228,6 +256,7 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
     print("  Computing payload SHA-256 and writing container...")
     hasher = hashlib.sha256()
     hasher.update(embed_payload)
+    hasher.update(ple_payload)
     for lp in layer_payloads:
         hasher.update(lp)
     payload_sha256 = hasher.digest()
@@ -237,7 +266,7 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
     # vs 256 / 16 on the 31B). They sit at the head of the former reserved block so
     # every preceding offset is unchanged and the struct stays 4096 bytes; a reader
     # that finds them zero treats the container as predating them.
-    header_fmt = "<IIIIIIIIIIIIIIQffffQQQQ60Q60Q32sII2984s"
+    header_fmt = "<IIIIIIIIIIIIIIQffffQQQQ60Q60Q32sIIIIIIQQ60I2712s"
     header_bytes = struct.pack(
         header_fmt,
         MAGIC,
@@ -268,7 +297,14 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
         payload_sha256,
         global_head_dim,
         global_kv_heads,
-        b'\x00' * 2984
+        ple_dim,
+        ple_vocab,
+        kv_shared,
+        0,              # ple_reserved
+        ple_offset,
+        ple_size,
+        *layer_d_ff,
+        b'\x00' * 2712
     )
 
     out_p = Path(output_file)
@@ -276,10 +312,11 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
     with open(out_p, "wb") as f:
         f.write(header_bytes)
         f.write(embed_payload)
+        f.write(ple_payload)
         for lp in layer_payloads:
             f.write(lp)
 
-    total_size = HEADER_SIZE + len(embed_payload) + sum(len(lp) for lp in layer_payloads)
+    total_size = HEADER_SIZE + len(embed_payload) + len(ple_payload) + sum(len(lp) for lp in layer_payloads)
     print(f"Successfully converted {output_file} ({total_size / (1024*1024):.2f} MB, {total_size:,} bytes)")
 
 
