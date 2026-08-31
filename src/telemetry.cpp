@@ -31,6 +31,8 @@ std::string TelemetrySnapshot::to_json_string() const {
     ss << "  \"heap1_budget_mb\": " << heap1_budget_mb << ",\n";
     ss << "  \"has_draft\": " << (has_draft ? "true" : "false") << ",\n";
     ss << "  \"draft_k\": " << draft_k << ",\n";
+    ss << "  \"speculative_drafted\": " << speculative_drafted << ",\n";
+    ss << "  \"speculative_accepted\": " << speculative_accepted << ",\n";
     ss << "  \"total_tokens_generated\": " << total_tokens_generated << ",\n";
     ss << "  \"breakdown\": {\n";
     ss << "    \"stream_io_ms\": " << stream_io_ms << ",\n";
@@ -71,6 +73,8 @@ void TelemetryCollector::record_generation_step(double step_time_ms, uint32_t to
     g_snapshot.total_tokens_generated += tokens_produced;
     g_total_draft += draft_tokens;
     g_total_accepted += accepted_tokens;
+    g_snapshot.speculative_drafted = g_total_draft;
+    g_snapshot.speculative_accepted = g_total_accepted;
     if (g_total_draft > 0) {
         g_snapshot.speculative_acceptance_rate = static_cast<double>(g_total_accepted) / g_total_draft;
     }
@@ -138,6 +142,15 @@ TelemetrySnapshot TelemetryCollector::snapshot() const {
     }
 
     return s;
+}
+
+void TelemetryCollector::reset_speculative_stats() {
+    std::lock_guard<std::mutex> lock(g_telemetry_mutex);
+    g_total_draft = 0;
+    g_total_accepted = 0;
+    g_snapshot.speculative_drafted = 0;
+    g_snapshot.speculative_accepted = 0;
+    g_snapshot.speculative_acceptance_rate = 0.0;
 }
 
 void TelemetryCollector::reset() {

@@ -10,6 +10,12 @@ struct TelemetrySnapshot {
     double tps{0.0};
     double ttft_ms{0.0};
     double speculative_acceptance_rate{0.0};
+    // The rate's denominator, published because it is SMALL. A 24-token generation runs a
+    // handful of verify rounds, so this is typically 15-35 drafts: "46.7%" is 7 of 15, not a
+    // stable percentage, and reading it as one is how a 76.2% single sample became a phantom
+    // regression to chase.
+    uint64_t speculative_drafted{0};
+    uint64_t speculative_accepted{0};
     double nvme_read_gbs{0.0};
     double ram_footprint_mb{0.0};
     double ram_total_mb{0.0};
@@ -27,7 +33,7 @@ struct TelemetrySnapshot {
     double heap0_budget_mb{13417.62};
     double heap1_budget_mb{6708.75};
     bool has_draft{false};
-    uint32_t draft_k{6};
+    uint32_t draft_k{8};
 
     uint64_t total_tokens_generated{0};
     uint64_t total_speculative_passes{0};
@@ -74,6 +80,11 @@ public:
 
     TelemetrySnapshot snapshot() const;
     void reset();
+
+    // Clears ONLY the speculative counters. reset() wipes the whole snapshot, including the
+    // model state published once at load time (resident layers, gpu_name, max_context), so it
+    // cannot be used per generation without blanking the fields the UI reads.
+    void reset_speculative_stats();
 
 private:
     TelemetryCollector() = default;

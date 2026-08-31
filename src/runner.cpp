@@ -1874,6 +1874,10 @@ void ForwardRunner::generate(const std::string& prompt,
                              TokenCallback on_token,
                              std::atomic<bool>* cancel_flag) {
     is_generating_ = true;
+    // Per generation, not per process. These counters were cumulative and never cleared, so in
+    // server mode the acceptance rate was a lifetime average that drifted across requests and
+    // could not be compared with anything.
+    TelemetryCollector::instance().reset_speculative_stats();
     auto start_time = std::chrono::high_resolution_clock::now();
 
     if (!tokenizer_ || !tokenizer_->is_loaded()) {

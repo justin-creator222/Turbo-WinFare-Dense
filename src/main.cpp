@@ -76,7 +76,17 @@ int main(int argc, char** argv) {
     float temp = 0.2f;
     float top_p = 0.95f;
     int top_k = 64;
-    int draft_k = 4;
+    // 8, matching GenerationOptions and capped by kGemmMaxBatch (the verify batch is K wide).
+    //
+    // Measured on "Write one sentence explaining what a ring buffer is", 24 tokens, greedy,
+    // three runs each: K=8 takes 20.58-20.81 s against K=4's 26.06-26.45 s. The target pass
+    // costs ~1,330 ms and a draft pass ~65 ms, a 20:1 ratio, so drafting more per round is
+    // nearly free and amortizes the expensive pass over more accepted tokens. The CLI said 4
+    // and GenerationOptions said 6, so the server was running an untuned third configuration.
+    //
+    // It costs 1-3% on prompts that stop early, where the last round over-drafts. That is a
+    // good trade for 21% on generations that run to length.
+    int draft_k = 8;
     bool speculative = true;
     bool run_server = false;
     bool cpu_mode = false;
