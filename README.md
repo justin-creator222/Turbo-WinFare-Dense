@@ -31,7 +31,8 @@ Most of this engine's design follows from that one fact.
 See `CONTRIBUTING.md` for the full setup. In short:
 
 ```powershell
-python tools/download_toolchain.py
+python tools/bootstrap.py          # fetch w64devkit, DXC, Vulkan headers
+python tools/bootstrap.py --verify # confirm the toolchain works
 $env:PATH = "C:\w64devkit\bin;" + $env:PATH
 cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=C:/w64devkit/bin/g++.exe
 cmake --build build

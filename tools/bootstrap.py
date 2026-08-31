@@ -3,7 +3,7 @@ Bootstrap and verification script for Turbo-WinFare Dense toolchain.
 
 Manages and verifies:
   * w64devkit       -> C:\\w64devkit          (g++, as, ld, etc.)
-  * cmake / ninja   -> c:\\Users\\Justin\\Code\\Turbo\\.venv\\Scripts or PATH
+  * cmake / ninja   -> PATH (or $TURBO_SIBLING_ROOT/.venv/Scripts, if set)
   * DXC             -> build/dxc.exe, build/dxcompiler.dll, build/dxil.dll
   * Vulkan-Headers  -> third_party/vulkan/include (vulkan/vulkan.h, etc.)
   * vulkan-1.dll    -> C:\\Windows\\System32\\vulkan-1.dll
@@ -28,8 +28,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 W64DEVKIT_DIR = Path("C:/w64devkit")
-SIBLING_VENV_SCRIPTS = Path("C:/Users/Justin/Code/Turbo/.venv/Scripts")
-SIBLING_BUILD = Path("C:/Users/Justin/Code/Turbo/build")
+# Optional local fallback for cmake/ninja/DXC.
+#
+# This was a hardcoded path to the author's machine, which is useless to anyone else and
+# leaks a private repo's layout. It is now opt-in: set TURBO_SIBLING_ROOT to a checkout that
+# already has these tools built, or leave it unset and everything is fetched from upstream.
+_SIBLING_ROOT = os.environ.get("TURBO_SIBLING_ROOT", "").strip()
+SIBLING_VENV_SCRIPTS = Path(_SIBLING_ROOT) / ".venv" / "Scripts" if _SIBLING_ROOT else None
+SIBLING_BUILD = Path(_SIBLING_ROOT) / "build" if _SIBLING_ROOT else None
 BUILD_DIR = REPO_ROOT / "build"
 THIRD_PARTY_DIR = REPO_ROOT / "third_party"
 VULKAN_INCLUDE_DIR = THIRD_PARTY_DIR / "vulkan" / "include"
@@ -158,12 +164,12 @@ def install_dxc(force=False):
     except Exception as e:
         print(f"[dxc] GitHub fetch failed: {e}")
         # Fallback copy from sibling build if available
-        if SIBLING_BUILD.exists():
+        if SIBLING_BUILD is not None and SIBLING_BUILD.exists():
             for fname in ("dxcompiler.dll", "dxil.dll"):
                 src = SIBLING_BUILD / fname
                 if src.exists():
                     shutil.copy2(src, BUILD_DIR / fname)
-                    print(f"[dxc] copied {fname} from sibling build")
+                    print(f"[dxc] copied {fname} from $TURBO_SIBLING_ROOT/build")
         if not (BUILD_DIR / "dxc.exe").exists():
             raise RuntimeError(f"Could not install dxc.exe: {e}")
 
@@ -229,14 +235,14 @@ def verify_toolchain():
 
     # 3. Check cmake
     cmake = shutil.which("cmake")
-    if not cmake and SIBLING_VENV_SCRIPTS.exists():
+    if not cmake and SIBLING_VENV_SCRIPTS is not None and SIBLING_VENV_SCRIPTS.exists():
         candidate = SIBLING_VENV_SCRIPTS / "cmake.exe"
         if candidate.exists():
             cmake = str(candidate)
             os.environ["PATH"] = f"{SIBLING_VENV_SCRIPTS}{os.pathsep}{os.environ.get('PATH', '')}"
 
     if not cmake:
-        errors.append("cmake.exe not found on PATH or sibling venv")
+        errors.append("cmake.exe not found on PATH (see TURBO_SIBLING_ROOT)")
     else:
         res = subprocess.run([cmake, "--version"], capture_output=True, text=True)
         if res.returncode == 0:
@@ -246,13 +252,13 @@ def verify_toolchain():
 
     # 4. Check ninja
     ninja = shutil.which("ninja")
-    if not ninja and SIBLING_VENV_SCRIPTS.exists():
+    if not ninja and SIBLING_VENV_SCRIPTS is not None and SIBLING_VENV_SCRIPTS.exists():
         candidate = SIBLING_VENV_SCRIPTS / "ninja.exe"
         if candidate.exists():
             ninja = str(candidate)
 
     if not ninja:
-        errors.append("ninja.exe not found on PATH or sibling venv")
+        errors.append("ninja.exe not found on PATH (see TURBO_SIBLING_ROOT)")
     else:
         res = subprocess.run([ninja, "--version"], capture_output=True, text=True)
         if res.returncode == 0:

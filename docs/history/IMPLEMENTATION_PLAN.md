@@ -3,7 +3,7 @@
 **Spec:** `spec.md` (Turbo-WinFare Dense, Gemma 4 31B, APU streaming runtime)
 **Executor:** Gemini 3.7 Flash / Google Antigravity 2.0, `/goal` with sub-agent delegation
 **Validator:** Claude Opus 5 (re-engaged at Phase 6 against §10 Acceptance Gates)
-**Target repo:** `c:\Users\Justin\Code\Dense Turbo` (currently empty)
+**Target repo:** `<repo root>` (currently empty)
 
 ---
 
@@ -19,7 +19,7 @@ that streaming cost across multiple tokens with speculative decoding.
 
 ### What already exists and shapes this plan
 
-`c:\Users\Justin\Code\Turbo` is a **shipped, working** Turbo-WinFare for Gemma 4 26B-A4B
+`<sibling engine>` is a **shipped, working** Turbo-WinFare for Gemma 4 26B-A4B
 (MoE), targeting this exact hardware, at **8.8 tok/s**. Its `CLAUDE.md` is a 490-line record
 of what was measured, what was tried and rejected, and which forward-pass constants produce
 fluent-but-wrong output when missed. Dense Turbo is a **fork and port** of that codebase:
@@ -47,7 +47,7 @@ streaming HF converter, an HTTP/OpenAI server, and 15 GPU kernels already diffed
 
 ### Four decisions taken (confirmed with the user)
 
-1. **Fork & port** from `c:\Users\Justin\Code\Turbo`, not greenfield.
+1. **Fork & port** from `<sibling engine>`, not greenfield.
 2. **Vulkan 1.3 backend, kernels stay in HLSL**, compiled to SPIR-V by DXC
    (`-spirv -fspv-target-env=vulkan1.3`). Meets §5's Vulkan mandate without rewriting
    CPU-verified kernels into a second language or bootstrapping the Vulkan SDK.
@@ -190,7 +190,7 @@ encode measured findings, not opinions.
 `_w64devkit_asset` comment documents a real clean-machine failure — keep it).
 
 Installs/verifies: w64devkit at `C:\w64devkit`; cmake + ninja (reuse
-`c:\Users\Justin\Code\Turbo\.venv\Scripts` or install into a local venv); DXC
+`<sibling engine>\.venv\Scripts` or install into a local venv); DXC
 (`dxcompiler.dll`, `dxil.dll`) into `build/`; Vulkan headers (`Vulkan-Headers` repo — the
 loader `vulkan-1.dll` 1.4.341 is already in System32, the SDK is not needed).
 
@@ -268,7 +268,7 @@ under its ceiling.
 Single-threaded, orchestrator only. No sub-agents until Gate 1 passes.
 
 ### T1.1 — Fork and rename
-Copy the reusable subset of `c:\Users\Justin\Code\Turbo` into `Dense Turbo`. Rename
+Copy the reusable subset of `<sibling engine>` into `Dense Turbo`. Rename
 `gturbo::` → `g4dense::`, `include/gturbo/` → `include/g4dense/`. **Do not copy**: `build/`,
 `.venv/`, `gemma-4-26b-a4b.gturbo/`, `turbo-fieldfare-main/`, `packed_experts.*`,
 `resident_index.*` (superseded by the `.g4dense` v2 header), the MoE shaders. Carry `LICENSE`,

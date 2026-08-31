@@ -1,7 +1,7 @@
 # Antigravity 2.0 kickoff prompt
 
 Paste the block below into Google Antigravity 2.0 as a single `/goal` invocation.
-Working directory must be `c:\Users\Justin\Code\Dense Turbo`.
+Working directory must be `<repo root>`.
 
 ---
 
@@ -18,7 +18,7 @@ READ THESE THREE DOCUMENTS BEFORE WRITING ANY CODE
 2. spec.md (repo root) — the original product spec. WHERE IT DISAGREES WITH THE PLAN,
    THE PLAN WINS. Its header lists which sections are superseded and why.
 
-3. c:\Users\Justin\Code\Turbo\CLAUDE.md — a shipped, working sibling engine for the Gemma 4
+3. <sibling engine>\CLAUDE.md — a shipped, working sibling engine for the Gemma 4
    26B MoE variant on this exact hardware, at 8.8 tok/s. You are FORKING this codebase.
    Its 490 lines record measurements, not opinions. Several document bugs that reproduce
    exactly in the dense design. Read it before porting any file or interpreting any benchmark.
@@ -28,7 +28,7 @@ FIVE RULES THAT OVERRIDE EVERYTHING ELSE
 ═══════════════════════════════════════════════════════════════
 
 1. THE SIBLING REPO IS READ-ONLY.
-   c:\Users\Justin\Code\Turbo is the user's shipped product. Read it, copy from it — never
+   <sibling engine> is the user's shipped product. Read it, copy from it — never
    edit, build, benchmark, git-commit, or run anything inside it. Copy files OUT to
    "Dense Turbo" and modify them there.
 
@@ -60,9 +60,9 @@ TOOLCHAIN
   C:\w64devkit\bin\g++.exe          exists, NOT on PATH.
                                     Add C:\w64devkit\bin to PATH first or g++ dies with
                                     "cannot execute 'as'". This is the C++ compiler. Use it.
-  cmake.exe / ninja.exe             c:\Users\Justin\Code\Turbo\.venv\Scripts\ (not on PATH)
+  cmake.exe / ninja.exe             <sibling engine>\.venv\Scripts\ (not on PATH)
   python 3.12.13                    same venv; has torch, numpy, safetensors, huggingface_hub
-  dxcompiler.dll + dxil.dll         c:\Users\Justin\Code\Turbo\build\ — copy them, do not
+  dxcompiler.dll + dxil.dll         <sibling engine>\build\ — copy them, do not
                                     re-download unless bootstrap says they are stale
 
 NOT INSTALLED — DO NOT ATTEMPT TO USE
@@ -140,7 +140,7 @@ YOU HAVE GONE WRONG IF…
 
 · You are writing Vulkan or kernel code and Phase 0 is not finished.
 · You spawned sub-agents before Gate 2 passed.
-· You edited, built, or ran anything inside c:\Users\Justin\Code\Turbo.
+· You edited, built, or ran anything inside <sibling engine>.
 · You hardcoded a wave/subgroup width of 32. RDNA 3 runs a 256-thread group as Wave64.
   Query WaveGetLaneCount(); force Wave32 explicitly where WMMA needs it.
 · You wrote a placeholder, stub, or zero-filled file to make something "work".

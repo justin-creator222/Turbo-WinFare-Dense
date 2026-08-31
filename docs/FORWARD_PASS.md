@@ -1,7 +1,7 @@
 # Forward Pass Specification & Authoritative Architecture
 
 **Date:** 2026-08-29  
-**Status:** Authoritative (Supersedes `spec.md` §3.1 and §5.1)  
+**Status:** Authoritative (Supersedes `docs/history/spec.md` §3.1 and §5.1)  
 **Target Model:** `mlx-community/gemma-4-31b-it-4bit` (@ `696d436c404745a59f30e4939a658162b0a9e57f`)  
 **Draft Model:** `mlx-community/gemma-4-e2b-it-4bit` (@ `238767527555cb75a05732a84dff5d6ba0dd6809`)
 

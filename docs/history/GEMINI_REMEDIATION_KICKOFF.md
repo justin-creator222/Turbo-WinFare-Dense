@@ -1,7 +1,7 @@
 # Antigravity 2.0 remediation kickoff
 
 Paste the block below into Antigravity 2.0 as a single `/goal`.
-Working directory: `c:\Users\Justin\Code\Dense Turbo`.
+Working directory: `<repo root>`.
 
 ---
 
@@ -16,7 +16,7 @@ READ IN THIS ORDER BEFORE TOUCHING ANY FILE
 
 1. docs/VALIDATION_REPORT.md  — what was found wrong, with evidence. Nine findings, F1–F9.
 2. REMEDIATION_PLAN.md        — THE AUTHORITY. Phases R0–R6, gates, task ids.
-3. c:\Users\Justin\Code\Turbo\CLAUDE.md — the sibling engine. READ-ONLY. Never edit or build it.
+3. <sibling engine>\CLAUDE.md — the sibling engine. READ-ONLY. Never edit or build it.
 
 spec.md is superseded wherever it disagrees with REMEDIATION_PLAN.md. Its §3.1 geometry and
 §5.1 memory design are both known-wrong on this hardware.
@@ -78,7 +78,7 @@ ENVIRONMENT — VERIFIED, DO NOT REDISCOVER
 ═══════════════════════════════════════════════════════════════
 
   PATH first:  C:\w64devkit\bin    (else g++ fails with "cannot execute 'as'")
-  cmake/ninja/python:  c:\Users\Justin\Code\Turbo\.venv\Scripts\   (has torch, numpy,
+  cmake/ninja/python:  <sibling engine>\.venv\Scripts\   (has torch, numpy,
                        safetensors, huggingface_hub)
   DXC:         build\dxc.exe, dxcompiler.dll, dxil.dll — already present
   Vulkan:      loader 1.4.341; ICD registered under the DISPLAY CLASS key, NOT under
@@ -135,7 +135,7 @@ YOU HAVE GONE WRONG IF…
 · You are rewriting streamer.cpp, vk_pipeline.cpp, kv_cache.cpp, or cpu_reference.cpp.
 · You piped a verification command through head, tail, or grep and read the exit code.
 · You proceeded past Gate R0 or Gate R2 without reporting.
-· You edited anything under c:\Users\Justin\Code\Turbo.
+· You edited anything under <sibling engine>.
 · You spawned sub-agents before R3.
 · You hardcoded a subgroup width of 32, or a vocab size, or a layer-type pattern.
 

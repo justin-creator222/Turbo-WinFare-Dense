@@ -187,3 +187,9 @@ add_test(NAME run_prompt_pipeline_test COMMAND $<TARGET_FILE:run_prompt_pipeline
 # every optimization in the speed round is judged by.
 add_executable(bench_gpu tools/bench_gpu.cpp)
 target_link_libraries(bench_gpu PRIVATE g4dense ${VULKAN_LIB})
+
+# The hardware probe that generates docs/GROUND_TRUTH.md and build/ground_truth.json.
+# It was previously compiled by hand, which meant the document could not be reproduced from
+# a clean checkout. It needs DXGI for adapter budgets alongside Vulkan.
+add_executable(probe_apu tools/probe_apu/main.cpp)
+target_link_libraries(probe_apu PRIVATE g4dense ${VULKAN_LIB} dxgi)

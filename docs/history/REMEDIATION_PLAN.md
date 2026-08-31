@@ -3,7 +3,7 @@
 **Supersedes** the original implementation plan (build-from-scratch), which is now history.
 **Input:** `docs/VALIDATION_REPORT.md` — verdict NOT ACCEPTED, 0 of 5 gates pass.
 **Executor:** Gemini 3.7 Flash / Antigravity 2.0, hardened prompt · **Validator:** Claude Opus 5
-**Repo:** `c:\Users\Justin\Code\Dense Turbo` @ `f0338bd`
+**Repo:** `<repo root>` @ `f0338bd`
 
 ---
 
@@ -231,7 +231,7 @@ shipping a hash function as a neural network. These rules target *that* failure 
 6. **Halt at Gate R0 and Gate R2** and report. R0 re-baselines the throughput gate; R2 is the
    first point at which any real-model claim is possible.
 7. **Read `docs/VALIDATION_REPORT.md` first**, then this plan, then the sibling
-   `c:\Users\Justin\Code\Turbo\CLAUDE.md` (read-only).
+   `<sibling engine>\CLAUDE.md` (read-only).
 
 ---
 
