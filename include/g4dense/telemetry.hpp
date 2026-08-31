@@ -21,6 +21,14 @@ struct TelemetrySnapshot {
     uint32_t context_tokens{0};
     uint32_t max_context{8192};
 
+    std::string gpu_name{"Radeon 780M"};
+    double heap0_usage_mb{0.0};
+    double heap1_usage_mb{0.0};
+    double heap0_budget_mb{13417.62};
+    double heap1_budget_mb{6708.75};
+    bool has_draft{false};
+    uint32_t draft_k{6};
+
     uint64_t total_tokens_generated{0};
     uint64_t total_speculative_passes{0};
 

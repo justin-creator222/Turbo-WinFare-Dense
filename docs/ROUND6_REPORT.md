@@ -4,17 +4,21 @@
 
 ## Summary
 
-Round 5 made the engine correct. This round made it **7.8× faster**, with byte-identical output.
+Round 5 made the engine correct. This round made it **7.6× faster**, with identical output.
 
 | | round 5 | round 6 |
 |---|---:|---:|
-| forward pass | 11,104 ms | **1,421 ms** |
-| "What is the capital of France?" | 279.2 s | **37.7 s** |
-| "…what a ring buffer is" | 507.1 s | **64.7 s** |
-| "List three primary colors." | 396.2 s | **49.5 s** |
+| forward pass | 11,104 ms | **1,456 ms** |
+| "What is the capital of France?" | 279.2 s | **38.3 s** |
+| "…what a ring buffer is" | 507.1 s | **66.6 s** |
+| "List three primary colors." | 396.2 s | **55.4 s** |
 
 All three prompts produce exactly the same text as round 5, and `run_gpu_forward_test` is still
 argmax-exact against the CPU oracle at all four positions.
+
+Final configuration: **41 of 60 layers resident**, 19 streamed, at minimum BIOS UMA. The figures
+in the step table below were taken at 42 resident during development; the shipped budget is
+slightly more conservative, which costs one layer.
 
 Per-phase, measured with the same command throughout
 (`run_turbo_dense --prompt "Hi" --max-tokens 2 --temp 0`):
@@ -26,6 +30,7 @@ Per-phase, measured with the same command throughout
 | 42 of 60 layers resident | 956 | 534 | 35 | 18 | **1,544** |
 | unbuffered async streaming | 789 | 532 | 43 | 87 | **1,451** |
 | 8 rows per gemv threadgroup | 800 | 495 | 41 | 85 | **1,421** |
+| shipped budget, 41 resident | 850 | 477 | 41 | 88 | **1,456** |
 
 ---
 
@@ -97,35 +102,44 @@ memory ceiling.
 
 ---
 
-## The UMA recommendation was backwards — and should be revisited
+## The UMA recommendation was backwards -- twice
 
-Before implementation I recommended lowering the BIOS UMA frame buffer, reasoning that
-Windows-visible RAM was the binding constraint. **That was wrong.** The binding constraint is
-the total memory Vulkan can allocate, and it *shrinks* as UMA shrinks:
+I first recommended *lowering* the BIOS UMA carve-out, on the theory that Windows-visible RAM
+was the binding constraint. Seeing the Vulkan heap total shrink from 19.90 to 15.90 GiB, I then
+recommended *raising* it back to 8 GB, on the theory that the heap total was the real limit.
 
-| | DEVICE_LOCAL heap | host-visible heap | 256 MB heap | **total** |
-|---|---:|---:|---:|---:|
-| 8 GB UMA (before) | 13.10 GiB | 6.55 GiB | 0.25 GiB | **19.90 GiB** |
-| minimum UMA (now) | 10.60 GiB | 5.30 GiB | — | **15.90 GiB** |
+**Both were reasoning where I should have measured.** With the engine actually running at each
+setting:
 
-Lowering UMA did return 7.7 GB to Windows (24,381 → 32,061 MB visible), but it cost 4.0 GiB of
-the ceiling that actually decides how many layers can be resident.
+| BIOS UMA | Vulkan heaps | visible RAM | resident layers | forward pass | TPS |
+|---|---:|---:|---:|---:|---:|
+| **minimum** | 15.90 GiB | 31.3 GiB | **41 / 60** | **1,456 ms** | **0.088** |
+| 8 GB | 19.90 GiB | 23.8 GiB | 26 / 60 | 2,428 ms | 0.052 |
 
-The budget under that ceiling:
+Minimum UMA wins by 1.7x. Imported layers are pinned *system* RAM, not Vulkan heap memory, so
+giving RAM back to Windows is exactly what buys residency; the heap total grows with UMA but
+never binds. The cost of the round trip was two BIOS changes and a reboot each.
 
-```
-weights          15.06 GiB      LM head           0.74 GiB
-KV cache (FP32)   2.19 GiB      streaming pool    1.05 GiB     total  19.04 GiB
-```
+Crossing the pinning limit is unrecoverable, which is what made it expensive to find. At 8 GB
+UMA the driver accepted 58 layers and then failed every `vkQueueSubmit` with
+`VK_ERROR_OUT_OF_DEVICE_MEMORY`, and freeing the imports did not restore it -- so there is no
+safe way to discover the edge by walking up to it. `VK_EXT_memory_budget` is no help either: it
+reported 12.69 GiB free immediately after that import, because it does not account for imported
+host memory. Hence a static budget plus a loud startup probe, rather than anything adaptive.
 
-At **15.90 GiB** only 42 of 60 layers fit, and the other 18 cost ~800 ms per token.
-At **19.90 GiB** all 60 fit, which would remove that 800 ms — roughly **1.6 tok/s instead of
-0.70**, a further 2.3×. The code already handles this: it imports greedily and releases the
-streaming pool when nothing is left to stream.
+## Two bugs this shook out
 
-**This is a BIOS question now, not a code one**, and it is the single largest remaining win.
+**A failing submit looked like a fast one.** `vkQueueSubmit`'s result was never checked. When
+the over-greedy import broke the device, the forward pass reported ~0 ms of GPU time and
+"1.93 TPS" while printing an empty response -- a 20x speedup that was pure failure. All three
+submit sites now check, and the runner probes the device once after import rather than
+discovering this mid-generation.
 
----
+**Tier pinning starved the prefetch queue.** A fallback branch pinned three of the four
+streaming slots when no layer was resident, so `plan_layers()` threw "cache thrash" and the
+stream-everything path could not run at all. Pinning is now removed entirely: it only ever
+avoided a re-read, and residency does that strictly better -- a pinned slot still costs a
+269 MB read per token, a resident layer costs nothing.
 
 ## Verification
 

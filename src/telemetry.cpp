@@ -23,6 +23,13 @@ std::string TelemetrySnapshot::to_json_string() const {
     ss << "  \"streamed_layers\": " << streamed_layers << ",\n";
     ss << "  \"context_tokens\": " << context_tokens << ",\n";
     ss << "  \"max_context\": " << max_context << ",\n";
+    ss << "  \"gpu_name\": \"" << (gpu_name.empty() ? "Radeon 780M" : gpu_name) << "\",\n";
+    ss << "  \"heap0_usage_mb\": " << heap0_usage_mb << ",\n";
+    ss << "  \"heap1_usage_mb\": " << heap1_usage_mb << ",\n";
+    ss << "  \"heap0_budget_mb\": " << heap0_budget_mb << ",\n";
+    ss << "  \"heap1_budget_mb\": " << heap1_budget_mb << ",\n";
+    ss << "  \"has_draft\": " << (has_draft ? "true" : "false") << ",\n";
+    ss << "  \"draft_k\": " << draft_k << ",\n";
     ss << "  \"total_tokens_generated\": " << total_tokens_generated << ",\n";
     ss << "  \"breakdown\": {\n";
     ss << "    \"stream_io_ms\": " << stream_io_ms << ",\n";

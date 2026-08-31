@@ -91,10 +91,62 @@ Worth recording, because each would otherwise have been plausible work:
   microbenchmark not at all (28-36 GB/s before and after), though it is worth a consistent
   ~37 ms on the real pass, so it was kept.
 
+### Round 7 — prefill batched
+
+Prefill ran one full weight pass per prompt token. `forward_batch()` now runs a chunk of
+positions per pass: **532 ms per position against 1,456 ms sequential (2.74x)**, 2.96x end to
+end, with identical output.
+
+| | round 6 | round 7 |
+|---|---:|---:|
+| "What is the capital of France?" | 38.3 s | **17.0 s** |
+| `--prompt "Hi" --max-tokens 2` | 22.8 s | **7.7 s** |
+
+Two measurements worth keeping, because both contradict what theory predicted:
+
+- **The batched GEMM contributes almost none of that.** `GemmInt4Batch` beats M separate
+  `GemvInt4` dispatches by only **1.17x** — it is groupshared-read-bound, and raising
+  rows-per-group makes it worse. The win is amortizing streaming I/O and weight reads.
+- **Its first version was 0.58x — slower than what it replaced** — because each lane owned a
+  contiguous 16-column block and `lane*16 mod 32` hits only two LDS banks. Consecutive lanes
+  must read consecutive floats.
+
+Activation loads are also NOT the `GemvInt4` bottleneck: vectorising them to `Load4` moved the
+GPU phase from 476.7 ms to 477.8 ms. With round 6's occupancy result, that is two eliminated
+hypotheses and no third.
+
+### Round 7 — batched prefill, FP16 KV, a second architecture
+
+| | round 6 | round 7 |
+|---|---:|---:|
+| "What is the capital of France?" | 38.3 s | **15.0 s** |
+| `--prompt "Hi" --max-tokens 2` | 22.8 s | **6.9 s** |
+| resident layers | 41 / 60 | **45 / 60** |
+
+- **Batched prefill** replaced one weight pass per prompt token: 532 ms per position against
+  1,456 ms sequential. This is nearly all of the gain.
+- **FP16 KV cache** bought 4 resident layers -- not by relieving the RAM-fraction cap, but by
+  lowering the *driver's own* refusal point, which counts the cache in total device memory.
+- **E2B runs**, with per-layer embeddings and KV sharing: 13.2 tok/s, and as a speculative draft
+  it gives **1.33x on a 24-token generation at 76.2% acceptance**. It is a *loss* on short
+  outputs, where its 1.5 GiB import reserve costs the target 6 layers for too few tokens.
+
+Three results that contradicted expectation, all measured:
+
+- **The batched GEMM contributes almost none of the prefill win** (1.17x over M separate
+  gemvs); amortizing streaming and weight reads does.
+- Its first version was **0.58x -- slower than what it replaced** -- from a 16-way LDS bank
+  conflict (`lane*16 mod 32` hits two banks).
+- **Vectorising the gemv's activation loads did nothing** (476.7 -> 477.8 ms), eliminating the
+  second hypothesis about that kernel after round 6 eliminated occupancy.
+
 ### Still on the table
 
-- **18 layers still stream, costing ~800 ms per token.** They did not fit under the
-  device-memory ceiling. See section 2 -- this is now a BIOS question, not a code one.
+- **19 layers still stream, costing ~850 ms per token.** They cannot be pinned: the driver
+  stops accepting imports at ~10.5 GiB on this machine, and going past that breaks submission
+  outright. Section 2 has the measurements. Reducing the KV cache from FP32 to FP16 would free
+  ~1.1 GiB of the same budget (about 4 more layers), but the attention kernel reads the cache as
+  FP32, so that is a shader change and a numerics change.
 - **The GPU phase is 495 ms** for ~16 GB of weight reads, i.e. ~33 GB/s, against 65-74 GB/s for
   a pure streaming copy. The gap is the kernel's access pattern, and the occupancy experiment
   above says it is not simply workgroup count.
@@ -119,32 +171,28 @@ From `tools/probe_apu`, re-verified independently during validation:
 
 ### Memory heaps — and why SAM does not apply
 
-**These heaps changed when the BIOS UMA frame buffer was lowered to its minimum**, and not in
-the direction expected. Lowering UMA returned 7.7 GB to Windows (24,381 -> 32,061 MB visible)
-but *shrank* the total memory Vulkan can allocate, which is what actually bounds residency:
+**These heaps change with the BIOS UMA frame buffer, but the heaps are NOT what bounds
+residency.** Imported layers are pinned *system* RAM, not heap allocations, so what actually
+limits them is how much Windows lets the driver pin -- and a larger UMA carve-out takes RAM away
+from Windows. Measured in both directions on this machine:
 
-| | DEVICE_LOCAL heap | host-visible heap | 256 MB heap | **total** |
+| BIOS UMA | Vulkan heaps | visible RAM | resident layers | forward pass |
 |---|---:|---:|---:|---:|
-| 8 GB UMA (before) | 13.10 GiB | 6.55 GiB | 0.25 GiB | **19.90 GiB** |
-| minimum UMA (now) | 10.60 GiB | 5.30 GiB | — | **15.90 GiB** |
+| **minimum** | 15.90 GiB | 31.3 GiB | **41 / 60** | **1,456 ms** |
+| 8 GB | 19.90 GiB | 23.8 GiB | 26 / 60 | 2,428 ms |
 
-The weights need 15.06 GiB, and the LM head (0.74 GiB), KV cache (~2.2 GiB at FP32) and the
-streaming pool (1.05 GiB) share the same ceiling. At 15.90 GiB only 42 of 60 layers fit; at
-19.90 GiB all 60 would, which would remove the last ~800 ms of per-token I/O.
+**So minimum UMA is correct, and a bigger carve-out is 1.7x slower.** An earlier version of this
+document recommended raising UMA to 8 GB on the reasoning that the Vulkan heap total bounds
+residency. It does grow with UMA -- 15.90 to 19.90 GiB -- but it was never the binding
+constraint, and that recommendation is retracted.
 
-**So the UMA recommendation was backwards for this design and should be revisited.** It was
-made on the assumption that Windows-visible RAM was the binding constraint; the measurement
-says the Vulkan heap total is, and that grows with UMA rather than shrinking.
-
-Spec §5.1 assumes heap 2 is large enough for a 4 × 245 MB ring. It is not, and it **cannot be
-enlarged**: Resizable BAR / AMD SAM is a PCIe mechanism, and the Z1 Extreme's iGPU shares the
-memory controller rather than sitting behind a PCIe aperture. The 256 MB figure is an AMD
-driver convention mirroring the discrete-GPU model.
-
-This matters far less than it would on a discrete part, and the measurements show why: heap 0
-and heap 1 differ by only **12%** in read bandwidth because they are the same physical DRAM. On
-a discrete GPU that gap would be roughly 20×. Heap placement is therefore a minor optimization
-here, not an architectural constraint.
+Crossing the pinning limit is not a soft failure. At 8 GB UMA the driver accepted 58 layers
+(14.81 GiB) and then returned `VK_ERROR_OUT_OF_DEVICE_MEMORY` from **every** `vkQueueSubmit`,
+and freeing the imports again did not restore it. `VK_EXT_memory_budget` cannot warn about this
+either: it reported 12.69 GiB still free immediately after that import, because it does not
+account for imported host memory at all. The import is therefore governed by a static budget
+(the smaller of heap-reported free space less a 512 MB reserve, and 34% of visible RAM), with
+`G4DENSE_MAX_RESIDENT_LAYERS` to override it for calibration.
 
 ## 3. Numerical parity — measured
 
