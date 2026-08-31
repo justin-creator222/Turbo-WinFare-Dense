@@ -14,6 +14,14 @@ using namespace g4dense;
 namespace fs = std::filesystem;
 
 int main() {
+    // Shared with the draft runtime: one device, one set of pipelines.
+    auto vk_ctx = std::make_shared<VulkanContext>();
+    vk_ctx->initialize();
+    auto tok = std::make_shared<Tokenizer>();
+    if (fs::exists(resolve_resource_path("tokenizer.json"))) {
+        tok->load_vocabulary(resolve_resource_path("tokenizer.json"));
+    }
+
     std::cout << "========================================================\n"
               << "  Turbo-WinFare Dense: Speculative Decoding Tests     \n"
               << "========================================================" << std::endl;
@@ -74,21 +82,18 @@ int main() {
         DraftRuntime draft;
         bool caught = false;
         try {
-            draft.load_model("non_existent_model_checkpoint.g4dense");
+            draft.load_model("non_existent_model_checkpoint.g4dense", vk_ctx, tok);
         } catch (const std::exception& e) {
             caught = true;
         }
         assert(caught && "DraftRuntime must fail loudly on missing checkpoint!");
         std::cout << "   [PASS] DraftRuntime correctly throws on missing checkpoint." << std::endl;
 
-        // The E2B container is quarantined as invalid (models/quarantine/README.md): its
-        // checkpoint uses per-layer embeddings and shares KV across 20 of 35 layers, neither
-        // of which this engine implements. This block is therefore skipped until a draft
-        // model the engine can actually run exists. Speculative decoding has no verified
-        // draft model at present -- that is a real gap, not a passing test.
+        // E2B is a real draft model again: round 7 implemented the per-layer embeddings and
+        // KV sharing it needs, and it is validated against tools/numpy_reference.py.
         std::string e2b_path = resolve_bundle_path("models/gemma-4-e2b-dense.g4dense");
         if (fs::exists(e2b_path)) {
-            bool ok = draft.load_model(e2b_path);
+            bool ok = draft.load_model(e2b_path, vk_ctx, tok);
             assert(ok && draft.is_loaded());
             std::cout << "   [PASS] DraftRuntime loaded real E2B model: " << e2b_path << std::endl;
 

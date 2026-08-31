@@ -346,6 +346,106 @@ void bench_gemv(VulkanContext& ctx, VulkanPipelineManager& pm, VkCommandBuffer c
 }
 
 // ---------------------------------------------------------------------------------------
+// 3b. Batched GEMM vs repeated GEMV -- does prefill batching actually pay?
+// ---------------------------------------------------------------------------------------
+void bench_batch(VulkanContext& ctx, VulkanPipelineManager& pm, VkCommandBuffer cmd, VkQueue q) {
+    std::cout << "\n=== 3b. Prefill: M x GemvInt4 vs 1 x GemmInt4Batch ===\n";
+    std::cout << "  Prefill runs one full weight pass per prompt token today. This is whether\n"
+                 "  batching M positions against one weight pass actually recovers that.\n";
+
+    const GemvCase cases[] = {
+        {"gate/up_proj  21504 x 5376", 21504, 5376},
+        {"down_proj      5376 x 21504", 5376, 21504},
+    };
+    const uint32_t M = 8;
+
+    for (const auto& c : cases) {
+        const uint32_t groups = c.in_dim / 64;
+        const uint64_t w_bytes  = static_cast<uint64_t>(c.rows) * (c.in_dim / 8) * 4;
+        const uint64_t sb_bytes = static_cast<uint64_t>(c.rows) * groups * 2;
+        const uint64_t x_bytes  = static_cast<uint64_t>(c.in_dim) * 4 * M;
+        const uint64_t o_bytes  = static_cast<uint64_t>(c.rows) * 4 * M;
+
+        VkMemoryAllocation w, sb, bb, x, o;
+        try {
+            w  = ctx.allocate_buffer(w_bytes,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostCachedMapped);
+            sb = ctx.allocate_buffer(sb_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostCachedMapped);
+            bb = ctx.allocate_buffer(sb_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostCachedMapped);
+            x  = ctx.allocate_buffer(x_bytes,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+            o  = ctx.allocate_buffer(o_bytes,  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+        } catch (const std::exception& ex) {
+            std::cout << "    " << c.name << ": allocation failed: " << ex.what() << "\n";
+            continue;
+        }
+        if (x.mapped_ptr) {
+            float* xp = static_cast<float*>(x.mapped_ptr);
+            for (uint64_t i = 0; i < x_bytes / 4; ++i) xp[i] = 0.001f * static_cast<float>(i % 97);
+        }
+
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+
+        auto time_it = [&](bool batched) {
+            pm.reset_descriptor_pool();
+            const ComputeKernel k = batched ? ComputeKernel::GemmInt4Batch : ComputeKernel::GemvInt4;
+            vkResetCommandBuffer(cmd, 0);
+            vkBeginCommandBuffer(cmd, &bi);
+            const uint32_t reps = batched ? 1u : M;
+            for (uint32_t r = 0; r < reps; ++r) {
+                VkDescriptorSet ds = pm.allocate_descriptor_set(k);
+                pm.update_storage_buffer(ds, 0, w.buffer, 0, w_bytes);
+                pm.update_storage_buffer(ds, 1, sb.buffer, 0, sb_bytes);
+                pm.update_storage_buffer(ds, 2, bb.buffer, 0, sb_bytes);
+                pm.update_storage_buffer(ds, 3, x.buffer, 0, x_bytes);
+                pm.update_storage_buffer(ds, 6, o.buffer, 0, o_bytes);
+                uint32_t pc[12]{0};
+                pc[0] = c.rows;
+                pc[1] = c.in_dim;
+                if (batched) {
+                    pc[8] = M; pc[9] = c.in_dim * 4; pc[10] = c.rows * 4;
+                } else {
+                    pc[5] = r * c.in_dim * 4;   // x_byte_off for this position
+                    pc[6] = r * c.rows * 4;     // out_byte_off
+                }
+                pm.bind_kernel(cmd, k);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        pm.get_pipeline_layout(k), 0, 1, &ds, 0, nullptr);
+                pm.push_constants(cmd, k, pc, sizeof(pc));
+                const uint32_t per_group = batched ? 8u : 8u;   // both pack 8 rows per group
+                pm.dispatch(cmd, (c.rows + per_group - 1) / per_group, 1, 1);
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            }
+            vkEndCommandBuffer(cmd);
+            vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE);
+            vkQueueWaitIdle(q);
+            const auto t0 = clk::now();
+            vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE);
+            vkQueueWaitIdle(q);
+            return ms_since(t0);
+        };
+
+        const double gemv_ms = time_it(false);
+        const double gemm_ms = time_it(true);
+        std::cout << "  " << c.name << "  (M = " << M << ")\n"
+                  << std::fixed << std::setprecision(2)
+                  << "    " << std::setw(28) << std::left << "M x GemvInt4"
+                  << std::right << std::setw(8) << gemv_ms << " ms\n"
+                  << "    " << std::setw(28) << std::left << "1 x GemmInt4Batch"
+                  << std::right << std::setw(8) << gemm_ms << " ms"
+                  << "   speedup " << std::setprecision(2) << (gemv_ms / gemm_ms) << "x\n";
+
+        ctx.free_buffer(w); ctx.free_buffer(sb); ctx.free_buffer(bb);
+        ctx.free_buffer(x); ctx.free_buffer(o);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // 4. Submission overhead
 // ---------------------------------------------------------------------------------------
 void bench_submission(VulkanContext& ctx, VulkanPipelineManager& pm, VkCommandBuffer cmd, VkQueue q) {
@@ -520,6 +620,7 @@ int main(int argc, char** argv) {
         }
 
         bench_gemv(ctx, pm, cmd, q);
+    bench_batch(ctx, pm, cmd, q);
         bench_submission(ctx, pm, cmd, q);
         if (have_model) bench_readfile(ctx, model, mc);
 

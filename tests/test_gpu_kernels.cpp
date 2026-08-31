@@ -31,6 +31,47 @@ inline uint16_t f32_to_bf16(float val) {
     return static_cast<uint16_t>(u32 >> 16);
 }
 
+// IEEE FP16 <-> float, for the KV cache. Written out rather than using a compiler intrinsic
+// so the test does not depend on one being available.
+inline uint16_t f32_to_f16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = static_cast<int32_t>((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t man = x & 0x7FFFFFu;
+    if (exp <= 0) return static_cast<uint16_t>(sign);
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00u);
+    // Round to nearest even on the 13 bits being discarded.
+    const uint32_t round_bit = (man >> 12) & 1u;
+    const uint32_t sticky = (man & 0xFFFu) != 0u;
+    uint32_t h = sign | (static_cast<uint32_t>(exp) << 10) | (man >> 13);
+    if (round_bit && (sticky || (h & 1u))) ++h;
+    return static_cast<uint16_t>(h);
+}
+
+inline float f16_to_f32(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t man = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) { bits = sign; }
+        else {
+            exp = 1;
+            while ((man & 0x400u) == 0) { man <<= 1; --exp; }
+            man &= 0x3FFu;
+            bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (man << 13);
+    } else {
+        bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
 inline float gelu_tanh_cpu(float x) {
     constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;
     float inner = SQRT_2_OVER_PI * (x + 0.044715f * x * x * x);
@@ -356,7 +397,7 @@ int main() {
         pm.update_storage_buffer(ds, 1, buf_norm.buffer, 0, HEAD_DIM * 2);
         pm.update_storage_buffer(ds, 6, buf_out.buffer, 0, TOTAL_DIM * 4);
 
-        uint32_t pc[12]{0};
+        uint32_t pc[16]{0};   // gp0..gp3: the batched kernels read gp3, so it must be pushed
         pc[0] = HEAD_DIM;           // gp0.x = head_dim
         pc[1] = NUM_HEADS;          // gp0.y = num_heads
         pc[2] = 0;                  // gp0.z = in_off
@@ -443,6 +484,98 @@ int main() {
 
         ctx.free_buffer(buf_x);
         ctx.free_buffer(buf_out);
+    }
+
+    // ----------------------------------------------------
+    // Test 3b: GemmInt4Batch -- the prefill kernel
+    //
+    // Exercised at M > 1 with a DIFFERENT activation vector per position, and with a non-zero
+    // out_stride, so a kernel that computed only the first column (which is what the enum
+    // silently did before this shader existed) or that mixed positions up cannot pass.
+    //
+    // in_dim 5376 is deliberately not a multiple of the 512-column tile: the last tile is 256
+    // wide, so the partial-tile path is covered too.
+    // ----------------------------------------------------
+    {
+        constexpr uint32_t ROWS = 256;
+        constexpr uint32_t COLS = 5376;
+        constexpr uint32_t GSIZE = 64;
+        constexpr uint32_t NUM_GROUPS = COLS / GSIZE;
+        constexpr uint32_t BATCH = 5;          // not a power of two, and < kGemmMaxBatch
+
+        std::vector<uint32_t> packed_w(ROWS * (COLS / 8));
+        std::vector<uint16_t> scales(ROWS * NUM_GROUPS);
+        std::vector<uint16_t> biases(ROWS * NUM_GROUPS);
+        std::vector<float> in_x(static_cast<size_t>(BATCH) * COLS);
+        std::vector<float> cpu_out(static_cast<size_t>(BATCH) * ROWS, 0.0f);
+
+        for (auto& v : in_x) v = dist(rng) * 0.1f;
+        for (auto& w : packed_w) w = rng();
+        for (auto& s : scales) s = f32_to_bf16(std::abs(dist(rng)) * 0.05f + 0.01f);
+        for (auto& b : biases) b = f32_to_bf16(dist(rng) * 0.05f);
+
+        for (uint32_t m = 0; m < BATCH; ++m) {
+            for (uint32_t r = 0; r < ROWS; ++r) {
+                float sum = 0.0f;
+                for (uint32_t c = 0; c < COLS; ++c) {
+                    const uint32_t w_idx = r * (COLS / 8) + (c / 8);
+                    const uint8_t q_val = (packed_w[w_idx] >> ((c % 8) * 4)) & 0x0F;
+                    const uint32_t g_idx = r * NUM_GROUPS + (c / GSIZE);
+                    const float wv = static_cast<float>(q_val) * bf16_to_f32(scales[g_idx])
+                                   + bf16_to_f32(biases[g_idx]);
+                    sum += wv * in_x[static_cast<size_t>(m) * COLS + c];
+                }
+                cpu_out[static_cast<size_t>(m) * ROWS + r] = sum;
+            }
+        }
+
+        VkMemoryAllocation buf_w = ctx.allocate_buffer(packed_w.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+        VkMemoryAllocation buf_s = ctx.allocate_buffer(scales.size() * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+        VkMemoryAllocation buf_b = ctx.allocate_buffer(biases.size() * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+        VkMemoryAllocation buf_x = ctx.allocate_buffer(in_x.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+        VkMemoryAllocation buf_out = ctx.allocate_buffer(cpu_out.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+
+        std::memcpy(buf_w.mapped_ptr, packed_w.data(), packed_w.size() * 4);
+        std::memcpy(buf_s.mapped_ptr, scales.data(), scales.size() * 2);
+        std::memcpy(buf_b.mapped_ptr, biases.data(), biases.size() * 2);
+        std::memcpy(buf_x.mapped_ptr, in_x.data(), in_x.size() * 4);
+        std::memset(buf_out.mapped_ptr, 0, cpu_out.size() * 4);
+
+        VkDescriptorSet ds = pm.allocate_descriptor_set(ComputeKernel::GemmInt4Batch);
+        pm.update_storage_buffer(ds, 0, buf_w.buffer, 0, packed_w.size() * 4);
+        pm.update_storage_buffer(ds, 1, buf_s.buffer, 0, scales.size() * 2);
+        pm.update_storage_buffer(ds, 2, buf_b.buffer, 0, biases.size() * 2);
+        pm.update_storage_buffer(ds, 3, buf_x.buffer, 0, in_x.size() * 4);
+        pm.update_storage_buffer(ds, 6, buf_out.buffer, 0, cpu_out.size() * 4);
+
+        uint32_t pc[16]{0};   // gp0..gp3: the batched kernels read gp3, so it must be pushed
+        pc[0] = ROWS;
+        pc[1] = COLS;
+        pc[8]  = BATCH;
+        pc[9]  = COLS * 4;   // x_stride between positions
+        pc[10] = ROWS * 4;   // out_stride between positions
+
+        VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkResetCommandBuffer(cmd, 0);
+        vkBeginCommandBuffer(cmd, &begin_info);
+        pm.bind_kernel(cmd, ComputeKernel::GemmInt4Batch);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                pm.get_pipeline_layout(ComputeKernel::GemmInt4Batch), 0, 1, &ds, 0, nullptr);
+        pm.push_constants(cmd, ComputeKernel::GemmInt4Batch, pc, sizeof(pc));
+        pm.dispatch(cmd, (ROWS + kGemmRowsPerGroup - 1) / kGemmRowsPerGroup, 1, 1);
+        vkEndCommandBuffer(cmd);
+
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue);
+
+        bool ok = check_allclose(static_cast<const float*>(buf_out.mapped_ptr), cpu_out.data(),
+                                 cpu_out.size(), 1e-3f, 1e-2f, "GemmInt4Batch");
+        assert(ok);
+        ctx.free_buffer(buf_w); ctx.free_buffer(buf_s); ctx.free_buffer(buf_b);
+        ctx.free_buffer(buf_x); ctx.free_buffer(buf_out);
     }
 
     // ----------------------------------------------------
@@ -595,6 +728,17 @@ int main() {
             for (auto& x : kc) x = dist(rng);
             for (auto& x : vc) x = dist(rng);
 
+            // The KV cache is FP16 on the device. Round the reference inputs through half
+            // precision so this test measures the KERNEL, not the storage format -- otherwise
+            // it would report the quantization error of the cache as a kernel defect. Whether
+            // that error is acceptable end to end is a separate question, answered by the
+            // argmax-exact oracle diff in run_gpu_forward_test.
+            std::vector<uint16_t> kc_h(kv_elems), vc_h(kv_elems);
+            for (uint32_t i = 0; i < kv_elems; ++i) {
+                kc_h[i] = f32_to_f16(kc[i]);  kc[i] = f16_to_f32(kc_h[i]);
+                vc_h[i] = f32_to_f16(vc[i]);  vc[i] = f16_to_f32(vc_h[i]);
+            }
+
             // Attention scale is head_dim^-0.5, passed to the kernel in gp2.z. Exercising a
             // non-unit scale matters: the kernel hardcoded 1.0 until it was found to be the
             // cause of incoherent generation, and a test that only ever passes 1.0 would not
@@ -629,21 +773,21 @@ int main() {
             }
 
             VkMemoryAllocation bq = ctx.allocate_buffer(q.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-            VkMemoryAllocation bk = ctx.allocate_buffer(kc.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
-            VkMemoryAllocation bv = ctx.allocate_buffer(vc.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+            VkMemoryAllocation bk = ctx.allocate_buffer(kc_h.size() * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+            VkMemoryAllocation bv = ctx.allocate_buffer(vc_h.size() * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
             VkMemoryAllocation bo = ctx.allocate_buffer(cpu_out.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
             std::memcpy(bq.mapped_ptr, q.data(), q.size() * 4);
-            std::memcpy(bk.mapped_ptr, kc.data(), kc.size() * 4);
-            std::memcpy(bv.mapped_ptr, vc.data(), vc.size() * 4);
+            std::memcpy(bk.mapped_ptr, kc_h.data(), kc_h.size() * 2);
+            std::memcpy(bv.mapped_ptr, vc_h.data(), vc_h.size() * 2);
             std::memset(bo.mapped_ptr, 0, cpu_out.size() * 4);
 
             VkDescriptorSet ds = pm.allocate_descriptor_set(ComputeKernel::Attention);
             pm.update_storage_buffer(ds, 0, bq.buffer, 0, q.size() * 4);
-            pm.update_storage_buffer(ds, 1, bk.buffer, 0, kc.size() * 4);
-            pm.update_storage_buffer(ds, 2, bv.buffer, 0, vc.size() * 4);
+            pm.update_storage_buffer(ds, 1, bk.buffer, 0, kc_h.size() * 2);
+            pm.update_storage_buffer(ds, 2, bv.buffer, 0, vc_h.size() * 2);
             pm.update_storage_buffer(ds, 6, bo.buffer, 0, cpu_out.size() * 4);
 
-            uint32_t pc[12]{0};
+            uint32_t pc[16]{0};   // gp0..gp3: the batched kernels read gp3, so it must be pushed
             pc[0] = q_heads; pc[1] = kv_heads; pc[2] = head_dim; pc[3] = n_pos;
             pc[4] = first;   pc[9] = capacity;
             std::memcpy(&pc[10], &attn_scale, 4);   // gp2.z: head_dim^-0.5
@@ -683,10 +827,10 @@ int main() {
     // cannot localize one -- and, as the Attention race showed, cannot even detect one that
     // only manifests beyond a single token. Claiming completeness we do not have is what let
     // a 5-of-13 suite print "ALL ... PASSED" through two validation rounds.
-    std::cout << "\n[test_gpu_kernels] 8 of 13 kernels verified against the CPU reference: "
-              << "RMSNormK, GeGLU, GemvInt4, QKVEpilogue, Softcap, ResidualAccum, EmbedLookup,"
+    std::cout << "\n[test_gpu_kernels] 9 of 11 kernels verified against the CPU reference: "
+              << "RMSNormK, GeGLU, GemvInt4, GemmInt4Batch, QKVEpilogue, Softcap, ResidualAccum, EmbedLookup,"
               << " Attention.\n"
-              << "  Not yet covered: PostAttn, LayerTail, LMHeadGreedy, "
-              << "ArgmaxReduce, GemvInt8, GemmInt4Batch.\n";
+              << "  Not yet covered: LMHeadGreedy, "
+              << "ArgmaxReduce, GemvInt8.\n";
     return 0;
 }
