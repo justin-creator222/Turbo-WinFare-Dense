@@ -47,6 +47,10 @@ public:
     // Ring-buffer physical slot computation
     uint32_t physical_slot(uint32_t layer_idx, uint32_t logical_pos) const;
     uint32_t layer_capacity(uint32_t layer_idx) const;
+    // The configured context ceiling, so telemetry reports what the engine actually enforces
+    // rather than the struct's default.
+    uint32_t max_context() const { return config_.max_context; }
+
     bool is_global_layer(uint32_t layer_idx) const;
 
     // Speculative draft slot management & rollback

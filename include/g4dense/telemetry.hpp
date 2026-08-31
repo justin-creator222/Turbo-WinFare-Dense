@@ -55,6 +55,15 @@ public:
     // Per-forward-pass phase attribution, as an exponential moving average so a single slow
     // pass does not dominate. Without this, "the pass takes 9.6 s" is all we know and every
     // optimization is a guess about which part of it moved.
+    // Static model/device facts the web UI displays. Without these the snapshot reported
+    // struct defaults -- 0 resident layers, 0 streamed, and a max_context of 8192 when the
+    // engine actually caps at 4096, which is worse than reporting nothing.
+    void record_model_state(uint32_t resident_layers, uint32_t streamed_layers,
+                            uint32_t max_context, const std::string& gpu_name,
+                            bool has_draft, uint32_t draft_k);
+    void record_heap_usage(double heap0_used_mb, double heap0_budget_mb,
+                           double heap1_used_mb, double heap1_budget_mb);
+
     void record_phase_breakdown(double stream_io_ms, double gpu_wait_ms,
                                 double lm_head_ms, double cpu_other_ms);
 

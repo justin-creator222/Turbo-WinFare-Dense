@@ -466,14 +466,21 @@ void HTTPServer::handle_chat_completion(uintptr_t client, const HttpRequest& req
         send_raw(client, "data: [DONE]\n\n");
     } else {
         std::string full_response;
+        int emitted = 0;
         r->generate(chat_prompt, gen_opts, [&](uint32_t, const std::string& piece) {
             full_response += piece;
+            ++emitted;
             return true;
         }, &cancel_generation_);
 
         GenerationResult res;
         res.text = full_response;
         res.stop_reason = StopReason::Eos;
+        // These were left at zero, so every response reported usage 0/0/0.
+        res.completion_tokens = emitted;
+        if (auto tk = r->tokenizer()) {
+            res.prompt_tokens = static_cast<int>(tk->encode(chat_prompt, false).size());
+        }
         std::string json = render_completion(id, chat_req.model, res, created);
         send_http_response(client, 200, "application/json", json, false);
     }

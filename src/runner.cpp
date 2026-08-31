@@ -670,6 +670,30 @@ void ForwardRunner::load_resident_layers() {
               << " GiB imported in " << secs << " s); " << streamed_layers_.size()
               << " streamed per token." << std::endl;
 
+    // Publish what the web UI displays. These were struct defaults before, so the telemetry
+    // endpoint reported 0 resident layers and a max_context of 8192 while the engine capped
+    // at 4096 -- worse than reporting nothing, because it looks authoritative.
+    TelemetryCollector::instance().record_model_state(
+        static_cast<uint32_t>(resident_count),
+        static_cast<uint32_t>(streamed_layers_.size()),
+        kv_cache_ ? kv_cache_->max_context() : 0,
+        vk_ctx_->device_name(),
+        draft_runtime_ && draft_runtime_->is_loaded(),
+        0);
+    {
+        const auto& mp = vk_ctx_->memory_properties();
+        const double free_gib = static_cast<double>(vk_ctx_->available_device_memory());
+        const double h0 = mp.memoryHeapCount > 0 ? static_cast<double>(mp.memoryHeaps[0].size) : 0.0;
+        const double h1 = mp.memoryHeapCount > 1 ? static_cast<double>(mp.memoryHeaps[1].size) : 0.0;
+        const double mb = 1024.0 * 1024.0;
+        // The driver reports free space per heap only in aggregate here, so usage is derived
+        // from the total rather than attributed per heap.
+        const double used = (h0 + h1 - free_gib) / mb;
+        TelemetryCollector::instance().record_heap_usage(
+            used * (h0 / ((h0 + h1) > 0 ? (h0 + h1) : 1.0)), h0 / mb,
+            used * (h1 / ((h0 + h1) > 0 ? (h0 + h1) : 1.0)), h1 / mb);
+    }
+
     // One check that the device can still do work. It cannot be walked back from the edge --
     // once submission returns VK_ERROR_OUT_OF_DEVICE_MEMORY, freeing the imports does not
     // restore it -- so this is a loud assertion that the budget above was conservative enough,
@@ -695,6 +719,11 @@ bool ForwardRunner::load_draft_model(const std::string& path) {
         draft_runtime_->load_model(path, vk_ctx_, tokenizer_);
         std::cout << "[ForwardRunner] draft model loaded for speculative decoding: "
                   << path << std::endl;
+        TelemetryCollector::instance().record_model_state(
+            static_cast<uint32_t>(header_.num_layers - streamed_layers_.size()),
+            static_cast<uint32_t>(streamed_layers_.size()),
+            kv_cache_ ? kv_cache_->max_context() : 0,
+            vk_ctx_->device_name(), true, 0);
         return true;
     } catch (const std::exception& ex) {
         std::cout << "[ForwardRunner] draft model failed to load (" << ex.what()

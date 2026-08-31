@@ -46,6 +46,12 @@ void print_usage() {
               << std::endl;
 }
 
+// The draft model for speculative decoding, and what to hold back from the target's layer
+// import so it has room. E2B imports 0.977 GiB of layer blocks plus its own activations, KV
+// cache and LM head.
+static const char* kDraftModelPath = "models/gemma-4-e2b-dense.g4dense";
+static constexpr unsigned long long kDraftImportReserveBytes = 1536ull * 1024 * 1024;
+
 int main(int argc, char** argv) {
     std::string model_path = "gemma-4-31b-dense.g4dense";
     std::string prompt = "";
@@ -188,13 +194,26 @@ int main(int argc, char** argv) {
     auto runner = std::make_shared<g4dense::ForwardRunner>(ctx, tok, resolved_path);
     // Speculative decoding keeps a second model resident. Reserve for it before the target's
     // layer import runs, because that import takes everything it is allowed to.
-    if (speculative && std::filesystem::exists("models/gemma-4-e2b-dense.g4dense")) {
-        // E2B needs ~1 GiB of imports plus its own activations, KV cache and LM head.
-        runner->set_import_reserve(1536ull * 1024 * 1024);
+    //
+    // The reserve and the load must agree: reserving without loading costs six resident
+    // layers for nothing, and loading without reserving fails outright once the target's
+    // greedy import has taken the budget.
+    const bool draft_wanted = speculative && std::filesystem::exists(kDraftModelPath);
+    if (draft_wanted) {
+        runner->set_import_reserve(kDraftImportReserveBytes);
     }
     runner->initialize();
     runner->switch_memory_tier(tier_id);
     std::cout << "Activated Memory Tier " << tier_id << " (Pinned layers active)." << std::endl;
+
+    // Load the draft HERE, not after the server branch.
+    //
+    // --server / --gui start the server below and never return, so a draft loaded further
+    // down was only ever loaded in one-shot CLI mode. Server mode therefore paid the 1.5 GiB
+    // import reserve -- 39 resident layers instead of 45 -- and got no speculation for it.
+    if (draft_wanted) {
+        runner->load_draft_model(kDraftModelPath);
+    }
 
     if (run_server) {
         g4dense::HTTPServer server;
@@ -230,11 +249,6 @@ int main(int argc, char** argv) {
     opts.speculative_enabled = speculative;
     opts.draft_k = draft_k;
 
-    // Speculative decoding needs a draft model resident beside the target. It is loaded only
-    // when asked for, because it costs ~1 GiB of the same budget the target's layers use.
-    if (opts.speculative_enabled) {
-        runner->load_draft_model("models/gemma-4-e2b-dense.g4dense");
-    }
 
     auto t0 = std::chrono::high_resolution_clock::now();
     int tok_count = 0;

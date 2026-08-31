@@ -1,4 +1,5 @@
 #include "g4dense/telemetry.hpp"
+#include <string>
 #include <sstream>
 #include <iomanip>
 #include <mutex>
@@ -73,6 +74,27 @@ void TelemetryCollector::record_generation_step(double step_time_ms, uint32_t to
     if (g_total_draft > 0) {
         g_snapshot.speculative_acceptance_rate = static_cast<double>(g_total_accepted) / g_total_draft;
     }
+}
+
+void TelemetryCollector::record_model_state(uint32_t resident_layers, uint32_t streamed_layers,
+                                            uint32_t max_context, const std::string& gpu_name,
+                                            bool has_draft, uint32_t draft_k) {
+    std::lock_guard<std::mutex> lock(g_telemetry_mutex);
+    g_snapshot.pinned_layers = resident_layers;
+    g_snapshot.streamed_layers = streamed_layers;
+    g_snapshot.max_context = max_context;
+    if (!gpu_name.empty()) g_snapshot.gpu_name = gpu_name;
+    g_snapshot.has_draft = has_draft;
+    g_snapshot.draft_k = draft_k;
+}
+
+void TelemetryCollector::record_heap_usage(double heap0_used_mb, double heap0_budget_mb,
+                                           double heap1_used_mb, double heap1_budget_mb) {
+    std::lock_guard<std::mutex> lock(g_telemetry_mutex);
+    g_snapshot.heap0_usage_mb = heap0_used_mb;
+    g_snapshot.heap0_budget_mb = heap0_budget_mb;
+    g_snapshot.heap1_usage_mb = heap1_used_mb;
+    g_snapshot.heap1_budget_mb = heap1_budget_mb;
 }
 
 void TelemetryCollector::record_phase_breakdown(double stream_io_ms, double gpu_wait_ms,
