@@ -13,11 +13,15 @@ LayerStreamer::LayerStreamer(std::shared_ptr<VulkanContext> ctx,
                              size_t slot_count,
                              uint64_t layer_bytes,
                              IOMode io_mode,
-                             EvictionPolicy policy)
+                             EvictionPolicy policy, size_t io_threads)
     : ctx_(ctx), container_path_(container_path), slot_count_(slot_count),
-      layer_bytes_(layer_bytes), requested_io_mode_(io_mode), policy_(policy) {}
+      layer_bytes_(layer_bytes), requested_io_mode_(io_mode), policy_(policy),
+      io_thread_count_(io_threads == 0 ? 1 : io_threads) {}
 
 LayerStreamer::~LayerStreamer() {
+    // Workers first: they hold file_handle_ and write into slot->ov, so closing the handle or
+    // freeing slots underneath a running read is a use-after-free.
+    stop_io_threads();
     if (file_handle_ != INVALID_HANDLE_VALUE) {
         CloseHandle(file_handle_);
         file_handle_ = INVALID_HANDLE_VALUE;
@@ -67,6 +71,13 @@ void LayerStreamer::initialize(const G4DenseHeader& header) {
         if (file_handle_ == INVALID_HANDLE_VALUE) {
             throw G4DenseFormatError("LayerStreamer: cannot open container file " + container_path_);
         }
+    }
+
+    // Workers start only once the handle is valid, so a failed open never leaves threads
+    // waiting on a file they cannot read.
+    io_stop_ = false;
+    for (size_t i = 0; i < io_thread_count_; ++i) {
+        io_threads_.emplace_back([this] { io_worker(); });
     }
 
     // Allocate UMA Layer Slots
@@ -167,23 +178,79 @@ LayerStreamer::LayerPlan LayerStreamer::plan_layers(const std::vector<int>& laye
     return plan;
 }
 
-void LayerStreamer::issue_read(LayerSlot* slot, uint64_t file_offset, size_t count) {
-    ResetEvent(slot->event);
-    std::memset(&slot->ov, 0, sizeof(slot->ov));
-    slot->ov.hEvent = slot->event;
-    slot->ov.Offset = static_cast<DWORD>(file_offset & 0xFFFFFFFF);
-    slot->ov.OffsetHigh = static_cast<DWORD>((file_offset >> 32) & 0xFFFFFFFF);
-
-    DWORD bytes_read = 0;
-    BOOL ok = ReadFile(file_handle_, slot->host_ptr, static_cast<DWORD>(count), &bytes_read, &slot->ov);
-    if (!ok) {
-        DWORD err = GetLastError();
-        if (err != ERROR_IO_PENDING) {
-            std::stringstream ss;
-            ss << "LayerStreamer: ReadFile failed (err=" << err << ")";
-            throw G4DenseFormatError(ss.str());
+void LayerStreamer::io_worker() {
+    for (;;) {
+        IoJob job{};
+        {
+            std::unique_lock<std::mutex> lk(io_mutex_);
+            io_cv_.wait(lk, [this] { return io_stop_ || !io_queue_.empty(); });
+            if (io_stop_ && io_queue_.empty()) return;
+            job = io_queue_.front();
+            io_queue_.pop_front();
         }
+
+        LayerSlot* slot = job.slot;
+        DWORD err = 0;
+        bool truncated = false;
+
+        // The offset lives in the OVERLAPPED, so concurrent workers on different slots do not
+        // share a file pointer. Blocking here is the entire point: this thread is not the one
+        // submitting GPU work, so a read that completes inline from the page cache costs
+        // nothing that matters.
+        ResetEvent(slot->event);
+        std::memset(&slot->ov, 0, sizeof(slot->ov));
+        slot->ov.hEvent = slot->event;
+        slot->ov.Offset = static_cast<DWORD>(job.offset & 0xFFFFFFFF);
+        slot->ov.OffsetHigh = static_cast<DWORD>((job.offset >> 32) & 0xFFFFFFFF);
+
+        DWORD bytes_read = 0;
+        BOOL ok = ReadFile(file_handle_, slot->host_ptr,
+                           static_cast<DWORD>(job.count), &bytes_read, &slot->ov);
+        if (!ok) {
+            err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                err = 0;
+                DWORD transferred = 0;
+                if (!GetOverlappedResult(file_handle_, &slot->ov, &transferred, TRUE)) {
+                    err = GetLastError();
+                } else {
+                    bytes_read = transferred;
+                }
+            }
+        }
+        if (err == 0 && bytes_read < job.count) truncated = true;
+
+        {
+            std::lock_guard<std::mutex> lk(io_mutex_);
+            slot->io_error = err;
+            slot->io_truncated = truncated;
+            slot->io_pending = false;
+        }
+        io_done_cv_.notify_all();
     }
+}
+
+void LayerStreamer::stop_io_threads() {
+    {
+        std::lock_guard<std::mutex> lk(io_mutex_);
+        io_stop_ = true;
+    }
+    io_cv_.notify_all();
+    for (auto& t : io_threads_) {
+        if (t.joinable()) t.join();
+    }
+    io_threads_.clear();
+}
+
+void LayerStreamer::issue_read(LayerSlot* slot, uint64_t file_offset, size_t count) {
+    {
+        std::lock_guard<std::mutex> lk(io_mutex_);
+        slot->io_pending = true;
+        slot->io_error = 0;
+        slot->io_truncated = false;
+        io_queue_.push_back(IoJob{slot, file_offset, count});
+    }
+    io_cv_.notify_one();
     slot->read_pending = true;
     total_io_calls_++;
     total_bytes_read_ += count;
@@ -191,11 +258,20 @@ void LayerStreamer::issue_read(LayerSlot* slot, uint64_t file_offset, size_t cou
 
 void LayerStreamer::await_read(LayerSlot* slot, size_t count) {
     if (!slot->read_pending) return;
-    DWORD transferred = 0;
-    BOOL ok = GetOverlappedResult(file_handle_, &slot->ov, &transferred, TRUE);
+    DWORD err = 0;
+    bool truncated = false;
+    {
+        std::unique_lock<std::mutex> lk(io_mutex_);
+        io_done_cv_.wait(lk, [slot] { return !slot->io_pending; });
+        err = slot->io_error;
+        truncated = slot->io_truncated;
+    }
     slot->read_pending = false;
-    if (!ok || transferred < count) {
-        throw G4DenseFormatError("LayerStreamer: async read failed or was truncated");
+    if (err != 0 || truncated) {
+        std::stringstream ss;
+        ss << "LayerStreamer: read failed (err=" << err
+           << (truncated ? ", truncated" : "") << ") for " << count << " bytes";
+        throw G4DenseFormatError(ss.str());
     }
 }
 

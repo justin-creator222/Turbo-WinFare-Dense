@@ -8,6 +8,9 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <thread>
+#include <deque>
+#include <condition_variable>
 
 namespace g4dense {
 
@@ -30,10 +33,17 @@ struct LayerSlot {
     uint64_t last_used_timestamp{0};
     uint32_t frequency{0};
 
-    // Persistent per-slot Win32 event & OVERLAPPED structure
+    // Persistent per-slot Win32 event & OVERLAPPED structure. The OVERLAPPED carries the file
+    // offset, so slots never share a file pointer and reads on different slots are independent.
     HANDLE event{nullptr};
     OVERLAPPED ov{};
     bool read_pending{false};
+
+    // Set while an I/O worker owns this slot; cleared by the worker on completion. Guarded by
+    // LayerStreamer::io_mutex_, not by lock_.
+    bool io_pending{false};
+    DWORD io_error{0};
+    bool io_truncated{false};
 
     // Slot pinning to prevent self-eviction within an active forward pass
     bool pinned{false};
@@ -47,7 +57,8 @@ public:
                   size_t slot_count,
                   uint64_t layer_bytes,
                   IOMode io_mode = IOMode::Auto,
-                  EvictionPolicy policy = EvictionPolicy::LRU);
+                  EvictionPolicy policy = EvictionPolicy::LRU,
+                  size_t io_threads = 2);
     ~LayerStreamer();
 
     void initialize(const G4DenseHeader& header);
@@ -119,6 +130,34 @@ private:
     std::atomic<uint64_t> total_io_calls_{0};
     std::atomic<uint64_t> total_hits_{0};
     std::atomic<uint64_t> total_misses_{0};
+
+    // The read is performed on a worker thread, and the reason is worth stating.
+    //
+    // Round 6 measured that BUFFERED overlapped reads complete INLINE when the data is already
+    // in the page cache, so ReadFile blocked the caller and nothing overlapped -- 956 ms moved
+    // out of the I/O phase into "CPU other" without being saved. The conclusion drawn was to
+    // use FILE_FLAG_NO_BUFFERING, which does make the read genuinely asynchronous.
+    //
+    // But that trades away bandwidth to fix a threading problem. Ground truth measures the
+    // unbuffered path at 3.08-3.09 GB/s against 7.14 GB/s buffered-warm. Inline completion is
+    // only fatal because the read is issued on the thread that submits GPU work; performing it
+    // on a worker makes it irrelevant, and keeps the faster path.
+    struct IoJob {
+        LayerSlot* slot;
+        uint64_t offset;
+        size_t count;
+    };
+
+    std::vector<std::thread> io_threads_;
+    std::deque<IoJob> io_queue_;
+    std::mutex io_mutex_;
+    std::condition_variable io_cv_;       // wakes workers when a job arrives
+    std::condition_variable io_done_cv_;  // wakes await_read() on completion
+    bool io_stop_{false};
+    size_t io_thread_count_{2};
+
+    void io_worker();
+    void stop_io_threads();
 
     LayerSlot* find_or_evict_slot(int layer_id, bool& was_hit);
     void issue_read(LayerSlot* slot, uint64_t file_offset, size_t count);

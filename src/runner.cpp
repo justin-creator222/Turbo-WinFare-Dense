@@ -224,20 +224,26 @@ void ForwardRunner::initialize() {
     // ceiling, i.e. four layers that could otherwise have been resident; that is the price of
     // being able to stream the remainder at all.
     const size_t total_slots = std::min<size_t>(4, header_.num_layers);
-    // Unbuffered. Two reasons, both measured:
+    // Buffered, with the read on an I/O worker thread.
     //
-    //   * Buffered overlapped reads complete INLINE when the data is already in the page
-    //     cache, so issue_reads() blocks and nothing overlaps. Splitting issue from await
-    //     moved 956 ms out of the I/O phase and straight into "CPU other" without saving any
-    //     of it. FILE_FLAG_NO_BUFFERING makes the read genuinely asynchronous.
-    //   * The destination is memory the GPU reads directly, so a second copy of the same
-    //     bytes in the page cache is waste -- and the machine is already at its memory
-    //     ceiling.
+    // This was FILE_FLAG_NO_BUFFERING, for a measured reason that turned out to be a
+    // threading problem wearing a bandwidth problem's clothes. Round 6 found that buffered
+    // overlapped reads complete INLINE when the data is already in the page cache, so
+    // issue_reads() blocked and nothing overlapped -- 956 ms moved out of the I/O phase into
+    // "CPU other" without being saved. Unbuffered does make the read genuinely asynchronous.
     //
-    // Requires sector-aligned offsets, sizes and destination pointers: the container is
-    // 4096-aligned throughout and Vulkan maps these slots on a page boundary.
+    // But it costs more than half the bandwidth. Ground truth measures the unbuffered path at
+    // 3.08-3.09 GB/s against 7.14 GB/s buffered-warm, and at 15 streamed layers this engine
+    // reads 4.145 GB PER TOKEN -- 1,341 ms at unbuffered speed, which is essentially the whole
+    // 1,328 ms token. The pass was disk-bound, not GPU-bound, which is why round 8's 12% gemv
+    // saving and its flash-attention rewrite both measured neutral: the GPU was never the
+    // constraint.
+    //
+    // Inline completion only matters because the read was issued on the thread that submits
+    // GPU work. LayerStreamer now performs it on a worker, so the caller never blocks and the
+    // faster path is kept.
     streamer_ = std::make_unique<LayerStreamer>(vk_ctx_, container_path_, total_slots,
-                                                max_layer_bytes, IOMode::Unbuffered);
+                                                max_layer_bytes, IOMode::Buffered);
     streamer_->initialize(header_);
 
     load_resident_layers();
