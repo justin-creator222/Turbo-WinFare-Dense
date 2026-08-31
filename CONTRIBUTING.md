@@ -25,6 +25,21 @@ ctest --test-dir build --output-on-failure
 
 MSVC is not supported. `spec.md`-era notes suggesting otherwise are obsolete.
 
+### Test fixtures are not in git
+
+`*.g4dense` is gitignored, which includes two things the suite depends on. Neither regenerates
+automatically, and a stale copy fails in ways that look like engine bugs -- a stale
+`oracle_tensors/` had two ctest cases failing for an entire round against an oracle that
+predated a softcapping change.
+
+```powershell
+python tools\make_synthetic_model.py --out tests\fixtures\tiny.g4dense
+.\build\run_cpu_reference_test.exe models\gemma-4-31b-dense.g4dense tests\fixtures\oracle_tensors 2
+```
+
+Regenerate both after any change to the container layout. `docs/G4DENSE_FORMAT.md` section 4.2
+lists the five places that layout is written down; they must move together.
+
 Most tests need neither a GPU nor a model: `test_format`, `test_tokenizer`, `test_streamer`,
 `test_sampling`, `test_detokenizer`, `test_server`, `test_openai`, `test_convert`. CI runs
 exactly those. `test_gpu_kernels` needs a D3D12 device with Shader Model 6.6 and must be run

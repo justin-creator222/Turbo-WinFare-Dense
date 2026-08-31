@@ -13,16 +13,26 @@
     "imported_gib": 11.58,
     "kv_cache_dtype": "FP16",
     "max_context": 4096,
-    "decode_tok_s_greedy": 0.75,
-    "decode_tok_s_speculative_32": 0.95,
+    "draft_k": 8,
+    "decode_tok_s_greedy": 1.13,
     "phase_ms_per_token": {
-      "stream_io": 322,
-      "gpu": 748,
-      "lm_head": 32,
-      "cpu_other": 100
+      "stream_io": 90,
+      "gpu": 631,
+      "lm_head": 24,
+      "cpu_other": 29
     },
-    "perfect_overlap_ceiling_tok_s": 1.14,
-    "note": "Streaming and GPU overlap, so the phases do not sum to the reciprocal."
+    "binding_constraint": "GPU",
+    "gpu_bound_ceiling_tok_s": 1.46,
+    "note": [
+      "Round 9 changed which constraint binds. The engine read 4.145 GB per token",
+      "through FILE_FLAG_NO_BUFFERING at 3.09 GB/s = 1,341 ms, against a 1,328 ms",
+      "token: it was DISK-bound, and every GPU optimisation measured neutral because",
+      "the GPU was never the constraint. Buffered reads on I/O worker threads took",
+      "stream I/O from 322 ms to 90 and throughput from 0.75 to 1.13 tok/s.",
+      "The GPU now binds at 631 of 883 ms, so 1.46 tok/s is the ceiling until the",
+      "gemv gets faster -- and gemv work now converts to throughput, which it did",
+      "not before."
+    ]
   },
   "layer_geometry": {
     "d_model": 5376,
@@ -197,7 +207,7 @@
         "alpha_0.78": 5.3,
         "alpha_0.85": 6.4
       },
-      "target_tps": 1.14,
+      "target_tps": 1.46,
       "meets_target": false,
       "feasible": false,
       "reason": "Heap 0 use (11563.4 MB) exceeds physical Device-Local Heap 0 (5428.8 MB); requires 32 GB hardware."

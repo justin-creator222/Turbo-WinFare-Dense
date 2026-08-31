@@ -182,8 +182,23 @@ ctest                    16 of 16
 
 ## Still open
 
+*Resolved in round 9 — see `docs/ROUND9_REPORT.md`. Left here as written, with what came of it.*
+
 - **15 layers stream, ~322 ms/token.** A hard memory ceiling on this machine, not a code
-  problem.
-- **Draft acceptance is 46.7–55.6%**, against 76.2% reported in round 7, unexplained.
-- **The gemv's 12% is unrealized** until streaming stops binding.
-- **`EmbedLookup` is still unwired** — parity-tested, ~0.1 ms of a ~1,300 ms pass.
+  problem. → **Half right.** The layer count is a memory ceiling; the 322 ms was not. Streaming
+  ran unbuffered at 3.09 GB/s, and buffered reads on worker threads took it to 89–92 ms.
+- **Draft acceptance is 46.7–55.6%**, against 76.2% reported in round 7, unexplained. → **Not a
+  regression.** 76.2%, 46.7% and 55.6% are 16/21, 7/15 and 5/9 — all at `draft_k` 4, all ~20-draft
+  samples. Greedy is deterministic, so round 7's figure was one default-temperature sample.
+- **The gemv's 12% is unrealized** until streaming stops binding. → **It converted**, to +1.8%
+  throughput, once streaming stopped binding. The reasoning for keeping it held up.
+- **`EmbedLookup` is still unwired** — parity-tested, ~0.1 ms of a ~1,300 ms pass. → Still true,
+  still not worth doing.
+
+## The thing this report should have asked
+
+Every performance conclusion here was drawn without checking which resource was saturated.
+Round 8 measured the GPU phase, optimised it twice, found both changes neutral, and recorded the
+neutrality honestly — but never asked *why* two independent GPU improvements would both come to
+nothing. The answer was one division: 4.145 GB per token at the streamer's measured 3.09 GB/s is
+1,341 ms, against a 1,328 ms token. The engine was disk-bound the entire round.

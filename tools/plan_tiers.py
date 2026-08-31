@@ -125,9 +125,12 @@ def solve_tiers(ground_truth):
     # The targets below are the measured operating point and the headroom above it that the
     # current kernels allow:
     #
-    #   measured, greedy decode, 45 of 60 resident      0.75 tok/s
-    #   the same pass with streaming perfectly hidden   1.14 tok/s  (GPU 748 + LM 32 + CPU 100)
-    #   with speculation, 32-token generation           ~0.95 tok/s effective
+    #   measured, greedy decode, 45 of 60 resident      1.13 tok/s
+    #   the same pass with streaming perfectly hidden   1.46 tok/s  (GPU 631 + LM 24 + CPU 29)
+    #
+    # Round 8's version of these lines read 0.75 and 1.14, and named streaming overlap as the
+    # gap. The real gap was that streaming ran unbuffered at 3.09 GB/s; see
+    # measured_operating_point.
     #
     # So tier 3 is set at the perfect-overlap ceiling and tier 4 is marked infeasible with the
     # arithmetic rather than a target nothing can meet.
@@ -137,7 +140,7 @@ def solve_tiers(ground_truth):
     tier_specs = [
         {"id": 1, "name": "Tier 1 (Baseline)", "ceiling_mb": 6000.0, "pinned_target": 6, "int8_kv": False, "target_tps": 0.35},
         {"id": 2, "name": "Tier 2 (Balanced)", "ceiling_mb": 10000.0, "pinned_target": 21, "int8_kv": False, "target_tps": 0.55},
-        {"id": 3, "name": "Tier 3 (High-Perf)", "ceiling_mb": 16000.0, "pinned_target": 45, "int8_kv": False, "target_tps": 1.14},
+        {"id": 3, "name": "Tier 3 (High-Perf)", "ceiling_mb": 16000.0, "pinned_target": 45, "int8_kv": False, "target_tps": 1.46},
         {"id": 4, "name": "Tier 4 (Resident)", "ceiling_mb": 22000.0, "pinned_target": 60, "int8_kv": False, "target_tps": 2.00},
     ]
 
@@ -243,11 +246,21 @@ def solve_tiers(ground_truth):
             "imported_gib": 11.58,
             "kv_cache_dtype": "FP16",
             "max_context": 4096,
-            "decode_tok_s_greedy": 0.75,
-            "decode_tok_s_speculative_32": 0.95,
-            "phase_ms_per_token": {"stream_io": 322, "gpu": 748, "lm_head": 32, "cpu_other": 100},
-            "perfect_overlap_ceiling_tok_s": 1.14,
-            "note": "Streaming and GPU overlap, so the phases do not sum to the reciprocal."
+            "draft_k": 8,
+            "decode_tok_s_greedy": 1.13,
+            "phase_ms_per_token": {"stream_io": 90, "gpu": 631, "lm_head": 24, "cpu_other": 29},
+            "binding_constraint": "GPU",
+            "gpu_bound_ceiling_tok_s": 1.46,
+            "note": [
+                "Round 9 changed which constraint binds. The engine read 4.145 GB per token",
+                "through FILE_FLAG_NO_BUFFERING at 3.09 GB/s = 1,341 ms, against a 1,328 ms",
+                "token: it was DISK-bound, and every GPU optimisation measured neutral because",
+                "the GPU was never the constraint. Buffered reads on I/O worker threads took",
+                "stream I/O from 322 ms to 90 and throughput from 0.75 to 1.13 tok/s.",
+                "The GPU now binds at 631 of 883 ms, so 1.46 tok/s is the ceiling until the",
+                "gemv gets faster -- and gemv work now converts to throughput, which it did",
+                "not before."
+            ]
         },
         "layer_geometry": {
             "d_model": 5376,

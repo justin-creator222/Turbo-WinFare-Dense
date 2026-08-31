@@ -142,21 +142,14 @@ Three results that contradicted expectation, all measured:
 
 ### Still on the table
 
-Rewritten at the end of round 8; the round-6 version of this list is superseded by
-`docs/ROUND7_REPORT.md` and `docs/ROUND8_REPORT.md`.
+Rewritten at the end of round 9.
 
-- **15 layers still stream**, now costing ~322 ms per token rather than ~850. They cannot be
-  pinned: the driver stops accepting imports at ~11.75 GiB. Choosing *which* layers stream —
-  evenly spaced rather than the tail — was worth 12% and is the round's largest win, but the
-  remaining I/O is a hard memory ceiling on this machine.
-- **`GemvInt4` is explained, and now ~12% faster.** Eight 4-byte weight loads per quantization
-  group became two `Load4`s. It does not show up as throughput at this residency because the
-  pass is streaming-bound; it converts the moment that stops being true.
-- **Draft acceptance is lower than round 7 reported** (46.7–55.6% against 76.2%) and the
-  discrepancy is not explained. It is a throughput question only — speculative output is
-  token-for-token identical to non-speculative.
-- **The embedding lookup is still on the CPU** (`EmbedLookup.hlsl` is parity-tested but
-  unreferenced). It is ~0.1 ms of a ~1,300 ms pass.
+- **The GPU is now the constraint**, at 631 ms of an 883 ms token. `GemvInt4` runs at 38–48
+  GB/s against 65–74 GB/s for a pure streaming copy, and unlike in rounds 6–8, closing that gap
+  would now show up as throughput.
+- **15 layers still stream**, but at 89–92 ms per token rather than 322. A hard memory ceiling,
+  not a code problem.
+- **`EmbedLookup` is still unwired** — parity-tested, ~0.1 ms of an ~883 ms pass.
 
 ## 2. Hardware baselines
 
@@ -228,70 +221,114 @@ not reach 8k context, so they are not a Tier 1 measurement — they are the only
 figures that exist. `config/tiers.json` projects a Tier 1 footprint of 4,739.7 MB, which
 remains unverified in practice.
 
-## 5. Throughput — measured, and the target re-based
+## 5. Throughput — measured, and which constraint binds
 
 **Measured, three runs, `--prompt "Hi" --max-tokens 14 --temp 0 --no-spec`, 45 of 60 layers
 resident:**
 
-| | round 7 | round 8 |
+| | round 7 | round 8 | round 9 |
+|---|---:|---:|---:|
+| stream I/O | 566–585 ms | 318–326 ms | **89–92 ms** |
+| GPU queue | 625–631 ms | 746–752 ms | 630–633 ms |
+| LM head | 38 ms | 32 ms | 24 ms |
+| CPU other | 110 ms | 100 ms | **28–29 ms** |
+| **throughput** | 0.667–0.677 tok/s | 0.750–0.760 tok/s | **1.129–1.136 tok/s** |
+
+**+50% over round 8, +68% over round 7**, from one change: the streaming reads were moved to
+worker threads and switched from unbuffered to buffered.
+
+### The engine was disk-bound, and that explains three rounds of neutral results
+
+The streamer used `FILE_FLAG_NO_BUFFERING`, chosen in round 6 because buffered overlapped reads
+*complete inline* from the page cache — so `issue_reads()` blocked and nothing overlapped. That
+observation was correct. The conclusion was not, because it fixed a threading problem by giving
+up more than half the read bandwidth:
+
+```
+unbuffered, measured      3.08–3.09 GB/s
+buffered warm, measured   7.14 GB/s
+
+15 streamed layers x 276.3 MB  =  4.145 GB per token
+                 / 3.09 GB/s   =  1,341 ms
+round-8 token time             =  1,328 ms      <- the read WAS the token
+```
+
+The GPU's 748 ms fitted inside the read with room to spare. So round 8's gemv vectorisation
+(12% faster kernel) and its flash-attention rewrite both measured neutral for the same reason:
+**the GPU was never the constraint.** Inline completion only mattered because the read was
+issued on the thread that submits GPU work; performing it on a worker makes it irrelevant and
+keeps the faster path.
+
+Note `CPU other`, 100 ms → 29 ms. That is the blocking read leaving the main thread.
+
+### The gemv converted, as predicted
+
+Round 8 kept the vectorised weight loads on the argument that they would pay once streaming
+stopped binding. Re-measured under the new regime, three runs each:
+
+| | GPU phase | throughput |
 |---|---:|---:|
-| stream I/O | 566–585 ms | **318–326 ms** |
-| GPU queue | 625–631 ms | 746–752 ms |
-| LM head | 38 ms | 32 ms |
-| CPU other | 110 ms | 100 ms |
-| **throughput** | **0.667–0.677 tok/s** | **0.750–0.760 tok/s** |
+| 8 × `u32_load` | 667–672 ms | 1.104–1.110 tok/s |
+| 2 × `Load4` | 630–631 ms | 1.126–1.130 tok/s |
 
-Stream I/O and GPU overlap, so the phases do not sum to the reciprocal of the throughput;
-faster GPU work at a fixed residency simply returns time to I/O wait.
+**+1.8%** where it was worth exactly nothing before. Modest, because the GPU is now 631 ms of
+an 883 ms token rather than all of it.
 
-### The 2.50 TPS gate was unreachable and has been replaced
+### Tuning
 
-Full residency needs **15.06 GiB** of layer imports. The driver stops accepting them at about
-**11.75 GiB**, and that is a heap ceiling rather than a tuning problem:
+I/O workers, and prefetch depth — each slot costs ~276 MB of import ceiling, i.e. a resident
+layer, so depth trades overlap against residency:
+
+| workers | tok/s | I/O | | depth | resident | tok/s | I/O |
+|---:|---:|---:|---|---:|---:|---:|---:|
+| 1 | 0.893 | 212 ms | | 2 (3 slots) | 46 | 1.102 | 126 ms |
+| 2 | 1.079 | 127–142 ms | | **3 (4 slots)** | **45** | **1.125** | **92 ms** |
+| **4** | **1.130** | **85–90 ms** | | 4 (5 slots) | 44 | 1.045 | 135 ms |
+| 6 | 1.139 | 84–87 ms | | | | | |
+| 8 | 1.127 | 89–92 ms | | | | | |
+
+Past 4 workers the gain is noise: `PREFETCH_DEPTH` is 3, so the queue never holds more than
+three jobs and further workers idle.
+
+### The ceiling now, and the arithmetic behind it
+
+Full residency needs **15.06 GiB** of layer imports against a driver ceiling of ~**11.75 GiB**,
+inside a 15.90 GiB heap that also holds the KV cache, LM head and streaming pool:
 
 ```
 imports 11.75 + KV (FP16, 4096) 1.17 + LM head 0.79 + streaming pool 1.05  ≈  14.8 GiB
-                                                         of a 15.90 GiB heap
 ```
 
-All three BIOS UMA settings were measured. **Minimum is the best of them** — 45 of 60 resident
-at 1,456 ms/pass, against 26 of 60 and 2,428 ms at 8 GB, where the larger device-local heap
-comes with only 23.81 GiB of visible RAM and the import broke down around 30 layers. 4 GB is
-worse on both counts.
-
-So the reachable ceiling with the current kernels is the pass with streaming perfectly hidden:
-GPU 748 + LM 32 + CPU 100 = **880 ms, or 1.14 tok/s**. `config/tiers.json` now carries that as
-the tier-3 target and a `measured_operating_point` block beside the projections.
+All three BIOS UMA settings were measured; minimum is the best of them. With streaming no longer
+binding, the ceiling is the GPU-bound pass: **631 + 24 + 29 = 684 ms, or 1.46 tok/s**. Further
+gemv work now converts to throughput, which it did not before.
 
 ### The projection model is superseded, not merely unmet
 
-Round 8 checked `config/tiers.json`'s projections against the engine. They are wrong in **both**
-directions:
-
-- they mark tier 3 (45 pinned layers) **infeasible** — which is the configuration the engine
-  actually runs — because the two-tier heap accounting does not match how the driver assigns
-  imported host memory;
-- they project **5.30 TPS** for that same configuration against a measured **0.75**, an
-  overestimate of about 7×, because the α model prices streaming bandwidth and nothing else.
-  The GPU phase alone is 748 ms/token, a hard 1.34 TPS ceiling for which the model has no term.
-
-`projected_tps` is kept as a record of what was assumed before anything ran. Plan against
+`config/tiers.json`'s projections mark tier 3 (45 pinned layers) **infeasible** — the
+configuration the engine actually runs — and project **5.30 TPS** for it. `projected_tps` is
+kept only as a record of what was assumed before anything ran. Plan against
 `measured_operating_point`.
 
 ### Speculative decoding
 
-Measured on "Write one sentence explaining what a ring buffer is", greedy:
+`draft_k` is **8**, and the three entry points now agree (the CLI said 4, `GenerationOptions`
+said 6, and the server set neither). Measured, 24 tokens greedy, three runs each:
 
-| tokens | 4 | 8 | 12 | 16 | 24 | 32 |
-|---|---:|---:|---:|---:|---:|---:|
-| `--no-spec` | 10.1 | 14.3 | 18.5 | 22.6 | 30.8 | 38.1 s |
-| speculative | 9.2 | 13.0 | 16.6 | 20.5 | 26.2 | 30.1 s |
-| ratio | 1.10× | 1.10× | 1.11× | 1.10× | 1.18× | 1.26× |
+| | elapsed | acceptance |
+|---|---:|---:|
+| K = 4 | 26.06–26.45 s | 46.7% |
+| **K = 8** | **20.58–20.81 s** | 51.4% |
 
-Round 7 measured a *loss* at 8 tokens. Spreading the streamed layers and the cheaper gemv
-removed enough per-layer cost that the six resident layers the draft displaces no longer
-dominate, so a length gate would only ever switch off a win. Acceptance measures 46.7% greedy /
-55.6% at default temperature, below the 76.2% recorded in round 7 from a single run.
+The target pass costs ~1,330 ms against a ~65 ms draft, a 20:1 ratio, so drafting more per round
+is nearly free. It costs 1–3% on prompts that stop early, where the final round over-drafts.
+
+**On reading the acceptance rate.** Its denominator is small — a 24-token generation is 15–35
+drafts, so "46.7%" is 7 of 15. Round 7 reported 76.2% (16 of 21, one default-temperature
+sample) and round 8 treated the difference as an unexplained regression; it was neither
+unexplained nor a regression. `speculative_drafted` and `speculative_accepted` are now published
+beside the rate, and the counters reset per generation instead of accumulating for the life of
+the process.
 
 ## 6. Benchmark methodology
 
