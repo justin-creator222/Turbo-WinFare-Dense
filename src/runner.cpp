@@ -180,24 +180,25 @@ void ForwardRunner::initialize() {
                   << std::endl;
     }
     kv_cfg.sliding_window = header_.sliding_window;
-    // Capped at ATTN_MAX_SPAN, not the spec's 8192.
+    // 4096 by default, but no longer because the kernel cannot do more.
     //
-    // Attention.hlsl stages scores in `groupshared float s_scores[ATTN_MAX_SPAN]` (4096) and
-    // indexes it as `s_scores[t - first]`. Sliding-window layers are safe at any context --
-    // their span is bounded by sliding_window -- but full-attention layers pass
-    // capacity == max_context with first == 0, so a context above 4096 writes past the end of
-    // a groupshared array. That is a buffer overflow, not a degraded result.
+    // Attention used to stage every score in `groupshared float s_scores[ATTN_MAX_SPAN]`, so a
+    // full-attention layer with a context above 4096 wrote past the end of that array -- a
+    // buffer overflow, not a degraded result, and the reason this was hard-capped. The online
+    // softmax removed the array; nothing in the kernel scales with the attended span now.
     //
-    // Raising this needs an online-softmax (flash-style) rewrite that never materializes the
-    // full score span. Until then the honest configuration is a 4096 ceiling, enforced below
-    // rather than left as a comment.
-    kv_cfg.max_context = 4096;
-    if (kv_cfg.max_context > kAttentionMaxSpan) {
+    // What remains is a cost, not a limit: 8192 doubles the KV cache to +336 MB, which is
+    // about 1.2 resident layers of the 31B surrendered on every generation whether or not the
+    // conversation is long. So the default stays 4096 and set_max_context() opts in.
+    kv_cfg.max_context = requested_max_context_;
+
+    // The head-dimension accumulator IS still groupshared, so this one is a real bound.
+    const uint32_t max_head_dim = std::max(header_.head_dim, header_.global_head_dim);
+    if (max_head_dim > kAttentionMaxHeadDim) {
         throw G4DenseFormatError(
-            "ForwardRunner: max_context " + std::to_string(kv_cfg.max_context) +
-            " exceeds Attention.hlsl's ATTN_MAX_SPAN of " + std::to_string(kAttentionMaxSpan) +
-            "; full-attention layers would overflow groupshared s_scores. Raise ATTN_MAX_SPAN "
-            "(costs groupshared occupancy) or implement online softmax.");
+            "ForwardRunner: head_dim " + std::to_string(max_head_dim) +
+            " exceeds Attention.hlsl's ATTN_MAX_HEAD_DIM of " +
+            std::to_string(kAttentionMaxHeadDim) + "; raise both together.");
     }
     kv_cfg.global_layer_mask = header_.global_layer_mask;
     // FP16 halves the cache to 1.10 GiB, which is worth about four more resident layers.

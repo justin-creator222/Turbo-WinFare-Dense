@@ -241,7 +241,7 @@ void HTTPServer::handle_client(uintptr_t client_socket) {
                << ",\"context_len\":" << config_.context_len
                // Bounded by ATTN_MAX_SPAN: full-attention layers stage their whole score span
                // in groupshared, so the GUI must not offer a context the kernel cannot serve.
-               << ",\"context_max\":" << ForwardRunner::kAttentionMaxSpan
+               << ",\"context_max\":" << ForwardRunner::kDefaultMaxContext
                << ",\"tier\":" << (r ? r->active_tier_id() : config_.active_tier_id)
                << "}}";
             send_http_response(client_socket, 200, "application/json", js.str(), false);

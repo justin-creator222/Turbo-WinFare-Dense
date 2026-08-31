@@ -110,9 +110,22 @@ public:
     // Dynamic Tier switching without reloading the model container
     void switch_memory_tier(uint32_t tier_id);
 
-    // Must match ATTN_MAX_SPAN in shaders/Attention.hlsl. Full-attention layers stage their
-    // whole score span in groupshared, so any context above this overflows that array.
-    static constexpr uint32_t kAttentionMaxSpan = 4096;
+    // Must match ATTN_MAX_HEAD_DIM in shaders/Attention.hlsl.
+    //
+    // This replaces kAttentionMaxSpan. Attention is now an online softmax that walks the keys
+    // in tiles, so nothing in the kernel scales with the attended span and the context ceiling
+    // is gone. What is still staged in groupshared is one accumulator per head dimension, and
+    // that is a property of the architecture (512 on the 31B's global layers, 256 on sliding)
+    // rather than of the conversation.
+    static constexpr uint32_t kAttentionMaxHeadDim = 512;
+
+    // The default context. Not a kernel limit any more -- raising it costs KV cache (8192
+    // would be +336 MB, about 1.2 resident layers of the 31B, on every generation whether or
+    // not the conversation is long), so it stays opt-in via set_max_context().
+    static constexpr uint32_t kDefaultMaxContext = 4096;
+
+    // Must be called before initialize(); the KV cache is sized there.
+    void set_max_context(uint32_t n) { requested_max_context_ = n; }
 
     uint32_t active_tier_id() const { return active_tier_id_; }
     std::shared_ptr<Tokenizer> tokenizer() const { return tokenizer_; }
@@ -149,6 +162,7 @@ private:
     std::string container_path_;
 
     G4DenseHeader header_{};
+    uint32_t requested_max_context_{kDefaultMaxContext};
     uint32_t active_tier_id_{1};
     uint64_t import_reserve_bytes_{0};
 

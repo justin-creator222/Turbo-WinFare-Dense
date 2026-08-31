@@ -826,6 +826,17 @@ int main() {
         run_attention_case("Attention/global", 8, 4, 64, /*n_pos=*/300, /*first=*/0, /*cap=*/512);
         // Sliding-window shape: the span wraps the ring, exercising the modulo indexing.
         run_attention_case("Attention/sliding", 8, 4, 64, /*n_pos=*/300, /*first=*/173, /*cap=*/128);
+        // Long span: 1100 keys is five tiles of the online softmax, so the running max is
+        // revised several times and the accumulator is rescaled on each revision. The two
+        // cases above both fit inside a couple of tiles and would pass even if the rescale
+        // were wrong. This one also runs past the old ATTN_MAX_SPAN-era comfort zone, which
+        // is the property the rewrite exists to provide.
+        run_attention_case("Attention/long-span", 8, 4, 64, /*n_pos=*/1100, /*first=*/0, /*cap=*/2048);
+        // Long span that also wraps the ring.
+        run_attention_case("Attention/long-sliding", 8, 4, 64, /*n_pos=*/1100, /*first=*/76, /*cap=*/1024);
+        // head_dim 128 with a long span: the accumulator loop strides differently from the
+        // score loop, and only a case where head_dim != the thread count exercises that.
+        run_attention_case("Attention/long-hd128", 8, 4, 128, /*n_pos=*/900, /*first=*/0, /*cap=*/1024);
     }
 
     vkDestroyCommandPool(dev, cmd_pool, nullptr);

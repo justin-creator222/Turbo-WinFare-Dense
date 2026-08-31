@@ -70,6 +70,9 @@ int main(int argc, char** argv) {
     std::string prompt = "";
     int tier_id = 1;
     int max_tokens = 512;
+    // 0 = the engine default (4096). Attention no longer caps this -- a larger
+    // context just costs KV cache, ~336 MB more at 8192.
+    uint32_t max_context = 0;
     float temp = 0.2f;
     float top_p = 0.95f;
     int top_k = 64;
@@ -104,6 +107,8 @@ int main(int argc, char** argv) {
             top_p = std::stof(argv[++i]);
         } else if (arg == "--top-k" && i + 1 < argc) {
             top_k = std::stoi(argv[++i]);
+        } else if (arg == "--max-context" && i + 1 < argc) {
+            max_context = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if (arg == "--draft-k" && i + 1 < argc) {
             draft_k = std::stoi(argv[++i]);
         } else if (arg == "--no-spec") {
@@ -215,6 +220,7 @@ int main(int argc, char** argv) {
     if (draft_wanted) {
         runner->set_import_reserve(kDraftImportReserveBytes);
     }
+    if (max_context != 0) runner->set_max_context(max_context);
     runner->initialize();
     runner->switch_memory_tier(tier_id);
     std::cout << "Activated Memory Tier " << tier_id << " (Pinned layers active)." << std::endl;

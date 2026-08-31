@@ -1,4 +1,4 @@
-// Grouped-query attention with sliding-window masking.
+// Grouped-query attention with sliding-window masking, as a single-pass online softmax.
 //
 // The attention scale comes in as a push constant and is 1.0 for this model:
 // Gemma4TextAttention sets `self.scaling = 1.0` outright, and the config defines no
@@ -9,8 +9,7 @@
 // It is passed in rather than baked into the kernel so it stays a property of the model, and
 // so the parity test can prove the kernel honours a non-unit value.
 //
-// One threadgroup per query head. Scores are staged in groupshared, so max context is
-// ATTN_MAX_POS.
+// One threadgroup per (batch position, query head).
 //
 //   t0 q   t1 k_cache   t2 v_cache
 //   u0 ctx (FP32, [q_heads * head_dim])
@@ -29,18 +28,39 @@
 // attends over keys [first_b, n_pos + slot] -- each query in the batch sees one more
 // key than the last. Getting that span wrong is invisible at M = 1 and wrong
 // everywhere else, so the multi-position oracle diff is what checks it.
+//
+// ---------------------------------------------------------------------------------------
+// Why online softmax
+//
+// The previous form staged every score in groupshared and made three passes over them: find
+// the max, exponentiate, then weight V. That needed one float of LDS per attended key, which
+// put a hard ATTN_MAX_SPAN = 4096 ceiling on the attended span and so on max_context.
+//
+// This form walks the keys in tiles, carrying a running max `m`, a running denominator `l`,
+// and the output accumulator itself. When a tile's max exceeds the running max, everything
+// accumulated so far is rescaled by exp(m_old - m_new) -- algebraically identical to the
+// two-pass form, because both numerator and denominator carry the same factor.
+//
+// Groupshared drops from 16 KB of scores to one tile of scores plus head_dim accumulators
+// (~3 KB), and the span ceiling disappears: the only remaining cap is on head_dim, which is a
+// property of the architecture (512 on the 31B's global layers) rather than of the context.
+//
+// The arithmetic is NOT bit-identical to the two-pass form -- rescaling reorders the sum -- so
+// this is gated on the argmax and top-5 oracle checks rather than on an exact logit diff.
 
 #include "Common.hlsli"
 
 #define ATTN_THREADS 256
-// Scores are staged relative to `first`, so this bounds the ATTENDED SPAN, not the total
-// context: a sliding-window layer never needs more than `sliding_window` entries however
-// long the conversation gets. 4096 floats = 16 KB of the 32 KB groupshared guarantee, which
-// keeps ~4 threadgroups resident per WGP on RDNA 3.
-#define ATTN_MAX_SPAN 4096
+// One key per thread per tile, so the tile size is the group size.
+#define ATTN_TILE ATTN_THREADS
+// Bounds head_dim, not context. 512 is the largest in the architecture (global layers);
+// sliding layers use 256.
+#define ATTN_MAX_HEAD_DIM 512
 
-groupshared float s_scores[ATTN_MAX_SPAN];
+groupshared float s_e[ATTN_TILE];              // this tile's exponentiated scores
+groupshared float s_acc[ATTN_MAX_HEAD_DIM];    // running unnormalized output
 groupshared float s_partial[ATTN_THREADS / 4];
+groupshared float s_reduced;
 
 [numthreads(ATTN_THREADS, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
@@ -58,7 +78,6 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
 
     const uint h    = gid.x % q_heads;
     const uint slot = gid.x / q_heads;            // which position in the batch
-    if (h >= q_heads) return;
 
     // This query's own causal span. n_pos is the context length of the FIRST position in the
     // batch, so position `slot` sees `slot` more keys.
@@ -73,71 +92,88 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     const uint kv_stride = kv_heads * head_dim * 2;
 
     const uint lane_count = WaveGetLaneCount();
-    const uint num_waves = ATTN_THREADS / lane_count;
+    const uint num_waves  = ATTN_THREADS / lane_count;
 
-    // --- 1. Scores, and their maximum -------------------------------------
-    float local_max = -1e30f;
-    for (uint t = first_b + tid; t < n_pos_b; t += ATTN_THREADS) {
-        const uint slot = t % capacity;
-        const uint kbase = k_off + slot * kv_stride + kvh * head_dim * 2;
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; ++d) {
-            dot += f32_load(g_in0, qbase + d * 4) * f16_load(g_in1, kbase + d * 2);
+    for (uint d0 = tid; d0 < head_dim; d0 += ATTN_THREADS) s_acc[d0] = 0.0f;
+
+    float m_run = -1e30f;   // running max of the scaled scores
+    float l_run = 0.0f;     // running sum of exp(score - m_run)
+
+    for (uint t0 = first_b; t0 < n_pos_b; t0 += ATTN_TILE) {
+        const uint tile_n = min(ATTN_TILE, n_pos_b - t0);
+        const uint t = t0 + tid;
+
+        // --- this thread's score, or -inf if it is past the end of the tile --------------
+        float sc = -1e30f;
+        if (tid < tile_n) {
+            const uint ring  = t % capacity;
+            const uint kbase = k_off + ring * kv_stride + kvh * head_dim * 2;
+            float dot = 0.0f;
+            for (uint d = 0; d < head_dim; ++d) {
+                dot += f32_load(g_in0, qbase + d * 4) * f16_load(g_in1, kbase + d * 2);
+            }
+            // Track the max of the SCALED score: the exponent below subtracts from this same
+            // value, so a max taken before scaling would shift every exponent.
+            sc = dot * scale;
         }
-        const float score = dot * scale;
-        s_scores[t - first_b] = score;   // staged relative to `first`
-        // Track the max of the SCALED score: step 2 subtracts `best` from these same values,
-        // so a max taken before scaling would shift every exponent.
-        local_max = max(local_max, score);
-    }
-    local_max = WaveActiveMax(local_max);
-    if (WaveIsFirstLane()) s_partial[tid / lane_count] = local_max;
-    GroupMemoryBarrierWithGroupSync();
-    if (tid == 0) {
-        float m = -1e30f;
-        for (uint w = 0; w < num_waves; ++w) m = max(m, s_partial[w]);
-        s_partial[0] = m;
-    }
-    GroupMemoryBarrierWithGroupSync();
-    const float best = s_partial[0];
-    // s_partial is reused below for the sum reduction. Without this barrier a fast wave can
-    // overwrite s_partial[0] with its partial sum while a slower wave is still reading `best`
-    // from it -- the group-sync above only guarantees arrival at that point, not that every
-    // thread has completed the read that follows.
-    //
-    // The race window scales with the length of the loop below, so a single-token pass
-    // (n_pos == 1) almost never hits it while multi-token generation does: the oracle diff at
-    // position 0 stayed argmax-exact while real generation degenerated into repeated tokens.
-    GroupMemoryBarrierWithGroupSync();
 
-    // --- 2. exp and its sum ------------------------------------------------
-    float local_sum = 0.0f;
-    for (uint t = first_b + tid; t < n_pos_b; t += ATTN_THREADS) {
-        const float e = exp(s_scores[t - first_b] - best);
-        s_scores[t - first_b] = e;
-        local_sum += e;
-    }
-    local_sum = WaveActiveSum(local_sum);
-    if (WaveIsFirstLane()) s_partial[tid / lane_count] = local_sum;
-    GroupMemoryBarrierWithGroupSync();
-    if (tid == 0) {
-        float s = 0.0f;
-        for (uint w = 0; w < num_waves; ++w) s += s_partial[w];
-        s_partial[0] = s;
-    }
-    GroupMemoryBarrierWithGroupSync();
-    const float inv_sum = 1.0f / s_partial[0];
-    // Same hazard in the other direction: step 3 below reads s_scores across the whole group,
-    // so every thread must have taken inv_sum before any of them moves on.
-    GroupMemoryBarrierWithGroupSync();
+        // --- tile max -------------------------------------------------------------------
+        // s_partial is reused for the sum reduction below, so every read of the reduced value
+        // is fenced on both sides: the group sync guarantees arrival, not that every thread
+        // has finished the read that follows it.
+        GroupMemoryBarrierWithGroupSync();
+        {
+            const float wm = WaveActiveMax(sc);
+            if (WaveIsFirstLane()) s_partial[tid / lane_count] = wm;
+            GroupMemoryBarrierWithGroupSync();
+            if (tid == 0) {
+                float m = -1e30f;
+                for (uint w = 0; w < num_waves; ++w) m = max(m, s_partial[w]);
+                s_reduced = m;
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        const float m_tile = s_reduced;
 
-    // --- 3. Weighted sum of V, parallel over the head dimension -----------
+        // exp(m_run - m_new) is 0 on the first tile (m_run is -1e30), which zeroes the
+        // untouched accumulator, and 1 whenever this tile brings nothing larger.
+        const float m_new   = max(m_run, m_tile);
+        const float rescale = exp(m_run - m_new);
+
+        // --- exponentiate, and this tile's denominator contribution ----------------------
+        const float e = (tid < tile_n) ? exp(sc - m_new) : 0.0f;
+        GroupMemoryBarrierWithGroupSync();
+        s_e[tid] = e;
+        {
+            const float ws = WaveActiveSum(e);
+            if (WaveIsFirstLane()) s_partial[tid / lane_count] = ws;
+            GroupMemoryBarrierWithGroupSync();
+            if (tid == 0) {
+                float s = 0.0f;
+                for (uint w = 0; w < num_waves; ++w) s += s_partial[w];
+                s_reduced = s;
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+        l_run = l_run * rescale + s_reduced;
+        m_run = m_new;
+
+        // --- fold this tile's V into the accumulator, parallel over head_dim -------------
+        // s_e is complete for the whole group at this point (the sum reduction synced), and
+        // the barrier at the top of the next tile keeps the next write from racing these
+        // reads.
+        for (uint d = tid; d < head_dim; d += ATTN_THREADS) {
+            float acc = s_acc[d] * rescale;
+            for (uint j = 0; j < tile_n; ++j) {
+                const uint vbase = v_off + ((t0 + j) % capacity) * kv_stride + kvh * head_dim * 2;
+                acc += s_e[j] * f16_load(g_in2, vbase + d * 2);
+            }
+            s_acc[d] = acc;
+        }
+    }
+
+    const float inv_sum = (l_run > 0.0f) ? (1.0f / l_run) : 0.0f;
     for (uint d = tid; d < head_dim; d += ATTN_THREADS) {
-        float acc = 0.0f;
-        for (uint t = first_b; t < n_pos_b; ++t) {
-            const uint vbase = v_off + (t % capacity) * kv_stride + kvh * head_dim * 2;
-            acc += s_scores[t - first_b] * f16_load(g_in2, vbase + d * 2);
-        }
-        f32_store(g_out0, out_off + slot * gp3.z + (h * head_dim + d) * 4, acc * inv_sum);
+        f32_store(g_out0, out_off + slot * gp3.z + (h * head_dim + d) * 4, s_acc[d] * inv_sum);
     }
 }
