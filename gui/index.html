@@ -31,23 +31,27 @@
                 </div>
             </div>
 
-            <!-- Memory Tier Selector -->
-            <div class="tier-selector-group">
-                <button class="tier-btn active" id="tier-btn-1" onclick="selectTier(1)" title="Tier 1 (Baseline): 6 Pinned Layers, 54 Streamed Layers">
+            <!-- Memory tier selector.
+                 The tier is a label, not a residency policy. How many layers stay resident is
+                 decided at load time by how much host memory the driver will accept, and is the
+                 same whichever tier is selected -- so these no longer claim per-tier layer
+                 counts and memory ceilings, which were a planning model, not the engine. -->
+            <div class="tier-selector-group" title="Residency is set by the driver's import limit and is identical for every tier. See the layer map for what is actually resident.">
+                <button class="tier-btn active" id="tier-btn-1" onclick="selectTier(1)" title="Tier 1 -- a label only; it does not change how many layers stay resident.">
                     <span class="tier-badge">Tier 1</span>
-                    <span class="tier-desc">6.0 GB</span>
+                    <span class="tier-desc">6.0 GB plan</span>
                 </button>
-                <button class="tier-btn" id="tier-btn-2" onclick="selectTier(2)" title="Tier 2 (Balanced): 21 Pinned Layers, 39 Streamed Layers">
+                <button class="tier-btn" id="tier-btn-2" onclick="selectTier(2)" title="Tier 2 -- a label only; it does not change how many layers stay resident.">
                     <span class="tier-badge">Tier 2</span>
-                    <span class="tier-desc">10.0 GB</span>
+                    <span class="tier-desc">10.0 GB plan</span>
                 </button>
-                <button class="tier-btn" id="tier-btn-3" onclick="selectTier(3)" title="Tier 3 (High-Perf): 48 Pinned Layers, 12 Streamed Layers">
+                <button class="tier-btn" id="tier-btn-3" onclick="selectTier(3)" title="Tier 3 -- a label only; it does not change how many layers stay resident.">
                     <span class="tier-badge">Tier 3</span>
-                    <span class="tier-desc">16.0 GB</span>
+                    <span class="tier-desc">16.0 GB plan</span>
                 </button>
-                <button class="tier-btn" id="tier-btn-4" onclick="selectTier(4)" title="Tier 4 (Resident): 60 Pinned Layers, 0 Streamed (Requires 32GB+ RAM)">
+                <button class="tier-btn" id="tier-btn-4" onclick="selectTier(4)" title="Tier 4 -- a label only; it does not change how many layers stay resident.">
                     <span class="tier-badge">Tier 4</span>
-                    <span class="tier-desc">22.0 GB</span>
+                    <span class="tier-desc">22.0 GB plan</span>
                 </button>
             </div>
 

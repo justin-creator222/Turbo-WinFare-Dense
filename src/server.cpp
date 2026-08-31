@@ -240,7 +240,8 @@ void HTTPServer::handle_client(uintptr_t client_socket) {
                << ",\"lm_head_size_mb\":" << (static_cast<double>(h.lm_head_size) / (1024.0 * 1024.0))
                << ",\"quant_type\":\"MLX INT4 (Group " << h.quant_group_size << ")\""
                << ",\"scale_dtype\":\"BF16\""
-               << ",\"device_name\":\"" << r->device_name() << "\"";
+               << ",\"device_name\":\"" << r->device_name() << "\""
+               << ",\"has_draft\":" << (r->has_draft_model() ? "true" : "false");
 
             // WHICH layers stream, not just how many. They are evenly spaced across the stack,
             // so a layer map that shaded the first N cells was drawing the wrong ones.

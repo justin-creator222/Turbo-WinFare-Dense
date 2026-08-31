@@ -102,8 +102,12 @@ function renderModelMetadata(info) {
     if (metaId) metaId.innerText = info.name || 'gemma-4-31b-dense';
     if (metaArch) metaArch.innerText = `${info.num_layers || 60} Dense Layers • ${(info.d_model || 5376).toLocaleString()} Dim`;
     if (metaFfn) metaFfn.innerText = `${(info.d_ff || 21504).toLocaleString()} Dim (GeGLU)`;
-    if (metaHeads) metaHeads.innerText = `${info.num_q_heads || 32} Q Heads • ${info.num_kv_heads || 16} KV (GQA 2:1)`;
-    if (metaGlobal) metaGlobal.innerText = `10 Global Layers • ${info.global_head_dim || 512} Dim • ${info.global_kv_heads || 4} KV`;
+    // The GQA ratio and the global-layer count were literals ("GQA 2:1", "10 Global Layers"),
+    // which are the 31B's numbers and wrong for any other container the engine can load.
+    const q = info.num_q_heads || 32, kv = info.num_kv_heads || 16;
+    if (metaHeads) metaHeads.innerText = `${q} Q Heads • ${kv} KV (GQA ${kv ? (q / kv) : 1}:1)`;
+    const nGlobal = Array.isArray(info.global_layers) ? info.global_layers.length : 0;
+    if (metaGlobal) metaGlobal.innerText = `${nGlobal} Global Layers • ${info.global_head_dim || 512} Dim • ${info.global_kv_heads || 4} KV`;
     if (metaQuant) metaQuant.innerText = `${info.quant_type || 'MLX INT4 (Group 64)'} • ${info.scale_dtype || 'BF16'}`;
     if (metaVocab) metaVocab.innerText = `${(info.vocab_size || 262144).toLocaleString()} Vocab • ${info.lm_head_size_mb || 756} MB Head`;
     if (metaSoftcap) metaSoftcap.innerText = `${info.softcapping || 30.0} Logit Softcap`;
@@ -180,9 +184,10 @@ function updateLayerSummaryText(pinnedCount) {
     const streamedEl = document.getElementById('layer-summary-streamed');
     const globalEl = document.getElementById('layer-summary-global');
 
-    if (pinnedEl) pinnedEl.innerHTML = `<strong>${pinnedCount}</strong> Pinned Layers`;
+    if (pinnedEl) pinnedEl.innerHTML = `<strong>${pinnedCount}</strong> Resident Layers`;
     if (streamedEl) streamedEl.innerHTML = `<strong>${TOTAL_LAYERS - pinnedCount}</strong> Streamed Layers`;
-    if (globalEl) globalEl.innerHTML = `<strong>10</strong> Global Attn (4096)`;
+    // Global-attention layers come from the container's mask, not from a constant.
+    if (globalEl) globalEl.innerHTML = `<strong>${GLOBAL_LAYERS.length}</strong> Global Attn`;
 }
 
 function update60LayerState(pinnedCount, activeLayerIdx = -1) {
