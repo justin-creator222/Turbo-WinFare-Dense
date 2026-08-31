@@ -147,13 +147,13 @@ function init60LayerGrid() {
         miniGrid.innerHTML = '';
         for (let i = 0; i < TOTAL_LAYERS; i++) {
             const cell = document.createElement('div');
-            const isPinned = i < pinnedCount;
+            const isPinned = isLayerResident(i);
             const isGlobal = GLOBAL_LAYERS.includes(i);
 
             cell.className = `layer-cell ${isPinned ? 'pinned' : 'streamed'} ${isGlobal ? 'global-attn' : 'sliding-attn'}`;
             cell.id = `layer-mini-${i}`;
             cell.innerText = i;
-            cell.title = `Layer ${i}: ${isGlobal ? 'Global Full Attention (4096)' : 'Sliding Window Attention (1024)'} • ${isPinned ? 'Heap 0 Pinned' : 'Heap 1 Streamed DMA'}`;
+            cell.title = `Layer ${i}: ${isGlobal ? 'Global Full Attention (4096)' : 'Sliding Window Attention (1024)'} • ${isPinned ? 'resident in memory' : 'streamed from disk each token'}`;
             cell.onclick = () => showLayerDetails(i);
             miniGrid.appendChild(cell);
         }
@@ -163,7 +163,7 @@ function init60LayerGrid() {
         modalGrid.innerHTML = '';
         for (let i = 0; i < TOTAL_LAYERS; i++) {
             const cell = document.createElement('div');
-            const isPinned = i < pinnedCount;
+            const isPinned = isLayerResident(i);
             const isGlobal = GLOBAL_LAYERS.includes(i);
 
             cell.className = `layer-cell ${isPinned ? 'pinned' : 'streamed'} ${isGlobal ? 'global-attn' : 'sliding-attn'}`;
@@ -215,7 +215,7 @@ function showLayerDetails(idx) {
     selectedLayerIndex = idx;
     const isGlobal = GLOBAL_LAYERS.includes(idx);
     const pinnedCount = TOTAL_LAYERS - streamedLayerSet.size;
-    const isPinned = idx < pinnedCount;
+    const isPinned = isLayerResident(idx);
 
     const badge = document.getElementById('ld-badge');
     const title = document.getElementById('ld-title');

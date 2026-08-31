@@ -233,7 +233,9 @@ int main(int argc, char** argv) {
     if (max_context != 0) runner->set_max_context(max_context);
     runner->initialize();
     runner->switch_memory_tier(tier_id);
-    std::cout << "Activated Memory Tier " << tier_id << " (Pinned layers active)." << std::endl;
+    // Not "pinned layers active": pinning was removed in round 6, and residency is decided by
+    // how much host memory the driver accepts, identically for every tier.
+    std::cout << "Memory tier " << tier_id << " selected (residency is driver-determined)." << std::endl;
 
     // Load the draft HERE, not after the server branch.
     //

@@ -127,8 +127,8 @@
                                 <div class="welcome-features-grid">
                                     <div class="wf-card">
                                         <span class="wf-icon">🚀</span>
-                                        <strong>Two-Tier Memory</strong>
-                                        <span>NVMe DMA async streaming into GPU compute memory with live Tier 1–4 management.</span>
+                                        <strong>Resident + Streamed Layers</strong>
+                                        <span>As many layers as the driver will import stay in memory; the rest stream from NVMe on every token.</span>
                                     </div>
                                     <div class="wf-card">
                                         <span class="wf-icon">🧠</span>
@@ -143,11 +143,11 @@
                                     <div class="wf-card">
                                         <span class="wf-icon">⚡</span>
                                         <strong>Vulkan 1.3 Shaders</strong>
-                                        <span>15 DXC SPIR-V compute kernels for INT4 group-64 quantized math.</span>
+                                        <span>12 SPIR-V compute kernels (HLSL via DXC) for INT4 group-64 quantized math.</span>
                                     </div>
                                 </div>
                                 <div class="welcome-hint">
-                                    💡 <em>Select your memory tier above, check the 60-layer streaming map in the sidebar, or pick a preset below to start generation!</em>
+                                    💡 <em>Check the 60-layer residency map in the sidebar to see which layers stream, or pick a preset below to start generation.</em>
                                 </div>
                             </div>
                         </div>
@@ -287,7 +287,7 @@
 
                     <div class="control-group">
                         <div class="layer-map-legend">
-                            <span class="legend-item"><i class="dot dot-pinned"></i> Pinned (Heap 0)</span>
+                            <span class="legend-item"><i class="dot dot-pinned"></i> Resident</span>
                             <span class="legend-item"><i class="dot dot-streamed"></i> Streamed (DMA)</span>
                             <span class="legend-item"><i class="dot dot-global"></i> Global Attn</span>
                             <span class="legend-item"><i class="dot dot-sliding"></i> Sliding Attn</span>
@@ -299,39 +299,39 @@
                         </div>
 
                         <div class="layer-summary-bar">
-                            <span id="layer-summary-pinned"><strong>—</strong> Pinned Layers</span>
+                            <span id="layer-summary-pinned"><strong>—</strong> Resident Layers</span>
                             <span id="layer-summary-streamed"><strong>—</strong> Streamed Layers</span>
                             <span id="layer-summary-global"><strong>10</strong> Global Attn</span>
                         </div>
                     </div>
                 </div>
 
-                <!-- Section 3: Two-Tier Memory & Hardware Profiler -->
+                <!-- Section 3: Memory & Hardware Profiler -->
                 <div class="panel-section">
                     <div class="section-title">
-                        <span>⚡ Two-Tier Memory Allocation</span>
+                        <span>⚡ Memory Allocation</span>
                         <span class="badge-tag" id="ram-total-badge">—</span>
                     </div>
 
                     <div class="control-group">
-                        <!-- Segmented Two-Tier Memory Bar -->
+                        <!-- Segmented memory bar -->
                         <div class="mem-bar-container">
                             <div class="mem-bar">
-                                <div class="mem-seg seg-pinned" id="seg-pinned" style="width: 0%;" title="Device-Local Pinned Layers (Heap 0)"></div>
+                                <div class="mem-seg seg-pinned" id="seg-pinned" style="width: 0%;" title="Resident layers -- imported host memory the GPU reads directly"></div>
                                 <div class="mem-seg seg-lmhead" id="seg-lmhead" style="width: 0%;" title="Tied LM Head & Embeddings (756 MB Heap 0)"></div>
                                 <div class="mem-seg seg-kv" id="seg-kv" style="width: 0%;" title="KV Cache Buffer Pool"></div>
                                 <div class="mem-seg seg-ring" id="seg-ring" style="width: 0%;" title="DMA Streaming Ring Buffer (4 slots Heap 1)"></div>
                                 <div class="mem-seg seg-activations" id="seg-activations" style="width: 0%;" title="Vulkan Compute Activation Scratchpad"></div>
                             </div>
                             <div class="mem-legend">
-                                <span><i class="dot dot-pinned"></i> Pinned (<span id="legend-pinned">—</span>)</span>
+                                <span><i class="dot dot-pinned"></i> Resident (<span id="legend-pinned">—</span>)</span>
                                 <span><i class="dot dot-lmhead"></i> LM Head (<span id="legend-lmhead">756 MB</span>)</span>
                                 <span><i class="dot dot-kv"></i> KV Cache (<span id="legend-kv">—</span>)</span>
                                 <span><i class="dot dot-ring"></i> DMA Ring (<span id="legend-ring">1.03 GB</span>)</span>
                             </div>
                         </div>
 
-                        <!-- Two-Tier Detailed Metrics Grid -->
+                        <!-- Detailed metrics grid -->
                         <div class="ram-metrics-grid">
                             <div class="ram-metric">
                                 <span class="lbl">Device Heap 0 (VRAM)</span>
@@ -522,7 +522,7 @@
                         </div>
                         <div class="ld-item">
                             <span class="ld-lbl">Residency Location</span>
-                            <span class="ld-val" id="ld-residency" style="color:var(--accent-green)">Heap 0 Device-Local (Pinned)</span>
+                            <span class="ld-val" id="ld-residency" style="color:var(--accent-green)">Resident</span>
                         </div>
                         <div class="ld-item">
                             <span class="ld-lbl">Query / KV Heads</span>
@@ -666,7 +666,7 @@
                     </div>
                     <div class="about-spec-row">
                         <span class="as-lbl">Compute Backend:</span>
-                        <span class="as-val">Vulkan 1.3 (15 DXC SPIR-V Shaders, Subgroup Math, Async Compute)</span>
+                        <span class="as-val">Vulkan 1.3 (12 SPIR-V kernels via DXC, subgroup math, async compute)</span>
                     </div>
                 </div>
 
