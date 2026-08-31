@@ -31,6 +31,24 @@ struct ServerConfig {
     int context_len{4096};
 };
 
+// A model download + conversion running in the background.
+//
+// A new user has no .g4dense container and no way to get one without leaving the UI for a
+// 40-minute command line job. This is that job, driven from the browser. The work itself is
+// tools/fetch_model.py -- the conversion is MLX INT4 repacking and has no C++ equivalent -- so
+// the server supervises a child process rather than doing it directly.
+struct DownloadJob {
+    enum class State { Idle, Running, Done, Failed, Cancelled };
+
+    State state{State::Idle};
+    std::string model;      // "e2b" | "31b"
+    std::string stage;      // download | convert | verify
+    std::string message;
+    std::string container;  // set on success
+    double percent{0.0};
+    int64_t started_ms{0};
+};
+
 class HTTPServer {
 public:
     HTTPServer();
@@ -41,6 +59,11 @@ public:
     bool is_running() const { return is_running_; }
 
     void set_context(std::shared_ptr<VulkanContext> ctx);
+
+    // Model provisioning, for a machine that has no containers yet.
+    bool start_download(const std::string& model, std::string& error);
+    void cancel_download();
+    DownloadJob download_status() const;
     std::shared_ptr<ForwardRunner> runner() const;
 
     void set_load_error(const std::string& message);
@@ -67,6 +90,18 @@ private:
     mutable std::mutex config_mutex_;
     std::mutex generate_mutex_;
     mutable std::mutex runner_mutex_;
+
+    // Download job state. The worker thread writes it; /api/download_status reads it.
+    DownloadJob job_;
+    mutable std::mutex job_mutex_;
+    std::thread job_thread_;
+    // Set by cancel_download(); the worker terminates the child process and exits.
+    std::atomic<bool> job_cancel_{false};
+    // The child process handle, so cancellation can actually stop a 40-minute download rather
+    // than only setting a flag the worker checks between lines.
+    std::atomic<void*> job_process_{nullptr};
+
+    void run_download_job(std::string model);
 
     OpenAIServerConfig openai_cfg_;
     std::unique_ptr<RequestCoordinator> coordinator_;

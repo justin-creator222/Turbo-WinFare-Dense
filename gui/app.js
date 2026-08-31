@@ -46,6 +46,9 @@ document.addEventListener('DOMContentLoaded', () => {
     hydrateConfig();
     refreshModelList();
     fetchTelemetry();
+    // What a new user sees first: whether any model is installed at all.
+    refreshSetup();
+    pollDownload();
     telemetryTimer = setInterval(fetchTelemetry, 1000);
 });
 
@@ -1169,4 +1172,192 @@ function downloadExportJson() {
     a.download = `dense_turbo_chat_${Date.now()}.json`;
     a.click();
     URL.revokeObjectURL(url);
+}
+
+// ============================================================================
+// First-run model provisioning
+//
+// A new user starts with no .g4dense container. Downloading and converting one is a
+// multi-gigabyte job that used to require leaving for the command line; this drives it from the
+// browser. The server runs tools/fetch_model.py as a child process and reports its progress.
+// ============================================================================
+
+let setupState = null;
+let setupPollTimer = null;
+
+function gbStr(bytes) {
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
+
+function refreshSetup() {
+    fetch('/api/setup')
+        .then(r => r.json())
+        .then(data => { setupState = data; renderSetup(data); })
+        .catch(err => console.warn('setup probe failed:', err));
+}
+
+function renderSetup(data) {
+    const panel = document.getElementById('setup-panel');
+    const intro = document.getElementById('setup-intro');
+    const rows = document.getElementById('setup-rows');
+    const disk = document.getElementById('setup-disk');
+    if (!panel || !rows) return;
+
+    // Python missing is a first-class outcome, not an error to swallow: the download cannot
+    // work without it and the user needs to be told exactly that.
+    if (!data || !data.python || data.error) {
+        panel.hidden = false;
+        rows.innerHTML = '';
+        if (intro) {
+            intro.innerHTML = (data && data.error)
+                ? escapeHtml(data.error)
+                : 'Could not check for models.';
+        }
+        return;
+    }
+
+    if (!data.huggingface_hub) {
+        panel.hidden = false;
+        rows.innerHTML = '';
+        if (intro) {
+            intro.innerHTML = 'Downloading needs the <code>huggingface_hub</code> package. ' +
+                              'Install it with <code>pip install huggingface_hub</code>, then reload.';
+        }
+        return;
+    }
+
+    if (disk && data.disk_free_bytes) disk.innerText = gbStr(data.disk_free_bytes) + ' free';
+
+    const models = data.models || {};
+    const missing = Object.keys(models).filter(k => !models[k].container_present);
+
+    // Nothing to do and nothing running: stay out of the way entirely.
+    const jobBox = document.getElementById('setup-job');
+    const jobRunning = jobBox && !jobBox.hidden;
+    if (missing.length === 0 && !jobRunning) {
+        panel.hidden = true;
+        return;
+    }
+    panel.hidden = false;
+
+    if (intro) {
+        intro.innerText = missing.length
+            ? 'These are downloaded from Hugging Face and converted locally. Nothing is uploaded.'
+            : 'All models are installed.';
+    }
+
+    // Sizes are approximate and stated up front, because a 31B download is 18 GB and half an
+    // hour -- finding that out afterwards is not acceptable.
+    const meta = {
+        e2b: { order: 0, dl: '3.4 GB', total: '~6 GB', note: 'small, fast, also the draft model' },
+        '31b': { order: 1, dl: '18 GB', total: '~35 GB', note: 'the main model' }
+    };
+
+    rows.innerHTML = '';
+    Object.keys(models)
+        .sort((a, b) => (meta[a] ? meta[a].order : 9) - (meta[b] ? meta[b].order : 9))
+        .forEach(key => {
+            const m = models[key];
+            const inf = meta[key] || { dl: '', total: '', note: '' };
+            const row = document.createElement('div');
+            row.className = 'setup-row';
+
+            const left = document.createElement('div');
+            left.innerHTML = `<div class="sr-name">${escapeHtml(m.label || key)}</div>` +
+                             `<div class="sr-sub">${inf.dl} download · ${inf.total} on disk · ${escapeHtml(inf.note)}</div>`;
+            row.appendChild(left);
+
+            const right = document.createElement('div');
+            if (m.container_present) {
+                const bits = [`<span class="sr-installed">✓ installed</span>`];
+                // The source checkpoint is only needed to re-convert, so offer the space back
+                // rather than deleting it silently.
+                if (m.checkpoint_present) {
+                    bits.push(`<button class="btn-secondary" style="margin-left:8px"
+                        onclick="reclaimCheckpoint('${key}', ${m.checkpoint_bytes})">
+                        Reclaim ${gbStr(m.checkpoint_bytes)}</button>`);
+                }
+                right.innerHTML = bits.join('');
+            } else {
+                right.innerHTML = `<button class="btn-primary" onclick="startDownload('${key}')">Download</button>`;
+            }
+            row.appendChild(right);
+            rows.appendChild(row);
+        });
+}
+
+function startDownload(model) {
+    fetch('/api/download_model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: model })
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.error) { alert(data.error); return; }
+        const box = document.getElementById('setup-job');
+        if (box) box.hidden = false;
+        pollDownload();
+    })
+    .catch(err => alert('Could not start the download: ' + err));
+}
+
+function cancelDownload() {
+    fetch('/api/download_cancel', { method: 'POST' }).catch(() => {});
+}
+
+function reclaimCheckpoint(model, bytes) {
+    if (!confirm(`Delete the downloaded source checkpoint for ${model} and free ${gbStr(bytes)}?\n\n` +
+                 `The converted model keeps working. You would only need this again to re-convert, ` +
+                 `which means downloading it a second time.`)) return;
+    fetch('/api/delete_checkpoint', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: model })
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.error) alert(data.error);
+        refreshSetup();
+    })
+    .catch(err => alert('Could not delete the checkpoint: ' + err));
+}
+
+function pollDownload() {
+    if (setupPollTimer) clearTimeout(setupPollTimer);
+    fetch('/api/download_status')
+        .then(r => r.json())
+        .then(j => {
+            const box = document.getElementById('setup-job');
+            const setTxt = (id, t) => { const el = document.getElementById(id); if (el) el.innerText = t; };
+
+            if (j.state === 'running') {
+                if (box) box.hidden = false;
+                setTxt('job-title', `${j.model.toUpperCase()} · ${j.stage}`);
+                setTxt('job-pct', `${j.percent.toFixed(0)}%`);
+                setTxt('job-msg', j.message || '');
+                const bar = document.getElementById('job-bar');
+                if (bar) bar.style.width = `${j.percent}%`;
+                setupPollTimer = setTimeout(pollDownload, 1500);
+                return;
+            }
+
+            if (box) box.hidden = true;
+            if (j.state === 'done') {
+                refreshModelList();     // the new container should appear in the picker
+                refreshSetup();
+            } else if (j.state === 'failed') {
+                alert('Download failed:\n\n' + (j.message || 'unknown error'));
+                refreshSetup();
+            } else if (j.state === 'cancelled') {
+                refreshSetup();
+            }
+        })
+        .catch(() => { setupPollTimer = setTimeout(pollDownload, 3000); });
+}
+
+function escapeHtml(s) {
+    return String(s === undefined || s === null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
 }

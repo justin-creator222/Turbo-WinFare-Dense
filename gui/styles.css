@@ -184,6 +184,46 @@ header {
     font-family: var(--mono);
 }
 
+/* First-run model provisioning panel. */
+.setup-panel {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: rgba(59, 130, 246, 0.06);
+}
+
+.setup-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 7px 0;
+    border-top: 1px solid var(--border);
+}
+
+.setup-row:first-of-type { border-top: none; }
+
+.setup-row .sr-name {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.setup-row .sr-sub {
+    font-size: 10px;
+    color: var(--text-secondary);
+    opacity: 0.8;
+}
+
+.setup-row .sr-installed {
+    font-size: 11px;
+    color: var(--accent-green, #34d399);
+    font-family: var(--mono);
+    white-space: nowrap;
+}
+
+.setup-job { margin-top: 10px; }
+
 /* Residency readout -- replaced the Tier 1-4 selector, which chose a label and nothing else. */
 .residency-readout {
     display: flex;

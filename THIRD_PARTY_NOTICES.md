@@ -73,8 +73,19 @@ Used to build the software; not linked into it or distributed with it.
 | Python 3 | Python Software Foundation | PSF License |
 
 `tools/bootstrap.py` and `tools/convert_hf_to_g4dense.py` use only the Python standard library.
-The optional validation tooling (`tools/numpy_reference.py`, `tools/dtype_probe.py`) uses NumPy
-(BSD-3-Clause) and is not required to build or run the engine.
+
+Two optional paths need third-party packages, and neither is required to build or run the
+engine:
+
+| Package | Used by | Terms |
+| --- | --- | --- |
+| `huggingface_hub` | `tools/fetch_model.py`, `tools/download_weights.py` — fetching a checkpoint, including from the web UI's **Get Models** panel | Apache-2.0 |
+| NumPy | `tools/numpy_reference.py`, `tools/dtype_probe.py` — validation tooling | BSD-3-Clause |
+
+The **Get Models** panel makes Python a runtime prerequisite *for that feature only*: the
+conversion is MLX INT4 repacking implemented in Python, so the server runs it as a child
+process. Inference itself never invokes Python, and the UI reports a missing interpreter or
+package as a clear message rather than failing partway through a download.
 
 ## Binary distribution
 

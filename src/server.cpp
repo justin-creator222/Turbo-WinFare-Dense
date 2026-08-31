@@ -116,6 +116,236 @@ bool HTTPServer::swap_runner(const std::string& container_path, bool load, std::
     }
 }
 
+
+// ============================================================================================
+// Model provisioning
+//
+// A new user has no .g4dense container, and building one means a multi-gigabyte download and a
+// conversion that takes minutes. Both live in tools/fetch_model.py: the conversion is MLX INT4
+// repacking with no C++ equivalent, so the server supervises a child process and relays its
+// progress rather than reimplementing any of it.
+// ============================================================================================
+
+namespace {
+
+// Run a command and return its stdout, or an empty string if it could not be run.
+std::string capture_command(const std::string& cmd) {
+    std::string out;
+    FILE* pipe = _popen(("\"" + cmd + "\" 2>nul").c_str(), "r");
+    if (!pipe) return out;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), pipe)) out += buf;
+    _pclose(pipe);
+    return out;
+}
+
+// Find an interpreter that actually works.
+//
+// Locating one is not enough. Windows ships an "app execution alias" at
+// %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe that exists, is first on PATH for most users,
+// and does nothing but print "Python was not found" and offer the Microsoft Store. SearchPath
+// finds it happily. So each candidate is executed and required to answer, which is the only
+// reliable way to tell a real interpreter from the stub.
+std::string find_python() {
+    std::vector<std::string> candidates;
+
+    // An explicit override wins: a user with several interpreters, or a venv the server should
+    // use, has no other way to say so.
+    if (const char* env = std::getenv("G4DENSE_PYTHON")) {
+        if (*env) candidates.emplace_back(env);
+    }
+    // A virtualenv beside the repo, which is how this project is normally set up.
+    std::error_code ec;
+    const fs::path venv = fs::path(resolve_resource_path(".")) / ".venv" / "Scripts" / "python.exe";
+    if (fs::exists(venv, ec)) candidates.push_back(venv.string());
+
+    for (const char* c : {"python.exe", "python3.exe", "py.exe"}) {
+        char found[MAX_PATH];
+        if (SearchPathA(nullptr, c, nullptr, MAX_PATH, found, nullptr) != 0) {
+            candidates.emplace_back(found);
+        }
+    }
+
+    for (const auto& cand : candidates) {
+        const std::string probe = "\"" + cand + "\" -c \"import sys; sys.stdout.write('G4OK')\"";
+        if (capture_command(probe).find("G4OK") != std::string::npos) return cand;
+    }
+    return {};
+}
+
+std::string json_escape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (char c : in) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) out += ' ';
+                else out += c;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+DownloadJob HTTPServer::download_status() const {
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    return job_;
+}
+
+void HTTPServer::cancel_download() {
+    job_cancel_ = true;
+    // Terminate the child. Without this, cancelling a download only stops the reader loop while
+    // huggingface_hub keeps pulling gigabytes in the background.
+    void* h = job_process_.exchange(nullptr);
+    if (h != nullptr) {
+        TerminateProcess(static_cast<HANDLE>(h), 1);
+        CloseHandle(static_cast<HANDLE>(h));
+    }
+}
+
+bool HTTPServer::start_download(const std::string& model, std::string& error) {
+    if (model != "e2b" && model != "31b") {
+        error = "unknown model id";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        if (job_.state == DownloadJob::State::Running) {
+            error = "a download is already running";
+            return false;
+        }
+        job_ = DownloadJob{};
+        job_.state = DownloadJob::State::Running;
+        job_.model = model;
+        job_.stage = "starting";
+        job_.message = "preparing";
+        job_.started_ms = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+    job_cancel_ = false;
+    if (job_thread_.joinable()) job_thread_.join();
+    job_thread_ = std::thread(&HTTPServer::run_download_job, this, model);
+    return true;
+}
+
+void HTTPServer::run_download_job(std::string model) {
+    auto fail = [&](const std::string& msg) {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        job_.state = job_cancel_ ? DownloadJob::State::Cancelled : DownloadJob::State::Failed;
+        job_.message = job_cancel_ ? "cancelled" : msg;
+    };
+
+    const std::string python = find_python();
+    if (python.empty()) {
+        fail("Python was not found on PATH. It is needed to download and convert a model; "
+             "install Python 3 and restart the server.");
+        return;
+    }
+
+    const std::string script = resolve_resource_path("tools/fetch_model.py");
+    std::string cmd = "\"" + python + "\" \"" + script + "\" --model " + model;
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE rd = nullptr, wr = nullptr;
+    if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) {
+        fail("could not create a pipe for the download process");
+        return;
+    }
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = wr;
+    si.hStdError = wr;
+    si.hStdInput = nullptr;
+    PROCESS_INFORMATION pi{};
+
+    std::vector<char> cmdbuf(cmd.begin(), cmd.end());
+    cmdbuf.push_back('\0');
+    // Python buffers stdout when it is a pipe, which would make progress arrive in one lump at
+    // the end. PYTHONUNBUFFERED forces it through as it is produced.
+    const char* env = "PYTHONUNBUFFERED=1\0PYTHONIOENCODING=utf-8\0";
+    std::string cwd = resolve_resource_path(".");
+    BOOL ok = CreateProcessA(nullptr, cmdbuf.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW, (LPVOID)env,
+                             cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+    CloseHandle(wr);
+    if (!ok) {
+        CloseHandle(rd);
+        fail("could not start the download process");
+        return;
+    }
+    CloseHandle(pi.hThread);
+    job_process_ = pi.hProcess;
+
+    std::string pending;
+    char buf[4096];
+    DWORD got = 0;
+    auto handle_line = [&](std::string line) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.rfind("STAGE ", 0) == 0) {
+            std::lock_guard<std::mutex> lock(job_mutex_);
+            job_.stage = line.substr(6);
+        } else if (line.rfind("PROGRESS ", 0) == 0) {
+            const std::string rest = line.substr(9);
+            const size_t sp = rest.find(' ');
+            std::lock_guard<std::mutex> lock(job_mutex_);
+            try { job_.percent = std::stod(rest.substr(0, sp)); } catch (...) {}
+            if (sp != std::string::npos) job_.message = rest.substr(sp + 1);
+        } else if (line.rfind("DONE ", 0) == 0) {
+            std::lock_guard<std::mutex> lock(job_mutex_);
+            job_.container = line.substr(5);
+            job_.percent = 100.0;
+        } else if (line.rfind("ERROR ", 0) == 0) {
+            std::lock_guard<std::mutex> lock(job_mutex_);
+            job_.message = line.substr(6);
+        } else if (!line.empty()) {
+            std::lock_guard<std::mutex> lock(job_mutex_);
+            if (job_.stage != "download") job_.message = line;
+        }
+    };
+
+    while (ReadFile(rd, buf, sizeof(buf), &got, nullptr) && got > 0) {
+        pending.append(buf, got);
+        size_t nl;
+        while ((nl = pending.find('\n')) != std::string::npos) {
+            handle_line(pending.substr(0, nl));
+            pending.erase(0, nl + 1);
+        }
+    }
+    if (!pending.empty()) handle_line(pending);
+    CloseHandle(rd);
+
+    DWORD exit_code = 1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    void* h = job_process_.exchange(nullptr);
+    if (h != nullptr) CloseHandle(static_cast<HANDLE>(h));
+
+    std::lock_guard<std::mutex> lock(job_mutex_);
+    if (job_cancel_) {
+        job_.state = DownloadJob::State::Cancelled;
+        job_.message = "cancelled";
+    } else if (exit_code == 0 && !job_.container.empty()) {
+        job_.state = DownloadJob::State::Done;
+        job_.percent = 100.0;
+    } else {
+        job_.state = DownloadJob::State::Failed;
+        if (job_.message.empty()) job_.message = "the download process exited with code " +
+                                                 std::to_string(exit_code);
+    }
+}
+
 void HTTPServer::start(uint16_t port, std::shared_ptr<ForwardRunner> runner, std::shared_ptr<VulkanContext> ctx) {
     {
         std::lock_guard<std::mutex> guard(runner_mutex_);
@@ -216,6 +446,130 @@ void HTTPServer::handle_client(uintptr_t client_socket) {
     // Three endpoints the GUI has always called and the server never implemented, so the
     // model metadata panel and the tier matrix rendered defaults and the "Reset KV Cache"
     // button reported success while doing nothing.
+    // ---- Model provisioning, for a machine with no containers yet ---------------------
+    //
+    // /api/setup reports prerequisites and what is installed; the other three drive the job.
+    // Everything here is deliberately explicit about what is MISSING, because the failure a new
+    // user hits is "nothing happens and I do not know why".
+    if (req.path == "/api/setup" && req.method == "GET") {
+        std::string body;
+        const std::string python = find_python();
+        if (python.empty()) {
+            body = "{\"python\":null,\"error\":\"Python 3 was not found on PATH. It is required "
+                   "to download and convert a model.\"}";
+        } else {
+            // fetch_model.py --check emits the whole picture as JSON, so there is one source of
+            // truth for which files count as installed rather than two implementations.
+            const std::string script = resolve_resource_path("tools/fetch_model.py");
+            const std::string out = capture_command(
+                "\"" + python + "\" \"" + script + "\" --check");
+            // The tool prints one JSON object; anything before it is noise from the interpreter.
+            const size_t brace = out.find('{');
+            if (brace == std::string::npos) {
+                body = "{\"python\":\"" + json_escape(python) +
+                       "\",\"error\":\"could not read the setup report from fetch_model.py\"}";
+            } else {
+                body = out.substr(brace);
+                while (!body.empty() && (body.back() == '\n' || body.back() == '\r' ||
+                                         body.back() == ' ')) body.pop_back();
+            }
+        }
+        send_http_response(client_socket, 200, "application/json", body, false);
+        return;
+    }
+
+    if (req.path == "/api/download_model" && req.method == "POST") {
+        std::string model, error;
+        try {
+            JsonValue root = JsonValue::parse(req.body);
+            model = root.at("model", "body").as_string("model");
+        } catch (const std::exception&) {
+            send_http_response(client_socket, 400, "application/json",
+                               "{\"error\":\"expected {\\\"model\\\":\\\"e2b\\\"|\\\"31b\\\"}\"}", false);
+            return;
+        }
+        if (!start_download(model, error)) {
+            send_http_response(client_socket, 409, "application/json",
+                               "{\"error\":\"" + json_escape(error) + "\"}", false);
+            return;
+        }
+        send_http_response(client_socket, 200, "application/json", "{\"status\":\"started\"}", false);
+        return;
+    }
+
+    if (req.path == "/api/download_status" && req.method == "GET") {
+        const DownloadJob j = download_status();
+        const char* st = "idle";
+        switch (j.state) {
+            case DownloadJob::State::Running:   st = "running"; break;
+            case DownloadJob::State::Done:      st = "done"; break;
+            case DownloadJob::State::Failed:    st = "failed"; break;
+            case DownloadJob::State::Cancelled: st = "cancelled"; break;
+            default: break;
+        }
+        std::ostringstream js;
+        js << std::fixed << std::setprecision(1)
+           << "{\"state\":\"" << st << "\""
+           << ",\"model\":\"" << json_escape(j.model) << "\""
+           << ",\"stage\":\"" << json_escape(j.stage) << "\""
+           << ",\"message\":\"" << json_escape(j.message) << "\""
+           << ",\"percent\":" << j.percent
+           << ",\"container\":\"" << json_escape(j.container) << "\""
+           << ",\"started_ms\":" << j.started_ms << "}";
+        send_http_response(client_socket, 200, "application/json", js.str(), false);
+        return;
+    }
+
+    if (req.path == "/api/download_cancel" && req.method == "POST") {
+        cancel_download();
+        send_http_response(client_socket, 200, "application/json", "{\"status\":\"cancelling\"}", false);
+        return;
+    }
+
+    // Reclaim the source checkpoint once a container has been built from it. It is only needed
+    // again to RE-convert, which a container format change would require -- so this is offered
+    // rather than done automatically.
+    if (req.path == "/api/delete_checkpoint" && req.method == "POST") {
+        std::string model;
+        try {
+            JsonValue root = JsonValue::parse(req.body);
+            model = root.at("model", "body").as_string("model");
+        } catch (const std::exception&) {
+            send_http_response(client_socket, 400, "application/json",
+                               "{\"error\":\"expected a model id\"}", false);
+            return;
+        }
+        std::string dir_name;
+        std::string container_name;
+        if (model == "e2b") { dir_name = "gemma-4-e2b-it-4bit"; container_name = "gemma-4-e2b-dense.g4dense"; }
+        else if (model == "31b") { dir_name = "gemma-4-31b-it-4bit"; container_name = "gemma-4-31b-dense.g4dense"; }
+        else {
+            send_http_response(client_socket, 400, "application/json",
+                               "{\"error\":\"unknown model id\"}", false);
+            return;
+        }
+        std::error_code ec;
+        const fs::path models_dir = fs::path(resolve_resource_path("models"));
+        // Refuse unless the container exists: deleting the source before the thing built from it
+        // exists would leave the user with neither.
+        if (!fs::exists(models_dir / container_name, ec)) {
+            send_http_response(client_socket, 409, "application/json",
+                               "{\"error\":\"no converted container for that model, so the "
+                               "checkpoint is still needed\"}", false);
+            return;
+        }
+        const uintmax_t removed = fs::remove_all(models_dir / dir_name, ec);
+        if (ec) {
+            send_http_response(client_socket, 500, "application/json",
+                               "{\"error\":\"" + json_escape(ec.message()) + "\"}", false);
+            return;
+        }
+        std::ostringstream js;
+        js << "{\"status\":\"ok\",\"removed_entries\":" << removed << "}";
+        send_http_response(client_socket, 200, "application/json", js.str(), false);
+        return;
+    }
+
     if (req.path == "/api/model_info" && req.method == "GET") {
         auto r = current_runner();
         std::ostringstream js;

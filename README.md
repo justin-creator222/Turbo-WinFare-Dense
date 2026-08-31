@@ -162,14 +162,36 @@ measuring one honestly means running the same prompt both ways and the server do
 | `GET /api/model_info` | geometry, and which layers stream |
 | `POST /api/load_model`, `/api/unload_model` | swap the container in place |
 | `POST /api/reset_kv`, `/api/clear_cache`, `/api/stop` | reset context, drop stream slots, cancel |
+| `GET /api/setup` | what is installed, and whether Python/`huggingface_hub` are available |
+| `POST /api/download_model` | start a download + conversion; `GET /api/download_status` polls it |
+| `POST /api/download_cancel`, `/api/delete_checkpoint` | stop a running job; reclaim a source checkpoint |
 
 ## Models
 
-Containers are `.g4dense` v3, built from MLX 4-bit HuggingFace checkpoints:
+**The easiest way is the web UI.** Start the server with `--gui` and, if no model is installed,
+a **Get Models** panel appears with each model's download size, total disk cost, and a button.
+It downloads from Hugging Face and converts locally — nothing is uploaded, and neither
+repository is gated, so no account or token is needed.
+
+| | download | on disk when done | roughly |
+|---|---:|---:|---|
+| Gemma 4 E2B | 3.4 GB | ~6 GB | start here — it is also the draft model |
+| Gemma 4 31B Dense | 18 GB | ~35 GB | the main model |
+
+Conversion leaves both the source checkpoint and the container on disk. The panel offers to
+reclaim the checkpoint afterwards; you would only need it again to re-convert.
+
+That feature runs the Python tools below as a child process, so it needs Python 3 with
+`huggingface_hub` installed. The UI says so plainly if either is missing. To do it by hand
+instead:
 
 ```powershell
 python tools/convert_hf_to_g4dense.py --input models\gemma-4-31b-it-4bit --out models\gemma-4-31b-dense.g4dense
 python tools/verify_weights.py models\gemma-4-31b-dense.g4dense
+
+# or download, convert and verify in one step -- this is exactly what the UI runs:
+python tools/fetch_model.py --model 31b
+python tools/fetch_model.py --check     # report what is installed
 ```
 
 [docs/G4DENSE_FORMAT.md](docs/G4DENSE_FORMAT.md) is the format spec. **A v2 container is rejected, not upgraded** — v3

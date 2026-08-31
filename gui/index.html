@@ -196,6 +196,34 @@
                             <button class="btn-danger" onclick="unloadModel()">🔴 Unload</button>
                         </div>
 
+                        <!-- First-run model provisioning.
+                             A new user has no .g4dense container and no way to get one without
+                             leaving for a command line. Hidden entirely once both models are
+                             installed and no job is running. -->
+                        <div class="setup-panel" id="setup-panel" hidden>
+                            <div class="sub-panel-header">
+                                <span>📥 Get Models</span>
+                                <span class="badge-mini" id="setup-disk">—</span>
+                            </div>
+                            <div class="control-hint" id="setup-intro">
+                                Checking what is installed…
+                            </div>
+
+                            <div id="setup-rows"></div>
+
+                            <div class="setup-job" id="setup-job" hidden>
+                                <div class="control-header">
+                                    <span id="job-title">Working…</span>
+                                    <span class="val" id="job-pct">0%</span>
+                                </div>
+                                <div class="res-bar" style="position:static;margin:6px 0;">
+                                    <div class="res-bar-fill" id="job-bar" style="width:0%;"></div>
+                                </div>
+                                <div class="control-hint" id="job-msg"></div>
+                                <button class="btn-danger" onclick="cancelDownload()">Cancel</button>
+                            </div>
+                        </div>
+
                         <!-- Active Model Checkpoint Details Card -->
                         <div class="metadata-card" id="model-meta-card">
                             <div class="meta-row">
