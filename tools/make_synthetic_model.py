@@ -1,5 +1,5 @@
 """
-Generates a deterministic synthetic tiny .g4dense v2 model for fast testing.
+Generates a deterministic synthetic tiny .g4dense v3 model for fast testing.
 4 layers, d_model 256, d_ff 512, 4/2 heads, vocab 1024.
 """
 
@@ -16,7 +16,7 @@ HEADER_SIZE = 4096
 ALIGNMENT = 4096
 
 MAGIC = 0x4734444E  # 'G4DN'
-VERSION = 2
+VERSION = 3  # 3: packed-weight blocks are 16-byte aligned within each layer
 QUANT_TYPE_AFFINE_INT4_G64 = 1
 
 
@@ -147,6 +147,10 @@ def make_synthetic_model(out_path: str, seed: int = 42):
 
         # Q, K, V, O, Gate, Up, Down
         for w in [w_q, w_k, w_v, w_o, w_gate, w_up, w_down]:
+            # 16-byte align each packed-weight block, matching convert_hf_to_g4dense.py and the
+            # runner's setup_proj. The gemv loads weights four words at a time.
+            while len(ldata) % 16 != 0:
+                ldata += b"\x00"
             p, s, b = quantize_affine_int4_g64(w, quant_group_size)
             ldata += p + s + b
 
@@ -250,7 +254,7 @@ def verify_synthetic_model(file_path: str):
         if declared_sha != calc_sha:
             raise RuntimeError(f"SHA-256 mismatch! declared={declared_sha.hex()}, calc={calc_sha.hex()}")
 
-    print(f"VERIFICATION SUCCESSFUL: {file_path} is structurally valid G4Dense v2 container.")
+    print(f"VERIFICATION SUCCESSFUL: {file_path} is structurally valid G4Dense v{VERSION} container.")
     return True
 
 

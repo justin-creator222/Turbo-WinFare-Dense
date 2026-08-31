@@ -28,7 +28,7 @@ void G4DenseManifest::validate() const {
     if (magic != "G4DN") {
         throw G4DenseFormatError("manifest.magic: expected 'G4DN', got '" + magic + "'");
     }
-    if (version != 2) {
+    if (version != 2 && version != 3) {
         throw G4DenseFormatError("manifest.version: unsupported version: " + std::to_string(version));
     }
     if (arch.num_layers <= 0 || arch.num_layers > (int)G4DenseHeader::MAX_LAYERS) {

@@ -299,6 +299,14 @@ void ForwardRunner::compute_layer_offsets() {
             p.rows = rows;
             p.in_dim = in_dim;
             uint32_t num_groups = in_dim / 64;
+            // 16-byte align every packed-weight block, and keep this in lockstep with the
+            // matching pad in tools/convert_hf_to_g4dense.py.
+            //
+            // The gemv reads weights with Load4. The norms are all multiples of 16 bytes but
+            // layer_scalar is 2, so without this pad every projection in the layer sits at
+            // offset 2 (mod 16) and every Load4 is misaligned. That produced garbage on the
+            // real model while the kernel parity test passed, because the test used offset 0.
+            cur = (cur + 15u) & ~15u;
             p.w_off = cur; cur += (rows * in_dim) / 2;
             p.s_off = cur; cur += rows * num_groups * 2;
             p.b_off = cur; cur += rows * num_groups * 2;

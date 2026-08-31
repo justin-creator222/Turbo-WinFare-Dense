@@ -365,6 +365,13 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
         const uint8_t* p = weights_start;
 
         auto parse_quant_block = [&](uint32_t rows, uint32_t cols, std::vector<float>& mat_out) {
+            // Skip the container's 16-byte alignment pad before each packed-weight block. This
+            // is the third place the layer layout is spelled out (with the runner's setup_proj
+            // and the converter); they must agree or the oracle silently grades against the
+            // wrong bytes -- which is exactly what happened when only the runner was updated.
+            const size_t pad = (16u - (static_cast<size_t>(p - layer_ptr) & 15u)) & 15u;
+            p += pad;
+
             uint32_t w_bytes = rows * (cols / 8) * sizeof(uint32_t);
             uint32_t s_bytes = rows * (cols / g_size) * sizeof(uint16_t);
             uint32_t b_bytes = rows * (cols / g_size) * sizeof(uint16_t);

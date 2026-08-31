@@ -25,12 +25,18 @@ enum class DType : uint8_t {
 #pragma pack(push, 1)
 struct G4DenseHeader {
     static constexpr uint32_t EXPECTED_MAGIC = 0x4734444E; // 'G4DN'
-    static constexpr uint32_t EXPECTED_VERSION = 2;
+    // 3: packed-weight blocks are 16-byte aligned within each layer (see runner's setup_proj).
+    //
+    // This one MUST be a version bump. Every previous field addition was backward compatible --
+    // zeroed fields read as "unspecified" -- but a layout change is not: a version-2 container
+    // read by this engine decodes at the wrong offsets and produces plausible-looking garbage
+    // rather than failing. Rejecting it outright is the only safe behaviour.
+    static constexpr uint32_t EXPECTED_VERSION = 3;
     static constexpr uint64_t ALIGNMENT_BYTES = 4096;
     static constexpr size_t MAX_LAYERS = 60;
 
     uint32_t magic;                 // 0x4734444E ('G4DN')
-    uint32_t version;               // 2
+    uint32_t version;               // EXPECTED_VERSION
     uint32_t quant_type;            // QuantType enum
     uint32_t num_layers;            // 60
     uint32_t d_model;               // 5376
@@ -67,15 +73,15 @@ struct G4DenseHeader {
     // Placed at the head of `reserved` rather than beside `head_dim` so that every offset in
     // this struct is unchanged: containers written before these existed have them zeroed, and
     // zero is read as "not specified" (see resolve_layer_geometry). The struct stays 4096
-    // bytes and the version stays 2.
+    // bytes and the version was not bumped for them.
     uint32_t global_head_dim;       // 512 on the 31B; 0 = unspecified (legacy container)
     uint32_t global_kv_heads;       // 4 on the 31B;   0 = unspecified (legacy container)
 
     // Per-layer embeddings (PLE) and KV sharing -- the E2B/E4B architecture.
     //
     // Zero on every model that does not use them, and the per-layer block layout is then
-    // byte-for-byte what it was, so existing containers stay valid and no version bump is
-    // needed. `ple_dim != 0` is the discriminator.
+    // byte-for-byte what it was, so those additions needed no version bump.
+    // `ple_dim != 0` is the discriminator.
     uint32_t ple_dim;               // hidden_size_per_layer_input (256 on E2B), 0 = no PLE
     uint32_t ple_vocab;             // vocab_size_per_layer_input
     uint32_t num_kv_shared_layers;  // trailing layers that reuse an earlier layer's K/V

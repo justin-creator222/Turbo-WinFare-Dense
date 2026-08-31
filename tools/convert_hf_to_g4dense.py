@@ -15,7 +15,7 @@ import numpy as np
 HEADER_SIZE = 4096
 ALIGNMENT = 4096
 MAGIC = 0x4734444E  # 'G4DN'
-VERSION = 2
+VERSION = 3  # 3: packed-weight blocks are 16-byte aligned within each layer
 
 
 def pad_to_alignment(data: bytes, alignment: int = ALIGNMENT) -> bytes:
@@ -231,6 +231,11 @@ def convert_checkpoint(input_dir: str, output_file: str, verify: bool = True):
         for p, opt in proj_names:
             if opt and not has_tensor(prefix + p + ".weight"):
                 continue
+            # 16-byte align each packed-weight block; the reader's setup_proj does the same.
+            # The gemv loads weights four words at a time, and layer_scalar is 2 bytes, so
+            # without this every projection would land at offset 2 (mod 16).
+            while len(l_bytes) % 16 != 0:
+                l_bytes += b"\x00"
             l_bytes += read_tensor_bytes(prefix + p + ".weight")
             l_bytes += read_tensor_bytes(prefix + p + ".scales")
             l_bytes += read_tensor_bytes(prefix + p + ".biases")

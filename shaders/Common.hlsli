@@ -102,6 +102,16 @@ float f32_load(RWByteAddressBuffer buf, uint byte_off) {
     return asfloat(buf.Load(byte_off));
 }
 
+// Four consecutive 32-bit words in one instruction. `byte_off` must be 16-byte aligned.
+//
+// The gemv's WEIGHT reads were eight separate 4-byte loads per quantization group -- 256
+// requests per wave for 1024 contiguous bytes. That is the one access pattern in the kernel
+// that does not match what the streaming-bandwidth probe does, and the probe reaches 65-74 GB/s
+// where the kernel reached ~33.
+uint4 u32x4_load(ByteAddressBuffer buf, uint byte_off) {
+    return buf.Load4(byte_off);
+}
+
 // Four consecutive FP32s in one instruction. `byte_off` must be 16-byte aligned.
 //
 // The gemv inner loop is dominated by ACTIVATION loads, not weight loads: every output row
@@ -145,8 +155,13 @@ float gemv_int4_row_lane(ByteAddressBuffer W, uint w_base,
         const uint g_w_base = row_w_base + g * 32u;
         const uint g_x_base = x_base     + g * (GROUP_SIZE * 4u);
 
-        for (uint word_idx = 0; word_idx < 8u; ++word_idx) {
-            const uint packed = u32_load(W, g_w_base + word_idx * 4u);
+        // g_w_base is a multiple of 32, so both halves are 16-byte aligned.
+        const uint4 wa = u32x4_load(W, g_w_base + 0u);
+        const uint4 wb = u32x4_load(W, g_w_base + 16u);
+        const uint packed_words[8] = { wa.x, wa.y, wa.z, wa.w, wb.x, wb.y, wb.z, wb.w };
+
+        [unroll] for (uint word_idx = 0; word_idx < 8u; ++word_idx) {
+            const uint packed = packed_words[word_idx];
             const uint x_off  = g_x_base + word_idx * 32u;
 
             // x_off is a multiple of 32, so both halves are 16-byte aligned.

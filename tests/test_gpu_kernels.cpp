@@ -290,19 +290,28 @@ int main() {
             cpu_out[r] = sum;
         }
 
-        VkMemoryAllocation buf_w = ctx.allocate_buffer(packed_w.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+        // Non-zero, 16-BYTE-ALIGNED byte offsets.
+        //
+        // This test used to pass 0 for all three, which meant it never exercised the offset
+        // arithmetic the real model uses -- and so it passed while the engine produced garbage
+        // after the weight loads were vectorised, because the container placed weights at
+        // offset 2 (mod 16) and Load4 was misaligned. The container now aligns those blocks;
+        // this asserts the kernel works at a non-zero offset, and W_PAD is deliberately not a
+        // multiple of the row stride.
+        constexpr uint32_t W_PAD = 16 * 7;
+        VkMemoryAllocation buf_w = ctx.allocate_buffer(packed_w.size() * 4 + W_PAD, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
         VkMemoryAllocation buf_s = ctx.allocate_buffer(scales.size() * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
         VkMemoryAllocation buf_b = ctx.allocate_buffer(biases.size() * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
         VkMemoryAllocation buf_x = ctx.allocate_buffer(in_x.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
         VkMemoryAllocation buf_out = ctx.allocate_buffer(ROWS * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
 
-        std::memcpy(buf_w.mapped_ptr, packed_w.data(), packed_w.size() * 4);
+        std::memcpy(static_cast<uint8_t*>(buf_w.mapped_ptr) + W_PAD, packed_w.data(), packed_w.size() * 4);
         std::memcpy(buf_s.mapped_ptr, scales.data(), scales.size() * 2);
         std::memcpy(buf_b.mapped_ptr, biases.data(), biases.size() * 2);
         std::memcpy(buf_x.mapped_ptr, in_x.data(), in_x.size() * 4);
 
         VkDescriptorSet ds = pm.allocate_descriptor_set(ComputeKernel::GemvInt4);
-        pm.update_storage_buffer(ds, 0, buf_w.buffer, 0, packed_w.size() * 4);
+        pm.update_storage_buffer(ds, 0, buf_w.buffer, 0, packed_w.size() * 4 + W_PAD);
         pm.update_storage_buffer(ds, 1, buf_s.buffer, 0, scales.size() * 2);
         pm.update_storage_buffer(ds, 2, buf_b.buffer, 0, biases.size() * 2);
         pm.update_storage_buffer(ds, 3, buf_x.buffer, 0, in_x.size() * 4);
@@ -311,7 +320,7 @@ int main() {
         uint32_t pc[8]{0};
         pc[0] = ROWS; // gp0.x = rows
         pc[1] = COLS; // gp0.y = in_dim
-        pc[2] = 0;    // gp0.z = w_byte_off
+        pc[2] = W_PAD; // gp0.z = w_byte_off
         pc[3] = 0;    // gp0.w = s_byte_off
         pc[4] = 0;    // gp1.x = b_byte_off
         pc[5] = 0;    // gp1.y = x_byte_off
