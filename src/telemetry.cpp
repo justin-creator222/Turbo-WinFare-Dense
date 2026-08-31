@@ -34,6 +34,12 @@ std::string TelemetrySnapshot::to_json_string() const {
     ss << "  \"speculative_drafted\": " << speculative_drafted << ",\n";
     ss << "  \"speculative_accepted\": " << speculative_accepted << ",\n";
     ss << "  \"total_tokens_generated\": " << total_tokens_generated << ",\n";
+    ss << "  \"ram_available_mb\": " << ram_available_mb << ",\n";
+    ss << "  \"kv_cache_mb\": " << kv_cache_mb << ",\n";
+    ss << "  \"lm_head_mb\": " << lm_head_mb << ",\n";
+    ss << "  \"layer_mb\": " << layer_mb << ",\n";
+    ss << "  \"total_layers\": " << total_layers << ",\n";
+    ss << "  \"stream_slots\": " << stream_slots << ",\n";
     ss << "  \"breakdown\": {\n";
     ss << "    \"stream_io_ms\": " << stream_io_ms << ",\n";
     ss << "    \"gpu_wait_ms\": " << gpu_wait_ms << ",\n";
@@ -92,6 +98,17 @@ void TelemetryCollector::record_model_state(uint32_t resident_layers, uint32_t s
     g_snapshot.draft_k = draft_k;
 }
 
+void TelemetryCollector::record_model_geometry(uint32_t total_layers, double layer_mb,
+                                              double lm_head_mb, double kv_cache_mb,
+                                              uint32_t stream_slots) {
+    std::lock_guard<std::mutex> lock(g_telemetry_mutex);
+    g_snapshot.total_layers = total_layers;
+    g_snapshot.layer_mb = layer_mb;
+    g_snapshot.lm_head_mb = lm_head_mb;
+    g_snapshot.kv_cache_mb = kv_cache_mb;
+    g_snapshot.stream_slots = stream_slots;
+}
+
 void TelemetryCollector::record_draft_k(uint32_t draft_k) {
     std::lock_guard<std::mutex> lock(g_telemetry_mutex);
     g_snapshot.draft_k = draft_k;
@@ -139,6 +156,7 @@ TelemetrySnapshot TelemetryCollector::snapshot() const {
     mem_status.dwLength = sizeof(mem_status);
     if (GlobalMemoryStatusEx(&mem_status)) {
         s.ram_total_mb = static_cast<double>(mem_status.ullTotalPhys) / (1024.0 * 1024.0);
+        s.ram_available_mb = static_cast<double>(mem_status.ullAvailPhys) / (1024.0 * 1024.0);
     }
 
     return s;

@@ -242,10 +242,19 @@
                             </div>
                             <div class="control-item">
                                 <div class="control-header">
-                                    <span>Draft Candidate Tokens (K)</span>
-                                    <span class="val" id="val-draft-k">6</span>
+                                    <span>Speculative Decoding</span>
+                                    <span class="val"><input type="checkbox" id="cfg-spec-on" checked onchange="updateConfig()"></span>
                                 </div>
-                                <input type="range" id="cfg-draft-k" min="1" max="10" value="6" oninput="updateDraftK()" onchange="updateConfig()">
+                                <div class="control-hint" id="spec-hint">Draft model proposes K-1 tokens; the target verifies them in one pass.</div>
+                            </div>
+                            <div class="control-item">
+                                <div class="control-header">
+                                    <span>Draft Candidate Tokens (K)</span>
+                                    <span class="val" id="val-draft-k">8</span>
+                                </div>
+                                <!-- Max is the verify batch width (kGemmMaxBatch = 8). The slider
+                                     used to offer 10, which the engine silently clamped. -->
+                                <input type="range" id="cfg-draft-k" min="1" max="8" value="8" oninput="updateDraftK()" onchange="updateConfig()">
                             </div>
                             <div class="spec-stats-row">
                                 <div class="spec-stat-item">
@@ -358,8 +367,10 @@
                                 <option value="1536">1536 Tokens</option>
                                 <option value="2048">2048 Tokens</option>
                                 <option value="3072">3072 Tokens</option>
-                                <option value="4096" selected>4096 Tokens (Max Groupshared)</option>
+                                <option value="4096" selected>4096 Tokens</option>
+                                <option value="8192">8192 Tokens (+336 MB KV)</option>
                             </select>
+                            <div class="control-hint" id="cfg-reload-note"></div>
                         </div>
 
                         <div class="btn-row">

@@ -15,9 +15,20 @@ struct ServerConfig {
     float temperature{0.2f};
     float top_p{0.95f};
     int top_k{64};
+    // The GUI has had sliders for these two since it was written, and posted them to
+    // /api/config, which silently ignored both -- a control that parses and does
+    // nothing, which this project's own contributing rules forbid.
+    float repetition_penalty{1.0f};
+    uint32_t draft_k{8};
+    bool speculative_enabled{true};
+    // 0 = no fixed seed. Exposed so a run can be reproduced from the UI.
+    bool has_seed{false};
+    uint64_t seed{0};
     int max_tokens{512};
     uint32_t active_tier_id{1};
-    int context_len{8192};
+    // The engine's default, not an aspiration. This said 8192 while the runner initialised
+    // 4096, so /api/config reported a context the model was not running.
+    int context_len{4096};
 };
 
 class HTTPServer {

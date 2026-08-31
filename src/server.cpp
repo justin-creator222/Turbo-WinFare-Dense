@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 
 #pragma comment(lib, "ws2_32.lib")
 namespace fs = std::filesystem;
@@ -90,6 +91,15 @@ bool HTTPServer::swap_runner(const std::string& container_path, bool load, std::
         tok->load_vocabulary();
 
         auto next = std::make_shared<ForwardRunner>(ctx, tok, resolved);
+        // The KV cache is sized inside initialize(), so a context change can only take effect
+        // here. Without this the config endpoint answered requires_reload: true and then the
+        // reload quietly ignored the new value.
+        {
+            std::lock_guard<std::mutex> guard(config_mutex_);
+            if (config_.context_len > 0) {
+                next->set_max_context(static_cast<uint32_t>(config_.context_len));
+            }
+        }
         next->initialize();
 
         {
@@ -203,6 +213,85 @@ void HTTPServer::handle_client(uintptr_t client_socket) {
     }
 
     // API Switch Tier
+    // Three endpoints the GUI has always called and the server never implemented, so the
+    // model metadata panel and the tier matrix rendered defaults and the "Reset KV Cache"
+    // button reported success while doing nothing.
+    if (req.path == "/api/model_info" && req.method == "GET") {
+        auto r = current_runner();
+        std::ostringstream js;
+        if (!r) {
+            js << "{\"loaded\":false}";
+        } else {
+            const auto& h = r->header();
+            js << std::fixed << std::setprecision(2);
+            js << "{\"loaded\":true"
+               << ",\"name\":\"" << std::filesystem::path(r->container_path()).stem().string() << "\""
+               << ",\"num_layers\":" << h.num_layers
+               << ",\"d_model\":" << h.d_model
+               << ",\"d_ff\":" << h.d_ff
+               << ",\"num_q_heads\":" << h.num_q_heads
+               << ",\"num_kv_heads\":" << h.num_kv_heads
+               << ",\"head_dim\":" << h.head_dim
+               << ",\"global_head_dim\":" << h.global_head_dim
+               << ",\"global_kv_heads\":" << h.global_kv_heads
+               << ",\"vocab_size\":" << h.vocab_size
+               << ",\"sliding_window\":" << h.sliding_window
+               << ",\"softcapping\":" << h.final_logit_softcapping
+               << ",\"lm_head_size_mb\":" << (static_cast<double>(h.lm_head_size) / (1024.0 * 1024.0))
+               << ",\"quant_type\":\"MLX INT4 (Group " << h.quant_group_size << ")\""
+               << ",\"scale_dtype\":\"BF16\""
+               << ",\"device_name\":\"" << r->device_name() << "\"";
+
+            // WHICH layers stream, not just how many. They are evenly spaced across the stack,
+            // so a layer map that shaded the first N cells was drawing the wrong ones.
+            js << ",\"streamed_layers\":[";
+            const auto& streamed = r->streamed_layers();
+            for (size_t i = 0; i < streamed.size(); ++i) {
+                js << (i ? "," : "") << streamed[i];
+            }
+            js << "]";
+
+            js << ",\"global_layers\":[";
+            bool first_g = true;
+            for (uint32_t l = 0; l < h.num_layers; ++l) {
+                if ((h.global_layer_mask >> l) & 1ull) {
+                    js << (first_g ? "" : ",") << l;
+                    first_g = false;
+                }
+            }
+            js << "]}";
+        }
+        send_http_response(client_socket, 200, "application/json", js.str(), false);
+        return;
+    }
+
+    if (req.path == "/api/reset_kv" && req.method == "POST") {
+        auto r = current_runner();
+        if (r) r->reset_kv_cache();
+        send_http_response(client_socket, 200, "application/json",
+                           std::string("{\"status\":\"") + (r ? "ok" : "no model") + "\"}", false);
+        return;
+    }
+
+    if (req.path == "/api/tiers" && req.method == "GET") {
+        // Served from config/tiers.json so the UI cannot drift from the planning artifact.
+        // If it is missing, say so rather than inventing a table.
+        std::string body = "{\"tiers\":[]}";
+        try {
+            const std::string tiers_path = resolve_resource_path("config/tiers.json");
+            std::ifstream tf(tiers_path, std::ios::binary);
+            if (tf) {
+                std::ostringstream buf;
+                buf << tf.rdbuf();
+                body = buf.str();
+            }
+        } catch (const std::exception&) {
+            // fall through to the empty table
+        }
+        send_http_response(client_socket, 200, "application/json", body, false);
+        return;
+    }
+
     if (req.path == "/api/switch_tier" && req.method == "POST") {
         try {
             JsonValue root = JsonValue::parse(req.body);
@@ -235,13 +324,25 @@ void HTTPServer::handle_client(uintptr_t client_socket) {
                << "\"temperature\":" << config_.temperature
                << ",\"top_p\":" << config_.top_p
                << ",\"top_k\":" << config_.top_k
+               << ",\"repetition_penalty\":" << config_.repetition_penalty
+               << ",\"draft_k\":" << config_.draft_k
+               << ",\"speculative_enabled\":" << (config_.speculative_enabled ? "true" : "false")
+               << ",\"has_draft\":" << ((r && r->has_draft_model()) ? "true" : "false")
+               << ",\"draft_k_max\":" << kGemmMaxBatch
+               << ",\"seed\":" << config_.seed
+               << ",\"has_seed\":" << (config_.has_seed ? "true" : "false")
                << ",\"max_tokens\":" << config_.max_tokens
                << ",\"slots\":" << (r ? 4 : 0)
                << ",\"eviction_policy\":\"LRU\""
-               << ",\"context_len\":" << config_.context_len
-               // Bounded by ATTN_MAX_SPAN: full-attention layers stage their whole score span
-               // in groupshared, so the GUI must not offer a context the kernel cannot serve.
-               << ",\"context_max\":" << ForwardRunner::kDefaultMaxContext
+               // What the model is ACTUALLY running, when one is loaded. The configured value
+               // only takes effect at the next load.
+               << ",\"context_len\":" << (r ? r->max_context() : static_cast<uint32_t>(config_.context_len))
+               << ",\"context_len_pending\":" << config_.context_len
+               // No longer a kernel limit. Attention is an online softmax and nothing in it
+               // scales with the attended span; what a larger context costs is KV cache, about
+               // 336 MB more at 8192, or roughly one resident layer. So the GUI may offer it,
+               // and it takes effect on reload.
+               << ",\"context_max\":" << 8192u
                << ",\"tier\":" << (r ? r->active_tier_id() : config_.active_tier_id)
                << "}}";
             send_http_response(client_socket, 200, "application/json", js.str(), false);
@@ -256,6 +357,19 @@ void HTTPServer::handle_client(uintptr_t client_socket) {
                     if (root.has("temperature")) config_.temperature = static_cast<float>(root.at("temperature", "body").as_double("temperature"));
                     if (root.has("top_p"))       config_.top_p = static_cast<float>(root.at("top_p", "body").as_double("top_p"));
                     if (root.has("top_k"))       config_.top_k = static_cast<int>(root.at("top_k", "body").as_uint32("top_k"));
+                    if (root.has("repetition_penalty")) config_.repetition_penalty = static_cast<float>(root.at("repetition_penalty", "body").as_double("repetition_penalty"));
+                    if (root.has("draft_k")) {
+                        // Clamped, not rejected: the verify batch is draft_k wide, so a larger
+                        // value would silently be truncated by the kernel anyway.
+                        uint32_t k = root.at("draft_k", "body").as_uint32("draft_k");
+                        config_.draft_k = k < 1u ? 1u : (k > kGemmMaxBatch ? kGemmMaxBatch : k);
+                    }
+                    if (root.has("speculative_enabled")) config_.speculative_enabled = root.at("speculative_enabled", "body").as_bool("speculative_enabled");
+                    if (root.has("seed")) {
+                        uint64_t sd = root.at("seed", "body").as_uint64("seed");
+                        config_.seed = sd;
+                        config_.has_seed = (sd != 0);
+                    }
                     if (root.has("max_tokens"))  config_.max_tokens = static_cast<int>(root.at("max_tokens", "body").as_uint32("max_tokens"));
                     // Slots and context are fixed at initialize(); saying so is what stops the
                     // GUI from appearing to apply a change that did nothing.
@@ -430,6 +544,18 @@ void HTTPServer::handle_chat_completion(uintptr_t client, const HttpRequest& req
     GenerationOptions gen_opts;
     gen_opts.max_tokens = chat_req.max_tokens;
     gen_opts.sampling = chat_req.sampling;
+    // Server-side settings the OpenAI request body has no field for. A per-request value wins
+    // where one was supplied; otherwise the configured value applies -- which is what makes the
+    // GUI's sliders take effect at all.
+    if (chat_req.sampling.repetition_penalty == 1.0f) {
+        gen_opts.sampling.repetition_penalty = config_.repetition_penalty;
+    }
+    if (!gen_opts.sampling.has_seed && config_.has_seed) {
+        gen_opts.sampling.has_seed = true;
+        gen_opts.sampling.seed = config_.seed;
+    }
+    gen_opts.draft_k = config_.draft_k;
+    gen_opts.speculative_enabled = config_.speculative_enabled;
 
     // Render the parsed conversation through the Gemma 4 turn template.
     //

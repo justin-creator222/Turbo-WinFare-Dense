@@ -16,7 +16,8 @@ let selectedLayerIndex = 0;
 
 // Gemma 4 31B Dense Architecture Constants
 const TOTAL_LAYERS = 60;
-const GLOBAL_LAYERS = [5, 11, 17, 23, 29, 35, 41, 47, 53, 59];
+// Overwritten from /api/model_info's global_layer_mask once a model is loaded.
+let GLOBAL_LAYERS = [5, 11, 17, 23, 29, 35, 41, 47, 53, 59];
 const LAYER_SIZE_MB = 269.45;
 const LM_HEAD_SIZE_MB = 755.99;
 
@@ -58,7 +59,16 @@ function fetchModelInfo() {
         .then(data => {
             if (data && data.loaded) {
                 modelInfo = data;
+                if (Array.isArray(data.streamed_layers)) {
+                    streamedLayerSet = new Set(data.streamed_layers);
+                }
+                if (Array.isArray(data.global_layers) && data.global_layers.length) {
+                    GLOBAL_LAYERS = data.global_layers;
+                }
                 renderModelMetadata(data);
+                const resident = TOTAL_LAYERS - streamedLayerSet.size;
+                update60LayerState(resident);
+                updateLayerSummaryText(resident);
             }
         })
         .catch(err => console.warn('model_info fetch failed:', err));
@@ -110,12 +120,16 @@ function renderModelMetadata(info) {
 // 60-Layer Architecture & Streaming Map
 // ============================================================================
 
-function getPinnedLayerCount(tierId) {
-    if (tierId === 1) return 6;
-    if (tierId === 2) return 21;
-    if (tierId === 3) return 48;
-    if (tierId === 4) return 60;
-    return 6;
+// Which layers actually stream, as reported by /api/model_info. Empty until it answers.
+//
+// This replaces getPinnedLayerCount(tier), which returned 6/21/48/60 from the tier table --
+// numbers that described a planning model, not the engine. Residency is decided at load time
+// by what the driver accepts, is the same for every tier, and the streamed layers are spread
+// evenly across the stack rather than taken from either end.
+let streamedLayerSet = new Set();
+
+function isLayerResident(i) {
+    return !streamedLayerSet.has(i);
 }
 
 function init60LayerGrid() {
@@ -123,7 +137,7 @@ function init60LayerGrid() {
     const modalGrid = document.getElementById('layer-modal-grid');
     if (!miniGrid && !modalGrid) return;
 
-    const pinnedCount = getPinnedLayerCount(currentTier);
+    const pinnedCount = TOTAL_LAYERS - streamedLayerSet.size;
 
     if (miniGrid) {
         miniGrid.innerHTML = '';
@@ -173,7 +187,10 @@ function updateLayerSummaryText(pinnedCount) {
 
 function update60LayerState(pinnedCount, activeLayerIdx = -1) {
     for (let i = 0; i < TOTAL_LAYERS; i++) {
-        const isPinned = i < pinnedCount;
+        // Was `i < pinnedCount`, which shades a contiguous block at the start of the stack.
+        // The engine spreads the streamed layers evenly, so that drew the wrong cells even
+        // when the count was right.
+        const isPinned = isLayerResident(i);
         const isGlobal = GLOBAL_LAYERS.includes(i);
         const isActive = (i === activeLayerIdx);
 
@@ -192,7 +209,7 @@ function update60LayerState(pinnedCount, activeLayerIdx = -1) {
 function showLayerDetails(idx) {
     selectedLayerIndex = idx;
     const isGlobal = GLOBAL_LAYERS.includes(idx);
-    const pinnedCount = getPinnedLayerCount(currentTier);
+    const pinnedCount = TOTAL_LAYERS - streamedLayerSet.size;
     const isPinned = idx < pinnedCount;
 
     const badge = document.getElementById('ld-badge');
@@ -209,7 +226,7 @@ function showLayerDetails(idx) {
     if (badge) badge.innerText = `Transformer Layer ${idx} / 59`;
     if (title) title.innerText = isGlobal ? `Global Full Attention Layer (Layer ${idx})` : `Sliding Window Attention Layer (Layer ${idx})`;
     if (span) span.innerText = isGlobal ? `4,096 Tokens (Full Context Scope)` : `1,024 Tokens (Sliding Window)`;
-    
+
     if (residency) {
         residency.innerText = isPinned ? `Heap 0 Device-Local (Permanent VRAM)` : `Heap 1 Host-Visible (4-Slot Ring DMA)`;
         residency.style.color = isPinned ? `var(--accent-green)` : `var(--accent-amber)`;
@@ -252,7 +269,7 @@ function selectTier(tierId) {
     })
     .then(r => r.json())
     .then(data => {
-        const pinnedCount = getPinnedLayerCount(tierId);
+        const pinnedCount = TOTAL_LAYERS - streamedLayerSet.size;
         update60LayerState(pinnedCount);
         updateLayerSummaryText(pinnedCount);
         renderTierMatrix();
@@ -328,6 +345,11 @@ function fetchTelemetry() {
         .catch(err => console.warn('Telemetry poll error:', err));
 }
 
+// Telemetry values are numbers or absent; absent must not become a plausible-looking default.
+function num(v, fallback) {
+    return (typeof v === 'number' && isFinite(v)) ? v : fallback;
+}
+
 function updateHUD(t) {
     const hudGpu = document.getElementById('hud-gpu');
     const hudRam = document.getElementById('hud-ram-usage');
@@ -339,28 +361,39 @@ function updateHUD(t) {
     const hudStatus = document.getElementById('hud-status');
 
     if (hudGpu && t.gpu_name) hudGpu.innerText = t.gpu_name;
-    
-    // UMA memory usage
-    const procMb = t.process_working_set_mb || (t.heap0_usage_mb + t.heap1_usage_mb) || 0;
-    const sysTotalMb = t.system_total_ram_mb || 24576;
-    if (hudRam) hudRam.innerText = `${(procMb / 1024).toFixed(2)} GB`;
-    if (hudRamSub) hudRamSub.innerText = `/ ${(sysTotalMb / 1024).toFixed(1)} GB UMA`;
+
+    // UMA memory usage.
+    //
+    // These read process_working_set_mb and system_total_ram_mb, which the server has never
+    // emitted -- so the first silently fell back to the sum of the two GPU heaps, and the
+    // second to a hardcoded 24576 MB from a BIOS setting this machine no longer uses.
+    const procMb = num(t.ram_footprint_mb, num(t.heap0_usage_mb, 0) + num(t.heap1_usage_mb, 0));
+    const sysTotalMb = num(t.ram_total_mb, 0);
+    if (hudRam) hudRam.innerText = procMb > 0 ? `${(procMb / 1024).toFixed(2)} GB` : '—';
+    if (hudRamSub) hudRamSub.innerText = sysTotalMb > 0 ? `/ ${(sysTotalMb / 1024).toFixed(1)} GB system` : '';
     if (hudRamFill) {
-        const pct = Math.min(100, Math.max(5, (procMb / sysTotalMb) * 100));
+        const pct = sysTotalMb > 0 ? Math.min(100, Math.max(2, (procMb / sysTotalMb) * 100)) : 0;
         hudRamFill.style.width = `${pct}%`;
     }
 
     // Inference TPS
     if (hudToks) {
-        hudToks.innerText = t.inference_tps > 0 ? `${t.inference_tps.toFixed(1)} TPS` : '—';
+        // The server emits this as `tps`. Reading `inference_tps` meant the headline
+        // throughput readout was blank in every build that has ever shipped.
+        const tps = num(t.tps, 0);
+        hudToks.innerText = tps > 0 ? `${tps.toFixed(2)} tok/s` : '—';
     }
 
     // Speculative Acceptance
     if (hudSpec) {
-        if (t.has_draft && t.speculative_acceptance_rate > 0) {
-            const alphaPct = (t.speculative_acceptance_rate * 100).toFixed(1);
-            const speedup = t.speculative_speedup > 1.0 ? `${t.speculative_speedup.toFixed(2)}x` : '';
-            hudSpec.innerText = `${alphaPct}% ${speedup}`;
+        if (t.has_draft && num(t.speculative_acceptance_rate, 0) > 0) {
+            // Already a percentage on the wire (telemetry.cpp multiplies by 100). Multiplying
+            // again displayed 46.7% as "4670.0%".
+            const alphaPct = num(t.speculative_acceptance_rate, 0).toFixed(1);
+            const drafted = num(t.speculative_drafted, 0);
+            hudSpec.innerText = drafted > 0
+                ? `${alphaPct}% (${num(t.speculative_accepted, 0)}/${drafted})`
+                : `${alphaPct}%`;
         } else {
             hudSpec.innerText = t.has_draft ? '0.0%' : 'N/A';
         }
@@ -393,12 +426,18 @@ function updateHUD(t) {
 }
 
 function updateMemoryProfiler(t) {
-    const pinnedCount = t.pinned_layers !== undefined ? t.pinned_layers : getPinnedLayerCount(currentTier);
-    const pinnedMb = pinnedCount * LAYER_SIZE_MB;
-    const lmHeadMb = LM_HEAD_SIZE_MB;
-    const kvMb = t.kv_cache_allocated_mb || (t.context_tokens ? t.context_tokens * 0.45 : 128);
-    const ringMb = (TOTAL_LAYERS - pinnedCount > 0) ? (4 * LAYER_SIZE_MB) : 0;
-    const actMb = 180; // Activation scratchpad
+    // Geometry comes from the server now. These were constants in this file (269.45 MB per
+    // layer, 755.99 MB of LM head, a 0.45 MB-per-token KV estimate) that had drifted from the
+    // container they claimed to describe.
+    const pinnedCount = t.pinned_layers !== undefined ? t.pinned_layers : 0;
+    const totalLayers = num(t.total_layers, TOTAL_LAYERS);
+    const layerMb = num(t.layer_mb, LAYER_SIZE_MB);
+    const pinnedMb = pinnedCount * layerMb;
+    const lmHeadMb = num(t.lm_head_mb, LM_HEAD_SIZE_MB);
+    const kvMb = num(t.kv_cache_mb, 0);
+    const slots = num(t.stream_slots, 0);
+    const ringMb = (totalLayers - pinnedCount > 0) ? (slots * layerMb) : 0;
+    const actMb = 180; // Activation scratchpad -- still an estimate, and small.
 
     const totalAllocMb = pinnedMb + lmHeadMb + kvMb + ringMb + actMb;
 
@@ -423,49 +462,62 @@ function updateMemoryProfiler(t) {
     setTxt('ram-total-badge', `${(totalAllocMb / 1024).toFixed(2)} GB Allocated`);
 
     // Grid metrics
-    const heap0Mb = t.heap0_usage_mb || (pinnedMb + lmHeadMb + actMb);
-    const heap1Mb = t.heap1_usage_mb || (ringMb + kvMb);
-    setTxt('ram-val-heap0', `${(heap0Mb / 1024).toFixed(2)} GB (Pool @ 73.6 GB/s)`);
-    setTxt('ram-val-heap1', `${(heap1Mb / 1024).toFixed(2)} GB (Host @ 65.3 GB/s)`);
-    setTxt('ram-val-kv', `${t.context_tokens || 0} / ${t.max_context || 4096} Tokens`);
-    setTxt('ram-val-process', `${((t.process_working_set_mb || totalAllocMb) / 1024).toFixed(2)} GB`);
-    setTxt('ram-val-sysavail', t.system_avail_ram_mb ? `${(t.system_avail_ram_mb / 1024).toFixed(2)} GB` : '—');
-    setTxt('ram-val-io', t.nvme_read_throughput_gbps > 0 ? `${t.nvme_read_throughput_gbps.toFixed(2)} GB/s` : (t.io_read_time_ms ? `${t.io_read_time_ms.toFixed(1)} ms` : '—'));
+    // Heap budgets are published, so the bandwidth figures no longer need to be literals --
+    // they were "73.6 / 65.3 GB/s", measured under a BIOS UMA setting this machine has not used
+    // since, and attached to the wrong heap besides.
+    const heap0Mb = num(t.heap0_usage_mb, 0);
+    const heap1Mb = num(t.heap1_usage_mb, 0);
+    const gb = (mb) => `${(mb / 1024).toFixed(2)} GB`;
+    setTxt('ram-val-heap0', `${gb(heap0Mb)} / ${gb(num(t.heap0_budget_mb, 0))}`);
+    setTxt('ram-val-heap1', `${gb(heap1Mb)} / ${gb(num(t.heap1_budget_mb, 0))}`);
+    setTxt('ram-val-kv', `${num(t.context_tokens, 0)} / ${num(t.max_context, 0)} tokens`);
+    setTxt('ram-val-process', gb(num(t.ram_footprint_mb, totalAllocMb)));
+    setTxt('ram-val-sysavail', num(t.ram_available_mb, 0) > 0 ? gb(t.ram_available_mb) : '—');
+    const ioMs = num((t.breakdown || {}).stream_io_ms, 0);
+    setTxt('ram-val-io', ioMs > 0 ? `${ioMs.toFixed(1)} ms / token` : '—');
 
     // Sync layer map
     update60LayerState(pinnedCount);
 }
 
 function updatePhaseProfiler(t) {
-    const ioMs = t.io_read_time_ms || 12.4;
-    const gpuMs = t.gpu_forward_time_ms || 38.2;
-    const draftMs = t.draft_forward_time_ms || (t.has_draft ? 8.5 : 0);
-    const verifyMs = t.verify_time_ms || (t.has_draft ? 6.2 : 0);
-    const lmMs = t.lm_head_time_ms || 4.1;
+    // The breakdown is a NESTED object on the wire, and none of the names this function used
+    // ever existed. Every value therefore fell through to a hardcoded literal -- 12.4 / 38.2 /
+    // 8.5 / 6.2 / 4.1 ms -- so this panel has been displaying invented performance data that
+    // looked entirely plausible. Fabricating a plausible substitute for missing telemetry is
+    // the one thing CONTRIBUTING.md says never to do.
+    const b = t.breakdown || {};
+    const ioMs = num(b.stream_io_ms, 0);
+    const gpuMs = num(b.gpu_wait_ms, 0);
+    const draftMs = num(b.draft_ms, 0);
+    const verifyMs = num(b.verify_ms, 0);
+    const lmMs = num(b.lm_head_ms, 0);
 
     const totalMs = ioMs + gpuMs + draftMs + verifyMs + lmMs;
+    const havePhases = totalMs > 0;
 
     const setWidth = (id, pct) => {
         const el = document.getElementById(id);
         if (el) el.style.width = `${Math.max(1, Math.min(100, pct))}%`;
     };
 
-    setWidth('phase-seg-io', (ioMs / totalMs) * 100);
-    setWidth('phase-seg-gpu', (gpuMs / totalMs) * 100);
-    setWidth('phase-seg-draft', (draftMs / totalMs) * 100);
-    setWidth('phase-seg-verify', (verifyMs / totalMs) * 100);
-    setWidth('phase-seg-lm', (lmMs / totalMs) * 100);
+    const pct = (v) => havePhases ? (v / totalMs) * 100 : 0;
+    setWidth('phase-seg-io', pct(ioMs));
+    setWidth('phase-seg-gpu', pct(gpuMs));
+    setWidth('phase-seg-draft', pct(draftMs));
+    setWidth('phase-seg-verify', pct(verifyMs));
+    setWidth('phase-seg-lm', pct(lmMs));
 
     const setTxt = (id, txt) => { const el = document.getElementById(id); if (el) el.innerText = txt; };
-    setTxt('phase-val-io', `${ioMs.toFixed(1)} ms`);
-    setTxt('phase-val-gpu', `${gpuMs.toFixed(1)} ms`);
-    setTxt('phase-val-draft', draftMs > 0 ? `${draftMs.toFixed(1)} ms` : '—');
-    setTxt('phase-val-verify', verifyMs > 0 ? `${verifyMs.toFixed(1)} ms` : '—');
-    setTxt('phase-val-lm', `${lmMs.toFixed(1)} ms`);
-    
-    if (t.time_to_first_token_ms > 0) {
-        setTxt('ttft-badge', `TTFT: ${t.time_to_first_token_ms.toFixed(0)} ms`);
-    }
+    const ms = (v) => v > 0 ? `${v.toFixed(1)} ms` : '—';
+    setTxt('phase-val-io', ms(ioMs));
+    setTxt('phase-val-gpu', ms(gpuMs));
+    setTxt('phase-val-draft', ms(draftMs));
+    setTxt('phase-val-verify', ms(verifyMs));
+    setTxt('phase-val-lm', ms(lmMs));
+
+    const ttft = num(t.ttft_ms, 0);
+    setTxt('ttft-badge', ttft > 0 ? `TTFT: ${ttft.toFixed(0)} ms` : 'TTFT: —');
 }
 
 function updateSpeculativeCoordinator(t) {
@@ -473,14 +525,18 @@ function updateSpeculativeCoordinator(t) {
     const speedupEl = document.getElementById('spec-val-speedup');
     const draftedEl = document.getElementById('spec-val-drafted');
 
-    if (alphaEl) {
-        alphaEl.innerText = t.speculative_acceptance_rate > 0 ? `${(t.speculative_acceptance_rate * 100).toFixed(1)}%` : '—';
-    }
+    const rate = num(t.speculative_acceptance_rate, 0);   // already a percentage
+    const drafted = num(t.speculative_drafted, 0);
+    const accepted = num(t.speculative_accepted, 0);
+
+    if (alphaEl) alphaEl.innerText = drafted > 0 ? `${rate.toFixed(1)}%` : '—';
+    if (draftedEl) draftedEl.innerText = drafted > 0 ? `${accepted} / ${drafted}` : '—';
+
+    // There is no measured speedup in telemetry -- comparing against a non-speculative run of
+    // the same prompt is the only honest way to get one, and the server does not do that. This
+    // used to print "1.00x" whenever a draft was loaded, which reads as a measurement.
     if (speedupEl) {
-        speedupEl.innerText = t.speculative_speedup > 1.0 ? `${t.speculative_speedup.toFixed(2)}x` : (t.has_draft ? '1.00x' : '—');
-    }
-    if (draftedEl) {
-        draftedEl.innerText = t.total_tokens_drafted > 0 ? `${t.total_tokens_accepted || 0} / ${t.total_tokens_drafted}` : '—';
+        speedupEl.innerText = drafted > 0 ? `k=${num(t.draft_k, 0)}` : (t.has_draft ? 'idle' : '—');
     }
 }
 
@@ -497,13 +553,54 @@ function hydrateConfig() {
             setValue('cfg-temp', c.temperature);
             setValue('cfg-topp', c.top_p);
             setValue('cfg-topk', c.top_k);
-            setValue('cfg-rep', c.repetition_penalty || 1.0);
+            setValue('cfg-rep', c.repetition_penalty !== undefined ? c.repetition_penalty : 1.0);
             setValue('cfg-maxtoks', c.max_tokens);
-            setValue('cfg-draft-k', c.draft_k || 6);
+            setValue('cfg-draft-k', c.draft_k || 8);
             setValue('cfg-context', c.context_len);
+
+            // The server publishes the verify-batch width, so the slider cannot offer a K the
+            // engine would silently clamp.
+            const kEl = document.getElementById('cfg-draft-k');
+            if (kEl && c.draft_k_max) kEl.max = c.draft_k_max;
+
+            const specEl = document.getElementById('cfg-spec-on');
+            if (specEl) {
+                specEl.checked = (c.speculative_enabled !== false);
+                // Speculation with no draft loaded is not an error, but it does nothing --
+                // saying so beats a toggle that appears to work.
+                specEl.disabled = (c.has_draft === false);
+            }
+            const hint = document.getElementById('spec-hint');
+            if (hint && c.has_draft === false) {
+                hint.innerText = 'No draft model loaded, so speculation has no effect.';
+            }
+            applyContextMax(c.context_max);
             renderConfigLabels();
         })
         .catch(err => console.warn('Config hydrate failed:', err));
+}
+
+// The context ceiling is the server's to state. It used to be fixed at 4096 in the UI because
+// the attention kernel could not exceed it; the online-softmax rewrite removed that limit, and
+// what a larger context costs now is KV cache (about one resident layer at 8192).
+function applyContextMax(maxCtx) {
+    if (!maxCtx) return;
+    const el = document.getElementById('cfg-context');
+    if (!el) return;
+    if (el.tagName === 'SELECT') {
+        const have = new Set(Array.from(el.options).map(o => parseInt(o.value, 10)));
+        [2048, 4096, 8192].filter(v => v <= maxCtx && !have.has(v)).forEach(v => {
+            const opt = document.createElement('option');
+            opt.value = String(v);
+            opt.text = `${v} tokens`;
+            el.add(opt);
+        });
+        Array.from(el.options).forEach(o => {
+            if (parseInt(o.value, 10) > maxCtx) o.remove();
+        });
+    } else {
+        el.max = maxCtx;
+    }
 }
 
 function setValue(id, val) {
@@ -519,9 +616,11 @@ function readConfigForm() {
         top_k: parseInt(document.getElementById('cfg-topk').value, 10) || 64,
         repetition_penalty: parseFloat(document.getElementById('cfg-rep').value) || 1.0,
         max_tokens: parseInt(document.getElementById('cfg-maxtoks').value, 10) || 512,
-        draft_k: parseInt(document.getElementById('cfg-draft-k').value, 10) || 6,
+        draft_k: parseInt(document.getElementById('cfg-draft-k').value, 10) || 8,
         context_len: parseInt(document.getElementById('cfg-context').value, 10) || 4096,
-        speculative_enabled: true
+        // Was hardcoded true with no control anywhere in the UI, and ignored by the server
+        // besides. Both ends now honour it.
+        speculative_enabled: !!(document.getElementById('cfg-spec-on') || {}).checked
     };
 }
 
@@ -548,6 +647,15 @@ function updateConfig() {
     })
     .then(r => r.json())
     .then(data => {
+        // The KV cache is sized at initialize(), so a context change cannot apply to the
+        // running model. The server says so; surfacing it is what stops the UI from appearing
+        // to have applied a setting that did nothing.
+        const note = document.getElementById('cfg-reload-note');
+        if (note) {
+            note.innerText = data.requires_reload
+                ? 'Context change applies after reloading the model.'
+                : '';
+        }
         fetchTelemetry();
     })
     .catch(err => console.warn('Config sync error:', err));
@@ -721,7 +829,7 @@ function sendPrompt() {
     if (sysPrompt) {
         messages.push({ role: 'system', content: sysPrompt });
     }
-    
+
     // Add history + current prompt
     conversation.forEach(m => messages.push(m));
 
@@ -884,7 +992,7 @@ function appendMessage(role, content) {
 
     const bubbleDiv = document.createElement('div');
     bubbleDiv.className = 'bubble';
-    
+
     if (role === 'user') {
         bubbleDiv.innerText = content;
         conversation.push({ role: 'user', content: content });
@@ -935,7 +1043,7 @@ function renderMarkdown(el, text) {
             const firstLineEnd = part.indexOf('\n');
             const lang = firstLineEnd > 3 ? part.substring(3, firstLineEnd).trim() : 'code';
             const code = firstLineEnd !== -1 ? part.substring(firstLineEnd + 1, part.length - 3) : '';
-            
+
             html += `
                 <div class="code-block-wrapper">
                     <div class="code-block-header">

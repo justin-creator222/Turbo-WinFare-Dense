@@ -152,12 +152,34 @@ public:
     // with a measurable cost, not a default.
     bool load_draft_model(const std::string& path);
 
+    // Whether a draft is actually loaded. The GUI needs this to tell "speculation is off"
+    // apart from "speculation is on but there is no draft to speculate with".
+    bool has_draft_model() const {
+        return draft_runtime_ && draft_runtime_->is_loaded();
+    }
+
     // Hold back device memory from this model's layer import, so a draft model can be loaded
     // afterwards. Must be called BEFORE initialize(): the import is greedy, and once it has
     // taken the budget there is nothing left for a second model.
     void set_import_reserve(uint64_t bytes) { import_reserve_bytes_ = bytes; }
     bool has_draft() const { return draft_runtime_ && draft_runtime_->is_loaded(); }
     const G4DenseHeader& header() const { return header_; }
+
+    // WHICH layers stream, not just how many. They are chosen evenly spaced across the stack,
+    // so any UI that shades "the first N layers" as resident is drawing the wrong ones.
+    const std::vector<uint32_t>& streamed_layers() const { return streamed_layers_; }
+
+    std::string device_name() const { return vk_ctx_ ? vk_ctx_->device_name() : std::string(); }
+
+    // Telemetry is a process-wide singleton and the draft model is a second ForwardRunner, so
+    // without this the draft's geometry overwrote the target's: the UI reported 35 layers of
+    // 37 MB (E2B) for a 60-layer, 276 MB-per-layer model. The draft publishes nothing.
+    // The context the KV cache was actually built with, which is not necessarily the value
+    // most recently requested -- set_max_context() only applies at the next initialize().
+    uint32_t max_context() const { return kv_cache_ ? kv_cache_->max_context() : 0u; }
+
+    void mark_as_draft() { is_draft_ = true; }
+    bool is_draft() const { return is_draft_; }
     TelemetrySnapshot get_latest_telemetry() const;
 
 private:
@@ -182,6 +204,7 @@ private:
     // split and on what else is allocated. That is why this is greedy rather than a fixed tier.
     std::vector<VkMemoryAllocation> resident_layer_bufs_;
     std::vector<void*> resident_regions_;      // VirtualAlloc bases, freed in the destructor
+    bool is_draft_{false};
     std::vector<uint32_t> streamed_layers_;    // layers that did NOT fit, in ascending order
 
     void load_resident_layers();

@@ -723,6 +723,11 @@ void ForwardRunner::load_resident_layers() {
     // Publish what the web UI displays. These were struct defaults before, so the telemetry
     // endpoint reported 0 resident layers and a max_context of 8192 while the engine capped
     // at 4096 -- worse than reporting nothing, because it looks authoritative.
+    //
+    // Only the target publishes. The draft is a second ForwardRunner sharing this process-wide
+    // collector, and it loads last, so anything it reported would be what the UI displayed.
+    if (is_draft_) return;
+
     TelemetryCollector::instance().record_model_state(
         static_cast<uint32_t>(resident_count),
         static_cast<uint32_t>(streamed_layers_.size()),
@@ -742,6 +747,22 @@ void ForwardRunner::load_resident_layers() {
         TelemetryCollector::instance().record_heap_usage(
             used * (h0 / ((h0 + h1) > 0 ? (h0 + h1) : 1.0)), h0 / mb,
             used * (h1 / ((h0 + h1) > 0 ? (h0 + h1) : 1.0)), h1 / mb);
+    }
+
+    // Static geometry, so the GUI does not have to hardcode it. It did, and the constants had
+    // drifted from the container.
+    {
+        uint64_t max_layer_bytes = 0;
+        for (uint32_t i = 0; i < header_.num_layers; ++i) {
+            if (header_.layer_sizes[i] > max_layer_bytes) max_layer_bytes = header_.layer_sizes[i];
+        }
+        const double mb = 1024.0 * 1024.0;
+        TelemetryCollector::instance().record_model_geometry(
+            header_.num_layers,
+            static_cast<double>(max_layer_bytes) / mb,
+            static_cast<double>(header_.lm_head_size) / mb,
+            kv_cache_ ? static_cast<double>(kv_cache_->total_memory_bytes()) / mb : 0.0,
+            streamer_ ? static_cast<uint32_t>(streamer_->slot_count()) : 0u);
     }
 
     // One check that the device can still do work. It cannot be walked back from the edge --

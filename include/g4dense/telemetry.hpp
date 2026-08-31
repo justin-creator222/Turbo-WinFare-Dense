@@ -16,6 +16,15 @@ struct TelemetrySnapshot {
     // regression to chase.
     uint64_t speculative_drafted{0};
     uint64_t speculative_accepted{0};
+
+    // Sizes the GUI would otherwise have to hardcode. It did: a 24 GB RAM constant from a
+    // different BIOS setting, and a per-layer size that no longer matched the container.
+    double kv_cache_mb{0.0};
+    double lm_head_mb{0.0};
+    double layer_mb{0.0};
+    double ram_available_mb{0.0};
+    uint32_t total_layers{0};
+    uint32_t stream_slots{0};
     double nvme_read_gbs{0.0};
     double ram_footprint_mb{0.0};
     double ram_total_mb{0.0};
@@ -67,6 +76,10 @@ public:
     void record_model_state(uint32_t resident_layers, uint32_t streamed_layers,
                             uint32_t max_context, const std::string& gpu_name,
                             bool has_draft, uint32_t draft_k);
+
+    // Static geometry, published once at load so the GUI stops guessing it.
+    void record_model_geometry(uint32_t total_layers, double layer_mb, double lm_head_mb,
+                               double kv_cache_mb, uint32_t stream_slots);
 
     // Reported separately from record_model_state: at load time no request has run, so the
     // K the verify loop will use is not known yet. Without this the endpoint showed

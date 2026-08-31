@@ -31,6 +31,7 @@ bool DraftRuntime::load_model(const std::string& model_path,
 
     tokenizer_ = tokenizer;
     runner_ = std::make_unique<ForwardRunner>(ctx, tokenizer, model_path);
+    runner_->mark_as_draft();
     runner_->initialize();
     consumed_ = 0;
     loaded_ = true;

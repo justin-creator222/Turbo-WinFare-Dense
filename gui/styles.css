@@ -790,6 +790,20 @@ aside {
     font-weight: 600;
 }
 
+/* One line of explanation under a control, for settings whose effect is not obvious. */
+.control-hint {
+    font-size: 10px;
+    line-height: 1.4;
+    color: var(--text-secondary);
+    opacity: 0.75;
+}
+
+.control-header .val input[type="checkbox"] {
+    accent-color: #93c5fd;
+    vertical-align: middle;
+    cursor: pointer;
+}
+
 select, input[type="number"], input[type="text"] {
     width: 100%;
     background: rgba(0, 0, 0, 0.4);
