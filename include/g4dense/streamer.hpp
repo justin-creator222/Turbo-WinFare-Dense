@@ -58,7 +58,19 @@ public:
                   uint64_t layer_bytes,
                   IOMode io_mode = IOMode::Auto,
                   EvictionPolicy policy = EvictionPolicy::LRU,
-                  size_t io_threads = 2);
+                  // 4 workers. Measured on the 31B, "Hi" / 14 tokens / greedy:
+                  //
+                  //   1 thread   0.893 tok/s   I/O 212 ms
+                  //   2          1.079         127-142
+                  //   4          1.130          85-90
+                  //   6          1.139          84-87
+                  //   8          1.127          89-92
+                  //
+                  // Past 4 the gain is noise, because PREFETCH_DEPTH is 3: the queue never
+                  // holds more than three jobs, so further workers idle. 4 is one more than
+                  // can currently be used, which leaves room for a deeper queue without
+                  // re-tuning.
+                  size_t io_threads = 4);
     ~LayerStreamer();
 
     void initialize(const G4DenseHeader& header);
