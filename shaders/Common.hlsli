@@ -108,6 +108,22 @@ float f32_load(RWByteAddressBuffer buf, uint byte_off) {
 // requests per wave for 1024 contiguous bytes. That is the one access pattern in the kernel
 // that does not match what the streaming-bandwidth probe does, and the probe reaches 65-74 GB/s
 // where the kernel reached ~33.
+//
+// What this bought, measured three runs each way on the 31B ("Hi", 14 tokens, greedy):
+//
+//                     GPU phase        throughput
+//   8 x u32_load      848-856 ms    0.746-0.751 tok/s
+//   2 x Load4         746-748 ms    0.750-0.760 tok/s
+//
+// So the kernel really is ~12% faster, and the third hypothesis for this gemv was the right
+// one after two dead ends. But it does NOT show up as throughput, because at 45 of 60 layers
+// resident the pass is bound by streaming I/O: time saved on the GPU is returned as time
+// waiting on a layer read. E2B, which is fully resident, is unchanged too (15.9 against 15.8
+// tok/s) -- at 2.5 GB it is not bandwidth-bound in the first place.
+//
+// It is kept because it is strictly less work for identical arithmetic, and it converts to
+// real throughput the moment streaming stops binding. It is not a throughput win today, and
+// an earlier single-run measurement that suggested otherwise was an outlier.
 uint4 u32x4_load(ByteAddressBuffer buf, uint byte_off) {
     return buf.Load4(byte_off);
 }
