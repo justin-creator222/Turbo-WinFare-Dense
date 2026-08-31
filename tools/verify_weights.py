@@ -13,7 +13,7 @@ import numpy as np
 
 HEADER_SIZE = 4096
 MAGIC = 0x4734444E
-VERSION = 2
+VERSION = 3  # 3: packed-weight blocks are 16-byte aligned within each layer
 
 
 def verify_g4dense_file(path: str, verbose: bool = True):
