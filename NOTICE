@@ -1,9 +1,11 @@
-Turbo-WinFare
+Turbo-WinFare Dense
 Copyright 2026 justin-creator222
 
 This product includes software developed as a derivative work of
 TurboFieldfare (https://github.com/drumih/turbo-fieldfare), copyright
-Andrey Mikhaylov, licensed under the Apache License, Version 2.0.
+Andrey Mikhaylov, licensed under the Apache License, Version 2.0, by way of
+Turbo-WinFare, a Windows/Direct3D 12 port of that work by the present
+copyright holder.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not
 use this file except in compliance with the License. You may obtain a copy of
@@ -21,33 +23,34 @@ the License.
 NOTICE OF MODIFICATION (Apache License 2.0, Section 4(b))
 --------------------------------------------------------
 
-Turbo-WinFare is a Windows port of TurboFieldfare and differs substantially
-from the original work. The following changes were made:
+Turbo-WinFare Dense targets a different model, a different graphics API and a
+different on-disk format from either prior work, and differs substantially
+from both. The following changes were made:
 
-  * The entire engine was rewritten from Swift 6.2 / Metal 4 (macOS, Apple
-    Silicon) to C++23 / Direct3D 12 DirectCompute (Windows 11, AMD RDNA 3).
-    No Swift source file from the original work is copied or included in this
-    repository. The GPU kernels were reimplemented in HLSL Shader Model 6.6;
-    they are not translations of the original Metal shaders, though they
-    compute the same functions.
-  * The macOS application, the XPC decode service, the repack/installer tool,
-    and the SwiftNIO-based server were not ported. Their roles are filled by
-    an embedded C++ HTTP server, a browser-based GUI, and a Python conversion
-    script.
-  * Runtime behaviour specific to Windows was added: D3D12 UMA heap
-    allocation, an NVMe-to-UMA expert streamer with a pinning slot cache, and
-    a MinGW/CMake/Ninja build.
+  * The engine is C++20 and Vulkan 1.3 compute, not Swift/Metal (the original
+    work) and not Direct3D 12 (the intermediate Windows port). GPU kernels are
+    written in HLSL and compiled to SPIR-V with DXC. No Swift source from the
+    original work is copied or included in this repository.
+  * The target model is Gemma 4 31B Dense, not the 26B-A4B mixture-of-experts
+    model. There are no experts, no router and no expert streaming; what is
+    streamed here are dense transformer layers. Gemma 4 E2B is supported as a
+    second architecture and as a speculative draft model.
+  * The container format is `.g4dense`, an original single-file format
+    documented in docs/G4DENSE_FORMAT.md. It is not the `.gturbo` bundle
+    format and is not compatible with it.
+  * Forward-pass constants were re-derived from Google's published Gemma 4
+    modelling source rather than carried over, after the inherited assumptions
+    were found to be wrong for this architecture. docs/ROUND5_REPORT.md
+    records what changed and why.
+  * Windows/AMD runtime behaviour specific to this project was added: host
+    memory imported through VK_EXT_external_memory_host, a buffered NVMe layer
+    streamer on I/O worker threads, a flash-attention (online softmax) kernel,
+    and batched speculative verification.
 
-The following aspects of the original work are deliberately retained for
-compatibility, and are derived from it:
+The following aspects trace back to the original work and are derived from it:
 
-  * The `.gturbo` on-disk bundle format: directory layout, manifest and
-    layout schemas, 16 KB alignment, and expert block stride.
-  * The MLX affine 4-bit (group 64, BF16 scale + bias) quantization layout and
-    8-bit router weights.
-  * Forward-pass constants and ordering for Gemma 4 26B-A4B, including the
-    attention scale, RMSNorm convention, partial rotary split, router
-    normalization, and the Top-P -> Top-K -> temperature sampling order.
+  * The MLX affine 4-bit quantization layout (group 64, BF16 scale and bias).
+  * The Top-P -> Top-K -> temperature sampling order.
   * The subset of the local OpenAI-compatible HTTP API that the original
     implements, and the CLI flag vocabulary.
 
@@ -55,14 +58,15 @@ compatibility, and are derived from it:
 DISCLAIMERS
 -----------
 
-Turbo-WinFare is an independent project. It is not affiliated with, sponsored
-by, or endorsed by Andrey Mikhaylov or the TurboFieldfare project.
+Turbo-WinFare Dense is an independent project. It is not affiliated with,
+sponsored by, or endorsed by Andrey Mikhaylov or the TurboFieldfare project.
 
-Turbo-WinFare is not affiliated with, sponsored by, or endorsed by Google.
-Gemma is a trademark of Google LLC. Model weights are not distributed with
-this software; they are downloaded separately and remain governed by their own
-terms. See THIRD_PARTY_NOTICES.md.
+Turbo-WinFare Dense is not affiliated with, sponsored by, or endorsed by
+Google. Gemma is a trademark of Google LLC. Model weights are not distributed
+with this software; they are downloaded separately and remain governed by
+their own terms, which are NOT the same for both models this engine runs.
+See THIRD_PARTY_NOTICES.md.
 
-Please report Windows, Direct3D, and build issues to
-https://github.com/justin-creator222/Turbo-WinFare -- not to the upstream
-TurboFieldfare repository.
+Please report issues to
+https://github.com/justin-creator222/Turbo-WinFare-Dense -- not to the
+upstream TurboFieldfare repository.
