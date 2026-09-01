@@ -78,6 +78,20 @@ the ideas that did not work:
 [3](docs/ROUND3_REPORT.md). Earlier planning documents are archived in
 [docs/history/](docs/history/).
 
+## Sibling project — Turbo-WinFare
+
+[**Turbo-WinFare**](https://github.com/justin-creator222/Turbo-WinFare) applies the same idea to a
+*mixture-of-experts* model instead of a dense one. It is a **Direct3D 12** (DirectCompute) engine
+that runs **Gemma 4 26B-A4B** on the same class of hardware (Legion Go S, Radeon 780M). Where this
+repository keeps 45 of 60 layers resident and streams the other 15, Turbo-WinFare keeps only the
+1.35 GB of non-expert weights resident and reads the eight experts each layer actually routes to
+from NVMe per token. Because so little is active per token, it is far faster: **9.9 tok/s** at 24
+expert slots, **16.2 tok/s** at 44.
+
+Separate codebase, separate container format, separate GUI and OpenAI-compatible server. The two
+projects share the design brief — an APU whose driver will not hand out as much memory as the model
+needs — not code.
+
 ## System requirements
 
 The engine streams whatever it cannot hold, so it runs on far less memory than the model's
