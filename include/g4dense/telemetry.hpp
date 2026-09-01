@@ -16,6 +16,10 @@ struct TelemetrySnapshot {
     // regression to chase.
     uint64_t speculative_drafted{0};
     uint64_t speculative_accepted{0};
+    // True once the adaptive gate has stopped drafting for this generation. Distinguishes "the
+    // drafter is loaded and idle" from "the drafter is loaded and losing", which the GUI
+    // otherwise shows identically.
+    bool drafting_gated{false};
 
     // Sizes the GUI would otherwise have to hardcode. It did: a 24 GB RAM constant from a
     // different BIOS setting, and a per-layer size that no longer matched the container.
@@ -85,6 +89,7 @@ public:
     // K the verify loop will use is not known yet. Without this the endpoint showed
     // draft_k 0 beside has_draft true and a non-zero acceptance rate.
     void record_draft_k(uint32_t draft_k);
+    void record_drafting_gated(bool gated);
     void record_heap_usage(double heap0_used_mb, double heap0_budget_mb,
                            double heap1_used_mb, double heap1_budget_mb);
 

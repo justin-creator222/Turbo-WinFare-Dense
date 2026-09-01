@@ -9,6 +9,7 @@
 #include <thread>
 #include <stdexcept>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 
@@ -628,6 +629,7 @@ void ForwardRunner::load_resident_layers() {
 
     const auto t_start = std::chrono::high_resolution_clock::now();
     uint64_t resident_bytes = 0;
+    uint32_t imported_layers = 0;
     bool ceiling_hit = false;
 
     // WHICH layers stream matters as much as how many.
@@ -668,7 +670,12 @@ void ForwardRunner::load_resident_layers() {
     for (uint32_t l = 0; l < header_.num_layers; ++l) {
         const uint64_t sz = header_.layer_sizes[l];
         if (ceiling_hit || plan_streamed[l]) { streamed_layers_.push_back(l); continue; }
-        if (l >= max_resident || resident_bytes + sz > import_budget) {
+        // max_resident is a COUNT, not an index. The plan above spreads the streamed layers
+        // evenly through the stack, so by layer `max_resident` only about `max_resident *
+        // (fit / num_layers)` have actually been imported -- comparing the index here refused
+        // layers while the budget was still unspent, and G4DENSE_MAX_RESIDENT_LAYERS=39 landed
+        // 25 layers resident. Harmless on the natural path, where max_resident is num_layers.
+        if (imported_layers >= max_resident || resident_bytes + sz > import_budget) {
             ceiling_hit = true;
             streamed_layers_.push_back(l);
             continue;
@@ -702,6 +709,7 @@ void ForwardRunner::load_resident_layers() {
             resident_layer_bufs_[l] = vk_ctx_->import_host_buffer(region, sz);
             resident_regions_.push_back(region);
             resident_bytes += sz;
+            ++imported_layers;
         } catch (const std::exception&) {
             // Expected once the device-memory ceiling is reached. Everything from here on is
             // streamed, and the engine stays correct -- just slower for those layers.
@@ -1999,6 +2007,34 @@ void ForwardRunner::generate(const std::string& prompt,
         batch_tokens.reserve(K);
         int emitted = 0;
 
+        // The adaptive gate: stop drafting when the drafter is not earning its keep.
+        //
+        // This SALVAGES a wrong --spec, it does not replace the launch-time decision. The
+        // 1.5 GiB reserve is spent at load, so nothing here gives the target its 6 layers back;
+        // the ceiling is the 39-layer no-drafting baseline (~42.6 s on the losing prompts,
+        // against ~52.9 s ungated at K=6 -- 8-13%).
+        //
+        // Threshold measured, K=6, each prompt against --no-spec pinned to 39 layers: wins down
+        // to 47.1% acceptance, losses from 32.2% down, so break-even is ~40%. At K=4 it is
+        // ~45%. 0.45 sits above both. The Python-function prompt at 47.1% is close to the line
+        // and may gate on a different phrasing; the honest reading is that it is marginal
+        // either way (0.93x net at its best K).
+        //
+        // The window costs ~4-5 s of probing on a prompt that was going to lose. It is not
+        // smaller because round 9 published a "76.2% -> 46.7% regression" that was 16/21 against
+        // 7/15 -- the same rate read off too few drafts.
+        double gate_min_accept = 0.45;
+        uint32_t gate_window = 24;
+        if (const char* env = std::getenv("G4DENSE_SPEC_GATE_MIN_ACCEPT")) {
+            gate_min_accept = std::atof(env);
+        }
+        if (const char* env = std::getenv("G4DENSE_SPEC_GATE_WINDOW")) {
+            gate_window = static_cast<uint32_t>(std::max(0, std::atoi(env)));
+        }
+        uint32_t drafted_total = 0;
+        uint32_t accepted_total = 0;
+        bool drafting = true;
+
         // The token the target has not processed yet. history's last entry has been forwarded
         // during prefill, so the first round leads with the token sampled from `logits`.
         uint32_t pending = sample_token(logits.data(), vocab_size, options.sampling,
@@ -2012,6 +2048,28 @@ void ForwardRunner::generate(const std::string& prompt,
         while (emitted < options.max_tokens) {
             if (cancel_flag && cancel_flag->load()) break;
             const auto step_start = std::chrono::high_resolution_clock::now();
+
+            // Gated: one token per target pass, no drafting. Deliberately runs through
+            // forward_batch with m=1 rather than falling through to the non-speculative loop
+            // below -- that loop samples from `logits` before forwarding, while this path
+            // carries a `pending` token that has not been forwarded yet, so handing over to it
+            // would emit `pending` twice.
+            if (!drafting) {
+                forward_batch(&pending, 1, static_cast<uint32_t>(history.size() - 1),
+                              verify.data(), true);
+                const uint32_t next = sample_token(
+                    verify.data(), vocab_size, options.sampling,
+                    seed_for(options.sampling, static_cast<uint32_t>(history.size())));
+                history.push_back(next);
+                ++emitted;
+                pending = next;
+                const double lat_g = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - step_start).count();
+                TelemetryCollector::instance().record_generation_step(lat_g, 1, 0, 0);
+                if (on_token && !on_token(next, tokenizer_->decode_single(next))) break;
+                if (is_stop(next)) break;
+                continue;
+            }
 
             DraftResult dr = draft_runtime_->generate_draft_tokens(history, K - 1, options.sampling);
             if (dr.draft_tokens.empty()) break;
@@ -2054,6 +2112,17 @@ void ForwardRunner::generate(const std::string& prompt,
             TelemetryCollector::instance().record_generation_step(
                 lat, ev.accepted_tokens.size(),
                 static_cast<uint32_t>(dr.draft_tokens.size()), ev.num_accepted);
+
+            // Gate check, on the counters this round already produced. Reported through
+            // telemetry rather than printed: this runs mid-stream, and anything written here
+            // lands in the middle of the generated text.
+            drafted_total += static_cast<uint32_t>(dr.draft_tokens.size());
+            accepted_total += ev.num_accepted;
+            if (drafting && drafted_total >= gate_window &&
+                static_cast<double>(accepted_total) / drafted_total < gate_min_accept) {
+                drafting = false;
+                TelemetryCollector::instance().record_drafting_gated(true);
+            }
             if (stop) break;
         }
 

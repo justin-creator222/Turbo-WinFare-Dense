@@ -40,8 +40,12 @@ continuously, while the GPU is working. The whole design follows from that one c
 - **Reading and computing happen at once.** Disk reads run on their own threads, so the GPU
   never waits on the filesystem, and a read served from the OS cache costs nothing on the
   critical path.
-- **A small model guesses ahead.** Gemma 4 E2B drafts several tokens at ~15 tok/s and the 31B
-  verifies them all in a single pass, so an accepted guess is effectively free.
+- **A small model can guess ahead, when the text is predictable enough.** Gemma 4 E2B drafts
+  several tokens and the 31B verifies them in a single pass. This is **off by default** and
+  `--spec` turns it on: loading the drafter reserves 1.5 GiB, which costs the 31B 6 resident
+  layers, and only rote or rigid-format output is predicted well enough to earn that back.
+  Measured across 10 prompts it wins on primes (1.50×) and JSON (1.18×) and loses on every
+  conversational one. [PERFORMANCE.md](docs/PERFORMANCE.md) §5 has the full matrix.
 
 ### What that costs
 
@@ -73,9 +77,9 @@ server speaks to this.
 
 **Round reports** — what changed and why, newest first. These carry the reasoning, including
 the ideas that did not work:
-[9](docs/ROUND9_REPORT.md) · [8](docs/ROUND8_REPORT.md) · [7](docs/ROUND7_REPORT.md) ·
-[6](docs/ROUND6_REPORT.md) · [5](docs/ROUND5_REPORT.md) · [4](docs/ROUND4_REPORT.md) ·
-[3](docs/ROUND3_REPORT.md). Earlier planning documents are archived in
+[10](docs/ROUND10_REPORT.md) · [9](docs/ROUND9_REPORT.md) · [8](docs/ROUND8_REPORT.md) ·
+[7](docs/ROUND7_REPORT.md) · [6](docs/ROUND6_REPORT.md) · [5](docs/ROUND5_REPORT.md) ·
+[4](docs/ROUND4_REPORT.md) · [3](docs/ROUND3_REPORT.md). Earlier planning documents are archived in
 [docs/history/](docs/history/).
 
 ## Sibling project — Turbo-WinFare
@@ -151,9 +155,10 @@ cmake --build build
 .\build\run_turbo_dense.exe --model models\gemma-4-31b-dense.g4dense --gui     # web UI + OpenAI API
 ```
 
-Useful flags: `--no-spec` (disable speculation), `--draft-k N` (drafts per verify round, capped
-at 8), `--max-context N` (default 4096; 8192 costs ~336 MB of KV cache, about one resident
-layer), `--temp`, `--top-p`, `--top-k`.
+Useful flags: `--spec` (enable speculative decoding; off by default because the drafter costs
+the 31B 6 resident layers), `--draft-k N` (verify-batch width, 2–8, default 6), `--max-context N`
+(default 4096; 8192 costs ~336 MB of KV cache, about one resident layer), `--temp`, `--top-p`,
+`--top-k`.
 
 ### The web UI
 

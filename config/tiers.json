@@ -13,7 +13,8 @@
     "imported_gib": 11.58,
     "kv_cache_dtype": "FP16",
     "max_context": 4096,
-    "draft_k": 8,
+    "speculation": "off by default (round 10); --spec opts in and costs 6 resident layers",
+    "draft_k_when_enabled": 6,
     "decode_tok_s_greedy": 1.13,
     "phase_ms_per_token": {
       "stream_io": 90,

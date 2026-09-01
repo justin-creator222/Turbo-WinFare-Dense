@@ -130,7 +130,20 @@ Rejected drafts leave stale entries past the accepted length in both KV caches. 
 read, because attention only looks at `[first, current_position)`, and the next pass overwrites
 those ring slots — so there is no rollback step.
 
-`draft_k` is 8, the width of the verify batch (`kGemmMaxBatch`).
+`draft_k` is the width of the verify batch, capped at `kGemmMaxBatch` (8) and floored at 2 —
+K=1 would ask the drafter for zero tokens. It defaults to **6**.
+
+**Speculation is off unless `--spec` is passed.** The drafter is loaded once at startup and
+reserves 1.5 GiB, which costs the target 6 resident layers — 21 streamed per token instead of
+15, a flat ~23% before anything is drafted. Only rote and rigid-format output accepts often
+enough (roughly 70%) to earn that back; over a 10-prompt suite no value of K beat leaving
+speculation off. Residency is therefore a launch-time decision, and the server's per-request
+`speculative_enabled` cannot change it — it only stops drafting.
+
+When drafting is on, an **adaptive gate** stops it mid-generation if acceptance falls below 45%
+over at least 24 drafted tokens, falling back to one token per target pass through the same
+`forward_batch` call with a batch of 1. It salvages a wrong `--spec`; it cannot return the 6
+layers. `docs/PERFORMANCE.md` §5 carries the measurements.
 
 ## 8. Where to look
 

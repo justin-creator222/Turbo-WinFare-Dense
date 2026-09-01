@@ -33,6 +33,7 @@ std::string TelemetrySnapshot::to_json_string() const {
     ss << "  \"draft_k\": " << draft_k << ",\n";
     ss << "  \"speculative_drafted\": " << speculative_drafted << ",\n";
     ss << "  \"speculative_accepted\": " << speculative_accepted << ",\n";
+    ss << "  \"drafting_gated\": " << (drafting_gated ? "true" : "false") << ",\n";
     ss << "  \"total_tokens_generated\": " << total_tokens_generated << ",\n";
     ss << "  \"ram_available_mb\": " << ram_available_mb << ",\n";
     ss << "  \"kv_cache_mb\": " << kv_cache_mb << ",\n";
@@ -109,6 +110,12 @@ void TelemetryCollector::record_model_geometry(uint32_t total_layers, double lay
     g_snapshot.stream_slots = stream_slots;
 }
 
+
+void TelemetryCollector::record_drafting_gated(bool gated) {
+    std::lock_guard<std::mutex> lock(g_telemetry_mutex);
+    g_snapshot.drafting_gated = gated;
+}
+ 
 void TelemetryCollector::record_draft_k(uint32_t draft_k) {
     std::lock_guard<std::mutex> lock(g_telemetry_mutex);
     g_snapshot.draft_k = draft_k;
@@ -169,6 +176,7 @@ void TelemetryCollector::reset_speculative_stats() {
     g_snapshot.speculative_drafted = 0;
     g_snapshot.speculative_accepted = 0;
     g_snapshot.speculative_acceptance_rate = 0.0;
+    g_snapshot.drafting_gated = false;
 }
 
 void TelemetryCollector::reset() {

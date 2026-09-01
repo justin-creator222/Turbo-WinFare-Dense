@@ -565,7 +565,12 @@ function updateSpeculativeCoordinator(t) {
     // the same prompt is the only honest way to get one, and the server does not do that. This
     // used to print "1.00x" whenever a draft was loaded, which reads as a measurement.
     if (speedupEl) {
-        speedupEl.innerText = drafted > 0 ? `k=${num(t.draft_k, 0)}` : (t.has_draft ? 'idle' : '—');
+        // "gated" is a third state, and it used to be indistinguishable from "idle": the
+        // drafter is loaded and was drafting, but acceptance fell below the threshold and the
+        // engine stopped. Without this the panel reads k=6 while nothing is being drafted.
+        speedupEl.innerText = t.drafting_gated ? 'gated off'
+                            : (drafted > 0 ? `k=${num(t.draft_k, 0)}`
+                                           : (t.has_draft ? 'idle' : '—'));
     }
 }
 
@@ -584,24 +589,30 @@ function hydrateConfig() {
             setValue('cfg-topk', c.top_k);
             setValue('cfg-rep', c.repetition_penalty !== undefined ? c.repetition_penalty : 1.0);
             setValue('cfg-maxtoks', c.max_tokens);
-            setValue('cfg-draft-k', c.draft_k || 8);
+            setValue('cfg-draft-k', c.draft_k || 6);
             setValue('cfg-context', c.context_len);
 
             // The server publishes the verify-batch width, so the slider cannot offer a K the
             // engine would silently clamp.
             const kEl = document.getElementById('cfg-draft-k');
             if (kEl && c.draft_k_max) kEl.max = c.draft_k_max;
-
             const specEl = document.getElementById('cfg-spec-on');
             if (specEl) {
                 specEl.checked = (c.speculative_enabled !== false);
                 // Speculation with no draft loaded is not an error, but it does nothing --
-                // saying so beats a toggle that appears to work.
+                // saying so beats a toggle that appears to work. Since round 10 the drafter is
+                // OFF unless the server was started with --spec, so this is now the common case.
                 specEl.disabled = (c.has_draft === false);
             }
+            // K is equally inert without a drafter, and was still live.
+            if (kEl) kEl.disabled = (c.has_draft === false);
             const hint = document.getElementById('spec-hint');
-            if (hint && c.has_draft === false) {
-                hint.innerText = 'No draft model loaded, so speculation has no effect.';
+            if (hint) {
+                hint.innerText = (c.has_draft === false)
+                    ? 'No draft model loaded. The drafter is loaded at startup with --spec; it '
+                      + 'cannot be enabled from here, because it costs the 31B 6 resident layers.'
+                    : 'Drafting pays off above roughly 70% acceptance -- rote sequences and rigid '
+                      + 'formats. It is stopped automatically if acceptance falls below 45%.';
             }
             applyContextMax(c.context_max);
             renderConfigLabels();
@@ -645,7 +656,7 @@ function readConfigForm() {
         top_k: parseInt(document.getElementById('cfg-topk').value, 10) || 64,
         repetition_penalty: parseFloat(document.getElementById('cfg-rep').value) || 1.0,
         max_tokens: parseInt(document.getElementById('cfg-maxtoks').value, 10) || 512,
-        draft_k: parseInt(document.getElementById('cfg-draft-k').value, 10) || 8,
+        draft_k: parseInt(document.getElementById('cfg-draft-k').value, 10) || 6,
         context_len: parseInt(document.getElementById('cfg-context').value, 10) || 4096,
         // Was hardcoded true with no control anywhere in the UI, and ignored by the server
         // besides. Both ends now honour it.

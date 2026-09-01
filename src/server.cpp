@@ -717,7 +717,10 @@ void HTTPServer::handle_client(uintptr_t client_socket) {
                         // Clamped, not rejected: the verify batch is draft_k wide, so a larger
                         // value would silently be truncated by the kernel anyway.
                         uint32_t k = root.at("draft_k", "body").as_uint32("draft_k");
-                        config_.draft_k = k < 1u ? 1u : (k > kGemmMaxBatch ? kGemmMaxBatch : k);
+                        // Floor of 2, not 1: K is the verify-batch width and the loop asks
+                        // the drafter for K-1 tokens, so draft_k=1 returned a ONE-token
+                        // response. Ceiling is the kernel batch width.
+                        config_.draft_k = k < 2u ? 2u : (k > kGemmMaxBatch ? kGemmMaxBatch : k);
                     }
                     if (root.has("speculative_enabled")) config_.speculative_enabled = root.at("speculative_enabled", "body").as_bool("speculative_enabled");
                     if (root.has("seed")) {

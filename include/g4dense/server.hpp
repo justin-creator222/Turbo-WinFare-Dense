@@ -19,8 +19,12 @@ struct ServerConfig {
     // /api/config, which silently ignored both -- a control that parses and does
     // nothing, which this project's own contributing rules forbid.
     float repetition_penalty{1.0f};
-    uint32_t draft_k{8};
-    bool speculative_enabled{true};
+    // Both match GenerationOptions and the CLI; see runner.hpp for why 6 and why off.
+    // speculative_enabled is a per-request switch, but the DRAFTER is loaded once at startup
+    // from --spec, so turning this on here cannot load one, and turning it off cannot give the
+    // target its 6 layers back. has_draft in /api/config is what says whether one exists.
+    uint32_t draft_k{6};
+    bool speculative_enabled{false};
     // 0 = no fixed seed. Exposed so a run can be reproduced from the UI.
     bool has_seed{false};
     uint64_t seed{0};

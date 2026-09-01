@@ -37,8 +37,10 @@ void print_usage() {
               << "  --temp <float>       Sampling temperature (0.0 = greedy, default: 0.2)\n"
               << "  --top-p <float>      Nucleus sampling top-p (default: 0.95)\n"
               << "  --top-k <int>        Top-k truncation (default: 64)\n"
-              << "  --draft-k <int>      Speculative draft tokens per step (default: 4)\n"
-              << "  --no-spec            Disable speculative decoding\n"
+              << "  --spec               Enable speculative decoding. Loads the E2B drafter,\n"
+              << "                       which costs the target 6 resident layers.\n"
+              << "  --draft-k <int>      Speculative verify-batch width, 2-8 (default: 6)\n"
+              << "  --no-spec            Deprecated no-op: speculation is off unless --spec\n"
               << "  --server             Start OpenAI-compatible HTTP server and Web GUI\n"
               << "  --port <port>        Server port (default: 8080)\n"
               << "  --gui                Auto-open Web GUI in default browser\n"
@@ -76,18 +78,38 @@ int main(int argc, char** argv) {
     float temp = 0.2f;
     float top_p = 0.95f;
     int top_k = 64;
-    // 8, matching GenerationOptions and capped by kGemmMaxBatch (the verify batch is K wide).
+    // 6, and capped by kGemmMaxBatch (the verify batch is K wide). Minimum 2: K is the batch
+    // width, one pending token plus K-1 drafts, so K=1 asks for zero drafts.
     //
-    // Measured on "Write one sentence explaining what a ring buffer is", 24 tokens, greedy,
-    // three runs each: K=8 takes 20.58-20.81 s against K=4's 26.06-26.45 s. The target pass
-    // costs ~1,330 ms and a draft pass ~65 ms, a 20:1 ratio, so drafting more per round is
-    // nearly free and amortizes the expensive pass over more accepted tokens. The CLI said 4
-    // and GenerationOptions said 6, so the server was running an untuned third configuration.
+    // Round 9 set this to 8 and recorded "K=8 is 21% faster, drafting more per round is nearly
+    // free". That was measured against a ~1,330 ms target pass -- a round-8 number -- and it
+    // never measured --no-spec on the same prompt at all. A 132-run sweep over 10 prompts x
+    // {no-spec, K=2,4,6,8} retired it. Best K is prompt-dependent and NOT monotonic, because K
+    // decides where round boundaries fall: an unpredictable token costs one wasted draft or
+    // seven depending on where it lands. The JSON prompt accepts 76% at K=6 and 46% at K=8.
     //
-    // It costs 1-3% on prompts that stop early, where the last round over-drafts. That is a
-    // good trade for 21% on generations that run to length.
-    int draft_k = 8;
-    bool speculative = true;
+    // 6 is the best value across the prompts where speculation is worth enabling at all
+    // (33.08 / 29.62 / 30.88 s on the three net winners, against K=8's 23.01 / 31.51 / 40.56).
+    // K=8 wins only on near-deterministic sequences and collapses everywhere else.
+    int draft_k = 6;
+
+    // Speculation is OFF by default, and --spec opts in.
+    //
+    // Loading the draft model reserves 1.5 GiB, which costs the target 6 resident layers -- 21
+    // streamed per token instead of 15. Measured with --no-spec pinned to 39 layers against its
+    // natural 45, that reserve alone is 1.21-1.23x slower, flat across prompts, and paid before
+    // a single token is drafted. Drafting earns it back only at high acceptance.
+    //
+    // Over the 10-prompt suite, 48 tokens each: --no-spec 347.77 s, K=4 437.99, K=6 446.85,
+    // K=8 (the old default) 512.77. No value of K beats leaving it off, and neither does an
+    // oracle that picks the best K per prompt (404.72). Speculation wins only on rote or rigid
+    // format output -- primes 1.50x, counting 1.19x, JSON 1.18x -- and loses on all seven
+    // conversational prompts.
+    //
+    // Residency is decided at load, drafting per request, so this is a launch-time decision:
+    // even perfectly gated speculation loses on a mixed workload (~381.7 s against 347.8 s for
+    // never loading the drafter). See docs/ROUND10_REPORT.md.
+    bool speculative = false;
     bool run_server = false;
     bool cpu_mode = false;
     std::string dump_tensors_dir = "";
@@ -120,8 +142,20 @@ int main(int argc, char** argv) {
         } else if (arg == "--max-context" && i + 1 < argc) {
             max_context = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if (arg == "--draft-k" && i + 1 < argc) {
+            // Clamped, not rejected. The lower bound is 2 because K is the verify-batch width:
+            // the loop asks the drafter for K-1 tokens, so K=1 asked for none, the draft came
+            // back empty and generation stopped after ONE token. The server clamped to 1 too,
+            // so `{"draft_k": 1}` over the API produced a one-token response.
             draft_k = std::stoi(argv[++i]);
+            if (draft_k < 2) draft_k = 2;
+            if (draft_k > static_cast<int>(g4dense::kGemmMaxBatch)) {
+                draft_k = static_cast<int>(g4dense::kGemmMaxBatch);
+            }
+        } else if (arg == "--spec") {
+            speculative = true;
         } else if (arg == "--no-spec") {
+            // Retained as a no-op: speculation is off unless --spec, and scripts and benchmark
+            // harnesses written against the old default still pass this.
             speculative = false;
         } else if (arg == "--server") {
             run_server = true;
@@ -302,6 +336,13 @@ int main(int argc, char** argv) {
               << "\n  RAM Footprint:    " << tele.ram_footprint_mb << " MB / " << tele.ram_total_mb << " MB"
               << "\n  Memory Tier:      Tier " << tele.active_tier_id
               << "\n  Draft acceptance: " << (tele.speculative_acceptance_rate * 100.0) << " %"
+              << " (" << tele.speculative_accepted << "/" << tele.speculative_drafted << ")"
+              // Printed here rather than when it happens: the gate trips mid-stream, and
+              // anything written there lands inside the generated text.
+              << "\n  Drafting:         "
+              << (!tele.has_draft ? "no drafter loaded (--spec to enable)"
+                                  : (tele.drafting_gated ? "GATED OFF -- acceptance below threshold"
+                                                         : "active"))
               // Per-forward-pass attribution. Printed so an optimization can be credited to a
               // phase instead of guessed at; the numbers are an EMA over the pass, so a single
               // cold pass does not dominate them.
