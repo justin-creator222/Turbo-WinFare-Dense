@@ -128,9 +128,6 @@ starts paying once enough layers stay put to leave the disk idle.
 
 
 
-```powershell
-.\build\run_turbo_dense.exe --model models\gemma-4-e2b-dense.g4dense --prompt "Hi" --max-tokens 24
-```
 
 Also needed, regardless of RAM: a **Vulkan 1.3** GPU with subgroup intrinsics (this targets an
 AMD Radeon 780M), **Windows**, and about **20 GB of disk** for the two containers.
