@@ -126,12 +126,8 @@ Note the flat part of that curve: 0 → 21 resident layers barely moves throughp
 low residency the pass is bound by reading weights, not by computing with them. Residency only
 starts paying once enough layers stay put to leave the disk idle.
 
-**On a small machine, run E2B instead.** It is fully resident in **1.8 GB** and generates at
-**15.1 tok/s** — 13× the 31B's speed:
 
-```powershell
-.\build\run_turbo_dense.exe --model models\gemma-4-e2b-dense.g4dense --prompt "Hi" --max-tokens 24
-```
+
 
 Also needed, regardless of RAM: a **Vulkan 1.3** GPU with subgroup intrinsics (this targets an
 AMD Radeon 780M), **Windows**, and about **20 GB of disk** for the two containers.
