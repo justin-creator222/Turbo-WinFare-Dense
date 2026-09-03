@@ -117,6 +117,54 @@ def check_environment():
     return 0
 
 
+def ensure_huggingface_hub():
+    """Checks if huggingface_hub is installed. If not, automatically runs pip install huggingface_hub."""
+    try:
+        import huggingface_hub  # noqa: F401
+        return True
+    except ImportError:
+        pass
+
+    emit("huggingface_hub is not installed. Running pip install huggingface_hub...")
+    progress(0.0, "installing huggingface_hub")
+    cmd = [sys.executable, "-m", "pip", "install", "huggingface_hub"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        output_lines = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                output_lines.append(line)
+                emit("  " + line)
+        rc = proc.wait()
+
+        # If it failed due to PEP 668 (externally-managed-environment), retry with --break-system-packages
+        if rc != 0 and any("break-system-packages" in l for l in output_lines):
+            emit("Retrying installation with --break-system-packages...")
+            retry_cmd = cmd + ["--break-system-packages"]
+            proc = subprocess.Popen(retry_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    emit("  " + line)
+            rc = proc.wait()
+
+        if rc != 0:
+            emit(f"ERROR pip install huggingface_hub failed with exit code {rc}")
+            return False
+
+        import importlib
+        importlib.invalidate_caches()
+        import huggingface_hub  # noqa: F401
+        emit("huggingface_hub successfully installed.")
+        return True
+    except Exception as e:
+        emit(f"ERROR Failed to install huggingface_hub: {e}")
+        return False
+
+
 def remote_total_bytes(repo, revision):
     """Total download size, so the progress bar is real rather than a spinner. Returns 0 if the
     metadata call fails -- the download still runs, it just reports bytes instead of percent."""
@@ -129,6 +177,8 @@ def remote_total_bytes(repo, revision):
 
 
 def do_download(m, dest):
+    if not ensure_huggingface_hub():
+        raise RuntimeError("huggingface_hub is required for download but could not be installed")
     from huggingface_hub import snapshot_download
 
     total = remote_total_bytes(m["repo"], m["revision"])
@@ -210,12 +260,6 @@ def main():
     ckpt = MODELS_DIR / m["checkpoint"]
     out_path = MODELS_DIR / m["container"]
 
-    try:
-        import huggingface_hub  # noqa: F401
-    except ImportError:
-        emit("ERROR huggingface_hub is not installed. Install it with: pip install huggingface_hub")
-        return 2
-
     t0 = time.time()
     try:
         if out_path.is_file():
@@ -229,6 +273,8 @@ def main():
             emit(f"Checkpoint already present at {ckpt}, skipping download.")
             progress(DOWNLOAD_SHARE, "checkpoint already downloaded")
         else:
+            if not ensure_huggingface_hub():
+                return 2
             do_download(m, ckpt)
 
         do_convert(m, ckpt, out_path)
