@@ -237,7 +237,7 @@ out in five places ([G4DENSE_FORMAT.md §4.2](docs/G4DENSE_FORMAT.md#42-where-th
 ## Verifying a change
 
 ```powershell
-ctest --test-dir build --output-on-failure     # 16 of 16
+ctest --test-dir build --output-on-failure     # 19 of 19
 
 .\build\run_gpu_forward_test.exe models\gemma-4-31b-dense.g4dense tests\fixtures\oracle_multi "2,3689,563,506"
 .\build\run_gpu_forward_test.exe models\gemma-4-e2b-dense.g4dense  tests\fixtures\oracle_e2b   "2,3689,563,506"
@@ -259,4 +259,4 @@ crashing with exit 29).
 | [`src/`](src/), [`include/g4dense/`](include/g4dense/) | engine — [`runner.cpp`](src/runner.cpp) is the forward pass, [`streamer.cpp`](src/streamer.cpp) the layer I/O |
 | [`shaders/`](shaders/) | HLSL compiled to SPIR-V by [`tools/compile_shaders.py`](tools/compile_shaders.py) |
 | [`tools/`](tools/) | conversion, verification, the NumPy reference, benchmarks |
-| [`docs/`](docs/) | [PERFORMANCE.md](docs/PERFORMANCE.md), [G4DENSE_FORMAT.md](docs/G4DENSE_FORMAT.md), [FORWARD_PASS.md](docs/FORWARD_PASS.md), per-round reports |
+| [`docs/`](docs/) | [PERFORMANCE.md](docs/PERFORMANCE.md), [G4DENSE_FORMAT.md](docs/G4DENSE_FORMAT.md), [FORWARD_PASS.md](docs/FORWARD_PASS.md), [MTP_LAYER_CONFIGURATION_REPORT.md](docs/MTP_LAYER_CONFIGURATION_REPORT.md), [MTP_VS_AUTOREGRESSIVE_COMPARISON_REPORT.md](docs/MTP_VS_AUTOREGRESSIVE_COMPARISON_REPORT.md), per-round reports |

@@ -154,12 +154,38 @@ std::string find_python() {
     if (const char* env = std::getenv("G4DENSE_PYTHON")) {
         if (*env) candidates.emplace_back(env);
     }
-    // A virtualenv beside the repo, which is how this project is normally set up.
-    std::error_code ec;
-    const fs::path venv = fs::path(resolve_resource_path(".")) / ".venv" / "Scripts" / "python.exe";
-    if (fs::exists(venv, ec)) candidates.push_back(venv.string());
 
-    for (const char* c : {"python.exe", "python3.exe", "py.exe"}) {
+    // Check uv python find if uv is available
+    const std::string uv_py = capture_command("uv python find");
+    if (!uv_py.empty()) {
+        std::string cleaned = uv_py;
+        while (!cleaned.empty() && (cleaned.back() == '\r' || cleaned.back() == '\n' || cleaned.back() == ' ')) {
+            cleaned.pop_back();
+        }
+        std::error_code ec;
+        if (!cleaned.empty() && fs::exists(cleaned, ec)) {
+            candidates.push_back(cleaned);
+        }
+    }
+
+    // A virtualenv beside the repo or in the parent directory
+    std::error_code ec;
+    const fs::path venv1 = fs::path(resolve_resource_path(".")) / ".venv" / "Scripts" / "python.exe";
+    if (fs::exists(venv1, ec)) candidates.push_back(venv1.string());
+    const fs::path venv2 = fs::path(resolve_resource_path("..")) / ".venv" / "Scripts" / "python.exe";
+    if (fs::exists(venv2, ec)) candidates.push_back(venv2.string());
+
+    // User profile .local/bin paths
+    if (const char* user_profile = std::getenv("USERPROFILE")) {
+        const fs::path local_bin = fs::path(user_profile) / ".local" / "bin";
+        for (const char* name : {"python3.12.exe", "python3.11.exe", "python.exe", "python3.exe"}) {
+            fs::path p = local_bin / name;
+            if (fs::exists(p, ec)) candidates.push_back(p.string());
+        }
+    }
+
+    // Search PATH for standard and versioned binaries
+    for (const char* c : {"python3.12.exe", "python3.11.exe", "python.exe", "python3.exe", "py.exe"}) {
         char found[MAX_PATH];
         if (SearchPathA(nullptr, c, nullptr, MAX_PATH, found, nullptr) != 0) {
             candidates.emplace_back(found);

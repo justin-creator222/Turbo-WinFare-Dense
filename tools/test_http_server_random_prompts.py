@@ -9,11 +9,19 @@ import sys
 
 PORT = 8089
 BASE_URL = f"http://127.0.0.1:{PORT}"
-EXE_TURBO = os.path.join(os.path.dirname(__file__), "..", "build", "turbo-dense.exe")
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+BUILD_DIR = os.path.join(REPO_ROOT, "build")
+EXE_TURBO = os.path.join(BUILD_DIR, "run_turbo_dense.exe") if os.path.exists(os.path.join(BUILD_DIR, "run_turbo_dense.exe")) else os.path.join(BUILD_DIR, "turbo-dense.exe")
 
-def wait_for_server(timeout=15):
+def wait_for_server(proc, timeout=15):
     start = time.time()
     while time.time() - start < timeout:
+        if proc.poll() is not None:
+            out, err = proc.communicate()
+            print(f"Server process terminated with code {proc.returncode}!")
+            print("STDOUT:", out)
+            print("STDERR:", err)
+            return False
         try:
             req = urllib.request.Request(f"{BASE_URL}/api/model_info")
             with urllib.request.urlopen(req, timeout=1.0) as resp:
@@ -55,11 +63,11 @@ def main():
         "--model", "tests/fixtures/tiny_muse.g4dense"
     ]
     print(f"Starting server: {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(cmd, cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     try:
         print("Waiting for server to initialize Vulkan and load model...")
-        assert wait_for_server(20), "Server failed to start within 20s"
+        assert wait_for_server(proc, 20), "Server failed to start within 20s"
         print("Server is UP and ready!\n")
 
         # 1. Model info check

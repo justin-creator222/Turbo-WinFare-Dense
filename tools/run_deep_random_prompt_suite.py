@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = ROOT / "build"
 EXE_DEEP_TEST = BUILD_DIR / "run_deep_random_prompts_test.exe"
-EXE_TURBO = BUILD_DIR / "turbo-dense.exe"
+EXE_TURBO = BUILD_DIR / "run_turbo_dense.exe" if (BUILD_DIR / "run_turbo_dense.exe").exists() else (BUILD_DIR / "turbo-dense.exe")
 
 def log_header(title):
     print("\n" + "=" * 75)

@@ -7,7 +7,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = ROOT / "build"
-EXE_TURBO = BUILD_DIR / "turbo-dense.exe"
+EXE_TURBO = BUILD_DIR / "run_turbo_dense.exe" if (BUILD_DIR / "run_turbo_dense.exe").exists() else (BUILD_DIR / "turbo-dense.exe")
 EXE_GPU_DIFF = BUILD_DIR / "run_gpu_forward_test.exe"
 EXE_CPU_DIFF = BUILD_DIR / "run_cpu_reference_test.exe"
 

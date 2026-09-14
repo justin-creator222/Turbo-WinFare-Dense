@@ -833,14 +833,6 @@ function usePreset(promptText) {
     sendPrompt();
 }
 
-const SYSTEM_PRESETS = {
-    default: 'You are a helpful, knowledgeable assistant. Answer the question that was asked, directly and without preamble. Match length to the question: one sentence when that is enough, more when the topic needs it. If you do not know something or are uncertain, say so plainly instead of guessing.',
-    code: 'You are an experienced software engineer. Give complete, runnable code: real imports, error paths handled, no placeholder comments standing in for logic. State the language version and any assumptions you made. Prefer the clear solution over the clever one. When reviewing or explaining existing code, describe what it actually does before suggesting changes, and flag bugs and edge cases you notice along the way.',
-    explain: 'You explain technical subjects to a competent reader who is new to this particular topic. Lead with the core idea in plain language, then add the mechanism and the details that matter. Use concrete examples and numbers over analogies. Define a term the first time you use it. Say explicitly where your explanation simplifies something, and where the real behavior differs.',
-    creative: 'You are a skilled creative writer. Write with concrete, specific detail and a distinct voice. Avoid cliche, filler adjectives, and tidy closing morals. Follow the requested form, length, and tone exactly. When a brief is vague, make a specific choice and commit to it rather than hedging across several options.',
-    none: '',
-};
-
 function clearTranscript() {
     conversation = [];
     const transcript = document.getElementById('transcript');
@@ -1133,7 +1125,7 @@ function renderMarkdown(el, text) {
 }
 
 function escapeHtml(str) {
-    return str
+    return String(str === undefined || str === null ? '' : str)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
@@ -1388,10 +1380,4 @@ function pollDownload() {
             }
         })
         .catch(() => { setupPollTimer = setTimeout(pollDownload, 3000); });
-}
-
-function escapeHtml(s) {
-    return String(s === undefined || s === null ? '' : s)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
 }

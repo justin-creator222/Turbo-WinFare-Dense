@@ -40,9 +40,9 @@ There is no CI. Everything below runs locally.
 
 | | |
 |---|---|
-| **No GPU, no model** | `run_format_test`, `run_tokenizer_test`, `run_detokenizer_test`, `run_sampling_test`, `run_contracts_test`, `run_prompt_pipeline_test`, `run_kv_cache_test`, `run_streamer_test` |
-| **Vulkan device** | `run_vk_device_test`, `run_gpu_kernels_test` |
-| **Vulkan device + a real container** | `run_gpu_forward_test`, `run_smoke_engine_test`, `run_speculative_test`, `run_real_generation_test`, `run_context_dependence_test`, `run_cpu_reference_test` |
+| **No GPU, no model** | `run_format_test`, `run_tokenizer_test`, `run_detokenizer_test`, `run_sampling_test`, `run_contracts_test`, `run_prompt_pipeline_test`, `run_streamer_test`, `run_cpu_reference_test`, `run_cpu_reference_muse_test` |
+| **Vulkan device** | `run_vk_device_test`, `run_gpu_kernels_test`, `run_kv_cache_test`, `run_mtp_runner_test`, `run_gpu_forward_muse_test` |
+| **Vulkan device + a real container** | `run_gpu_forward_test`, `run_smoke_engine_test`, `run_speculative_test`, `run_real_generation_test`, `run_context_dependence_test` |
 
 `run_gpu_kernels_test` needs a Vulkan 1.3 device with subgroup (wave) intrinsics.
 

@@ -13,7 +13,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = REPO_ROOT / "build"
-EXE_PATH = BUILD_DIR / "turbo-dense.exe"
+EXE_PATH = BUILD_DIR / "run_turbo_dense.exe" if (BUILD_DIR / "run_turbo_dense.exe").exists() else (BUILD_DIR / "turbo-dense.exe")
 
 
 def check_disk_queue():
