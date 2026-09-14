@@ -36,6 +36,8 @@ enum class ComputeKernel : uint32_t {
     QKVEpilogue,
     Attention,
     GeGLU,
+    SwiGLU,
+    AttnGate,
     ResidualAccum,
     Softcap,
     LMHeadGreedy,

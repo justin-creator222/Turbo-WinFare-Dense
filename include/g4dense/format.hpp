@@ -98,11 +98,93 @@ struct G4DenseHeader {
     // containers keep working.
     uint32_t layer_d_ff[MAX_LAYERS];
 
-    uint8_t  reserved[2712];        // Padding to exactly 4096 bytes
+    // Architecture discriminator and model-specific metadata
+    // 0 = GEMMA4 (default, backwards compatible with legacy zeroed reserved bytes)
+    // 1 = MUSE_GLIMMER
+    uint32_t arch_type;         // ModelArch enum
+    uint32_t attn_out_dim;      // 4096 on Muse Glimmer (32 heads * 128 dim); 0 = d_model (Gemma 4)
+    float    qk_scale_factor;   // 3.87 on Muse Glimmer; 0 = 1.0f (Gemma 4)
+    float    output_multiplier; // 0.196116 on Muse Glimmer; 0 = 1.0f (Gemma 4)
+
+    uint8_t  reserved[2696];    // Padding to exactly 4096 bytes (2712 - 16 = 2696)
 };
 #pragma pack(pop)
 
 static_assert(sizeof(G4DenseHeader) == 4096, "G4DenseHeader must be exactly 4096 bytes");
+
+enum class ModelArch : uint32_t {
+    GEMMA4 = 0,
+    MUSE_GLIMMER = 1
+};
+
+inline ModelArch model_architecture(const G4DenseHeader& h) {
+    if (h.arch_type == static_cast<uint32_t>(ModelArch::MUSE_GLIMMER)) {
+        return ModelArch::MUSE_GLIMMER;
+    }
+    return ModelArch::GEMMA4;
+}
+
+inline bool is_muse_glimmer(const G4DenseHeader& h) {
+    return model_architecture(h) == ModelArch::MUSE_GLIMMER;
+}
+
+inline uint32_t model_attn_out_dim(const G4DenseHeader& h) {
+    return h.attn_out_dim != 0 ? h.attn_out_dim : h.d_model;
+}
+
+inline float model_qk_scale_factor(const G4DenseHeader& h) {
+    return h.qk_scale_factor != 0.0f ? h.qk_scale_factor : 1.0f;
+}
+
+inline float model_output_multiplier(const G4DenseHeader& h) {
+    return h.output_multiplier != 0.0f ? h.output_multiplier : 1.0f;
+}
+
+#pragma pack(push, 1)
+struct G4MtpHeader {
+    static constexpr uint32_t EXPECTED_MAGIC = 0x47344D54; // 'G4MT'
+    static constexpr uint32_t EXPECTED_VERSION = 1;
+    static constexpr uint64_t ALIGNMENT_BYTES = 4096;
+    static constexpr size_t MAX_LAYERS = 8;
+
+    uint32_t magic;
+    uint32_t version;
+    uint32_t quant_type;
+    uint32_t num_layers;
+    uint32_t backbone_hidden_size;
+    uint32_t hidden_size;
+    uint32_t intermediate_size;
+    uint32_t vocab_size;
+    uint32_t num_q_heads;
+    uint32_t num_kv_heads;
+    uint32_t head_dim;
+    uint32_t global_head_dim;
+    uint32_t global_kv_heads;
+    uint32_t sliding_window;
+
+    uint64_t global_layer_mask;
+
+    uint32_t quant_group_size;
+    uint32_t scale_dtype;
+
+    uint64_t embed_offset;
+    uint64_t embed_size;
+    uint64_t pre_proj_offset;
+    uint64_t pre_proj_size;
+    uint64_t post_proj_offset;
+    uint64_t post_proj_size;
+    uint64_t norm_offset;
+    uint64_t norm_size;
+
+    uint64_t layer_offsets[MAX_LAYERS];
+    uint64_t layer_sizes[MAX_LAYERS];
+
+    uint8_t  payload_sha256[32];
+    uint8_t  reserved[3800];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(G4MtpHeader) == 4096, "G4MtpHeader must be exactly 4096 bytes");
 
 // This layer's feed-forward width. Falls back to the model-wide d_ff for containers written
 // before the per-layer array existed.
@@ -213,5 +295,6 @@ public:
 
 // Validates header structure, bounds, alignments, and internal consistency
 void validate_header(const G4DenseHeader& header, uint64_t file_size = 0);
+void validate_mtp_header(const G4MtpHeader& header, uint64_t file_size = 0);
 
 } // namespace g4dense

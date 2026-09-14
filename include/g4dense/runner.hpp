@@ -7,6 +7,7 @@
 #include "g4dense/streamer.hpp"
 #include "g4dense/kv_cache.hpp"
 #include "g4dense/draft_runtime.hpp"
+#include "g4dense/mtp_runner.hpp"
 #include "g4dense/speculator.hpp"
 #include "g4dense/tokenizer.hpp"
 #include "g4dense/sampling.hpp"
@@ -79,6 +80,7 @@ struct LayerOffsetsGPU {
     ProjOffsets q_proj;
     ProjOffsets k_proj;
     ProjOffsets v_proj;
+    ProjOffsets attn_gate;     // Muse-Glimmer gated attention: d_model -> attn_out_dim
     ProjOffsets o_proj;
     ProjOffsets ple_gate;      // hidden -> ple_dim
     ProjOffsets ple_proj;      // ple_dim -> hidden
@@ -157,14 +159,15 @@ public:
     // Whether a draft is actually loaded. The GUI needs this to tell "speculation is off"
     // apart from "speculation is on but there is no draft to speculate with".
     bool has_draft_model() const {
-        return draft_runtime_ && draft_runtime_->is_loaded();
+        return (mtp_runner_ && mtp_runner_->is_loaded()) ||
+               (draft_runtime_ && draft_runtime_->is_loaded());
     }
 
     // Hold back device memory from this model's layer import, so a draft model can be loaded
     // afterwards. Must be called BEFORE initialize(): the import is greedy, and once it has
     // taken the budget there is nothing left for a second model.
     void set_import_reserve(uint64_t bytes) { import_reserve_bytes_ = bytes; }
-    bool has_draft() const { return draft_runtime_ && draft_runtime_->is_loaded(); }
+    bool has_draft() const { return has_draft_model(); }
     const G4DenseHeader& header() const { return header_; }
 
     // WHICH layers stream, not just how many. They are chosen evenly spaced across the stack,
@@ -183,6 +186,11 @@ public:
     void mark_as_draft() { is_draft_ = true; }
     bool is_draft() const { return is_draft_; }
     TelemetrySnapshot get_latest_telemetry() const;
+
+    KVCacheManager* kv_cache() const { return kv_cache_.get(); }
+    VkBuffer last_hidden_state_buffer() const { return buf_norm_.buffer; }
+    const float* last_hidden_state_mapped(uint32_t batch_index = 0) const;
+    void get_token_embedding(uint32_t token_id, float* out_embedding) const;
 
 private:
     void allocate_gpu_resources();
@@ -217,6 +225,7 @@ private:
     std::unique_ptr<LayerStreamer> streamer_;
     std::unique_ptr<KVCacheManager> kv_cache_;
     std::unique_ptr<DraftRuntime> draft_runtime_;
+    std::unique_ptr<MtpRunner> mtp_runner_;
     std::unique_ptr<SpeculativeCoordinator> speculator_;
 
     std::atomic<bool> is_generating_{false};
@@ -241,6 +250,7 @@ private:
     VkMemoryAllocation buf_q_{};
     VkMemoryAllocation buf_k_{};
     VkMemoryAllocation buf_v_{};
+    VkMemoryAllocation buf_attn_gate_{};
     VkMemoryAllocation buf_attn_out_{};
     VkMemoryAllocation buf_proj_out_{};
     VkMemoryAllocation buf_gate_{};

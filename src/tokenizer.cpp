@@ -345,14 +345,25 @@ bool Tokenizer::parse_tokenizer_json(const std::string& filepath) {
         auto it = piece_map_.find(name);
         if (it != piece_map_.end()) slot = it->second;
     };
-    lookup("<bos>", bos_id_);
-    lookup("<eos>", eos_id_);
-    lookup("<pad>", pad_id_);
-    lookup("<unk>", unk_id_);
-    lookup("<|turn>", turn_start_id_);
-    lookup("<turn|>", end_of_turn_id_);
-    lookup("<|tool_response>", tool_response_id_);
-    stop_token_ids_ = {eos_id_, end_of_turn_id_, tool_response_id_};
+    if (arch_ == ModelArch::MUSE_GLIMMER) {
+        bos_id_ = 200000;
+        eos_id_ = 200001;
+        lookup("<|begin_of_text|>", bos_id_);
+        lookup("<|start|>", bos_id_);
+        lookup("<|end_of_text|>", eos_id_);
+        uint32_t eot_id = 200008;
+        lookup("<|eot|>", eot_id);
+        stop_token_ids_ = {eos_id_, eot_id};
+    } else {
+        lookup("<bos>", bos_id_);
+        lookup("<eos>", eos_id_);
+        lookup("<pad>", pad_id_);
+        lookup("<unk>", unk_id_);
+        lookup("<|turn>", turn_start_id_);
+        lookup("<turn|>", end_of_turn_id_);
+        lookup("<|tool_response>", tool_response_id_);
+        stop_token_ids_ = {eos_id_, end_of_turn_id_, tool_response_id_};
+    }
 
     // Longest content first, so "<|tool_response>" is matched before any shorter token
     // that happens to be a prefix of it.
@@ -364,6 +375,37 @@ bool Tokenizer::parse_tokenizer_json(const std::string& filepath) {
 
     loaded_ = true;
     return true;
+}
+
+void Tokenizer::set_architecture(ModelArch arch) {
+    arch_ = arch;
+    auto lookup = [&](const char* name, uint32_t& slot) {
+        auto it = piece_map_.find(name);
+        if (it != piece_map_.end()) slot = it->second;
+    };
+    if (arch == ModelArch::MUSE_GLIMMER) {
+        bos_id_ = 200000;
+        eos_id_ = 200001;
+        vocab_size_ = pieces_.empty() ? 202048 : static_cast<uint32_t>(pieces_.size());
+        lookup("<|begin_of_text|>", bos_id_);
+        lookup("<|start|>", bos_id_);
+        lookup("<|end_of_text|>", eos_id_);
+        uint32_t eot_id = 200008;
+        lookup("<|eot|>", eot_id);
+        stop_token_ids_ = {eos_id_, eot_id};
+    } else {
+        bos_id_ = 2;
+        eos_id_ = 1;
+        vocab_size_ = pieces_.empty() ? 262144 : static_cast<uint32_t>(pieces_.size());
+        lookup("<bos>", bos_id_);
+        lookup("<eos>", eos_id_);
+        lookup("<pad>", pad_id_);
+        lookup("<unk>", unk_id_);
+        lookup("<|turn>", turn_start_id_);
+        lookup("<turn|>", end_of_turn_id_);
+        lookup("<|tool_response>", tool_response_id_);
+        stop_token_ids_ = {eos_id_, end_of_turn_id_, tool_response_id_};
+    }
 }
 
 bool Tokenizer::load_vocabulary(const std::string& vocab_file) {
@@ -594,6 +636,19 @@ std::string Tokenizer::decode(const std::vector<uint32_t>& tokens, bool skip_spe
 // ---------------------------------------------------------------------------
 
 std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages) const {
+    if (arch_ == ModelArch::MUSE_GLIMMER) {
+        std::string out;
+        for (const auto& m : messages) {
+            size_t b = m.content.find_first_not_of(" \t\r\n");
+            size_t e = m.content.find_last_not_of(" \t\r\n");
+            std::string content = (b == std::string::npos) ? "" : m.content.substr(b, e - b + 1);
+            std::string role = (m.role == "model") ? "assistant" : m.role;
+            out += "<|start|>" + role + "\n<|message|>" + content + "<|eot|>\n";
+        }
+        out += "<|start|>assistant\n<|message|>";
+        return out;
+    }
+
     static const std::string TURN_OPEN = "<|turn>";
     static const std::string TURN_CLOSE = "<turn|>";
 

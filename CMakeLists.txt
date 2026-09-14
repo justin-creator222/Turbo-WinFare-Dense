@@ -111,6 +111,9 @@ add_test(NAME run_sampling_test COMMAND $<TARGET_FILE:run_sampling_test>)
 add_executable(run_cpu_reference_test tests/test_cpu_reference.cpp)
 target_link_libraries(run_cpu_reference_test PRIVATE g4dense)
 add_test(NAME run_cpu_reference_test COMMAND $<TARGET_FILE:run_cpu_reference_test>)
+add_test(NAME run_cpu_reference_muse_test
+         COMMAND $<TARGET_FILE:run_cpu_reference_test> tests/fixtures/tiny_muse.g4dense tests/fixtures/oracle_muse 2 "200000,42,108,999"
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_executable(run_vk_device_test tests/test_vk_device.cpp)
 target_link_libraries(run_vk_device_test PRIVATE g4dense ${VULKAN_LIB})
@@ -131,6 +134,11 @@ add_test(NAME run_smoke_engine_test COMMAND $<TARGET_FILE:run_smoke_engine_test>
 add_executable(run_speculative_test tests/test_speculative.cpp)
 target_link_libraries(run_speculative_test PRIVATE g4dense ${VULKAN_LIB})
 add_test(NAME run_speculative_test COMMAND $<TARGET_FILE:run_speculative_test>)
+
+add_executable(run_mtp_runner_test tests/test_mtp_runner.cpp)
+target_link_libraries(run_mtp_runner_test PRIVATE g4dense ${VULKAN_LIB})
+add_test(NAME run_mtp_runner_test COMMAND $<TARGET_FILE:run_mtp_runner_test>
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # --- P1.3: tests that existed on disk but were never registered ------------------
 #
@@ -155,6 +163,11 @@ target_link_libraries(run_gpu_forward_test PRIVATE g4dense ${VULKAN_LIB})
 add_test(NAME run_gpu_forward_test COMMAND $<TARGET_FILE:run_gpu_forward_test>
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 set_tests_properties(run_gpu_forward_test PROPERTIES TIMEOUT 1800)
+
+add_test(NAME run_gpu_forward_muse_test
+         COMMAND $<TARGET_FILE:run_gpu_forward_test> tests/fixtures/tiny_muse.g4dense tests/fixtures/oracle_muse "200000,42,108,999"
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+set_tests_properties(run_gpu_forward_muse_test PROPERTIES TIMEOUT 120)
 
 # P0.1 coherence check. Token count is deliberately small here so ctest stays tractable at
 # the current ~23 s/token; judge coherence from a longer manual run.
@@ -193,3 +206,7 @@ target_link_libraries(bench_gpu PRIVATE g4dense ${VULKAN_LIB})
 # a clean checkout. It needs DXGI for adapter budgets alongside Vulkan.
 add_executable(probe_apu tools/probe_apu/main.cpp)
 target_link_libraries(probe_apu PRIVATE g4dense ${VULKAN_LIB} dxgi)
+
+# Deep Random Prompts Test Suite
+add_executable(run_deep_random_prompts_test tests/test_deep_random_prompts.cpp)
+target_link_libraries(run_deep_random_prompts_test PRIVATE g4dense ${VULKAN_LIB} psapi)

@@ -15,6 +15,7 @@
 #include <csignal>
 #include <windows.h>
 #include <shellapi.h>
+#include <fstream>
 
 namespace fs = std::filesystem;
 
@@ -37,9 +38,10 @@ void print_usage() {
               << "  --temp <float>       Sampling temperature (0.0 = greedy, default: 0.2)\n"
               << "  --top-p <float>      Nucleus sampling top-p (default: 0.95)\n"
               << "  --top-k <int>        Top-k truncation (default: 64)\n"
-              << "  --spec               Enable speculative decoding. Loads the E2B drafter,\n"
-              << "                       which costs the target 6 resident layers.\n"
-              << "  --draft-k <int>      Speculative verify-batch width, 2-8 (default: 6)\n"
+              << "  --spec               Enable speculative decoding. Auto-loads MTP drafter\n"
+              << "                       (models/gemma-4-31b-assistant.g4mtp) if present, or E2B.\n"
+              << "  --draft-model <path> Path to draft model (.g4mtp or .g4dense)\n"
+              << "  --draft-k <int>      Speculative verify-batch width, 2-8 (default: 5 for MTP, 6 for E2B)\n"
               << "  --no-spec            Deprecated no-op: speculation is off unless --spec\n"
               << "  --server             Start OpenAI-compatible HTTP server and Web GUI\n"
               << "  --port <port>        Server port (default: 8080)\n"
@@ -49,23 +51,16 @@ void print_usage() {
 }
 
 // The draft model for speculative decoding, and what to hold back from the target's layer
-// import so it has room. E2B imports 0.977 GiB of layer blocks plus its own activations, KV
-// cache and LM head.
-//
-// 1.5 GiB looks generous against 0.977 GiB of layers, and trimming it was expected to buy the
-// target a couple of layers. Measured, it does not -- the reserve is what keeps the DRAFT fully
-// resident, and the draft runs K times per verify round:
-//
-//   reserve   target   draft        24 tokens
-//   1536 MiB   39/60   35/35        26.2 s
-//   1280 MiB   40/60   32/35        26.1 s
-//   1152 MiB   41/60   27/35        29.2 s
-//   1024 MiB   41/60   27/35        29.6 s
-//
-// A streamed draft costs more than an extra resident target layer gains, and 1280 is a tie
-// within noise. 1536 keeps the draft entirely resident, which is the predictable end.
-static const char* kDraftModelPath = "models/gemma-4-e2b-dense.g4dense";
-static constexpr unsigned long long kDraftImportReserveBytes = 1536ull * 1024 * 1024;
+// import so it has room.
+// MTP assistant drafter is ~252 MB weights, requiring only ~384 MB reserve,
+// freeing 5-6 resident layers for the 31B target model.
+// E2B drafter imports 0.977 GiB of layer blocks plus its own activations, KV
+// cache and LM head, requiring 1536 MB reserve.
+static const char* kMtpDraftModelPath = "models/gemma-4-31b-assistant.g4mtp";
+static constexpr unsigned long long kMtpDraftImportReserveBytes = 384ull * 1024 * 1024;
+
+static const char* kE2bDraftModelPath = "models/gemma-4-e2b-dense.g4dense";
+static constexpr unsigned long long kE2bDraftImportReserveBytes = 1536ull * 1024 * 1024;
 
 int main(int argc, char** argv) {
     std::string model_path = "gemma-4-31b-dense.g4dense";
@@ -91,24 +86,14 @@ int main(int argc, char** argv) {
     // 6 is the best value across the prompts where speculation is worth enabling at all
     // (33.08 / 29.62 / 30.88 s on the three net winners, against K=8's 23.01 / 31.51 / 40.56).
     // K=8 wins only on near-deterministic sequences and collapses everywhere else.
-    int draft_k = 6;
+    int draft_k = 5;
+    bool draft_k_specified = false;
+    std::string draft_model_path = "";
 
     // Speculation is OFF by default, and --spec opts in.
     //
-    // Loading the draft model reserves 1.5 GiB, which costs the target 6 resident layers -- 21
-    // streamed per token instead of 15. Measured with --no-spec pinned to 39 layers against its
-    // natural 45, that reserve alone is 1.21-1.23x slower, flat across prompts, and paid before
-    // a single token is drafted. Drafting earns it back only at high acceptance.
-    //
-    // Over the 10-prompt suite, 48 tokens each: --no-spec 347.77 s, K=4 437.99, K=6 446.85,
-    // K=8 (the old default) 512.77. No value of K beats leaving it off, and neither does an
-    // oracle that picks the best K per prompt (404.72). Speculation wins only on rote or rigid
-    // format output -- primes 1.50x, counting 1.19x, JSON 1.18x -- and loses on all seven
-    // conversational prompts.
-    //
-    // Residency is decided at load, drafting per request, so this is a launch-time decision:
-    // even perfectly gated speculation loses on a mixed workload (~381.7 s against 347.8 s for
-    // never loading the drafter). See docs/ROUND10_REPORT.md.
+    // Loading the draft model reserves memory (384 MiB for MTP, 1536 MiB for E2B).
+    // The MTP assistant drafter is ~252 MB, allowing the target model to retain ~44 resident layers.
     bool speculative = false;
     bool run_server = false;
     bool cpu_mode = false;
@@ -141,11 +126,10 @@ int main(int argc, char** argv) {
             top_k = std::stoi(argv[++i]);
         } else if (arg == "--max-context" && i + 1 < argc) {
             max_context = static_cast<uint32_t>(std::stoi(argv[++i]));
+        } else if (arg == "--draft-model" && i + 1 < argc) {
+            draft_model_path = argv[++i];
         } else if (arg == "--draft-k" && i + 1 < argc) {
-            // Clamped, not rejected. The lower bound is 2 because K is the verify-batch width:
-            // the loop asks the drafter for K-1 tokens, so K=1 asked for none, the draft came
-            // back empty and generation stopped after ONE token. The server clamped to 1 too,
-            // so `{"draft_k": 1}` over the API produced a one-token response.
+            draft_k_specified = true;
             draft_k = std::stoi(argv[++i]);
             if (draft_k < 2) draft_k = 2;
             if (draft_k > static_cast<int>(g4dense::kGemmMaxBatch)) {
@@ -257,12 +241,44 @@ int main(int argc, char** argv) {
     // Speculative decoding keeps a second model resident. Reserve for it before the target's
     // layer import runs, because that import takes everything it is allowed to.
     //
-    // The reserve and the load must agree: reserving without loading costs six resident
+    // The reserve and the load must agree: reserving without loading costs resident
     // layers for nothing, and loading without reserving fails outright once the target's
     // greedy import has taken the budget.
-    const bool draft_wanted = speculative && std::filesystem::exists(kDraftModelPath);
+    std::string active_draft_path = "";
+    uint64_t draft_reserve_bytes = 0;
+    if (speculative) {
+        if (!draft_model_path.empty()) {
+            if (fs::exists(draft_model_path)) {
+                active_draft_path = draft_model_path;
+            } else {
+                std::cerr << "Warning: Specified draft model not found: " << draft_model_path << std::endl;
+            }
+        } else if (fs::exists(kMtpDraftModelPath)) {
+            active_draft_path = kMtpDraftModelPath;
+        } else if (fs::exists(kE2bDraftModelPath)) {
+            active_draft_path = kE2bDraftModelPath;
+        }
+
+        if (!active_draft_path.empty()) {
+            bool is_mtp = false;
+            std::ifstream f(active_draft_path, std::ios::binary);
+            if (f.is_open()) {
+                uint32_t magic = 0;
+                f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+                if (magic == g4dense::G4MtpHeader::EXPECTED_MAGIC) {
+                    is_mtp = true;
+                }
+            }
+            draft_reserve_bytes = is_mtp ? kMtpDraftImportReserveBytes : kE2bDraftImportReserveBytes;
+            if (!draft_k_specified) {
+                draft_k = is_mtp ? 5 : 6;
+            }
+        }
+    }
+
+    const bool draft_wanted = speculative && !active_draft_path.empty();
     if (draft_wanted) {
-        runner->set_import_reserve(kDraftImportReserveBytes);
+        runner->set_import_reserve(draft_reserve_bytes);
     }
     if (max_context != 0) runner->set_max_context(max_context);
     runner->initialize();
@@ -274,10 +290,10 @@ int main(int argc, char** argv) {
     // Load the draft HERE, not after the server branch.
     //
     // --server / --gui start the server below and never return, so a draft loaded further
-    // down was only ever loaded in one-shot CLI mode. Server mode therefore paid the 1.5 GiB
-    // import reserve -- 39 resident layers instead of 45 -- and got no speculation for it.
+    // down was only ever loaded in one-shot CLI mode. Server mode therefore paid the
+    // import reserve and got no speculation for it.
     if (draft_wanted) {
-        runner->load_draft_model(kDraftModelPath);
+        runner->load_draft_model(active_draft_path);
     }
 
     if (run_server) {

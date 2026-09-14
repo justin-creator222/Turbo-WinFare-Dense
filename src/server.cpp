@@ -88,7 +88,7 @@ bool HTTPServer::swap_runner(const std::string& container_path, bool load, std::
     try {
         std::string resolved = resolve_bundle_path(container_path);
         auto tok = std::make_shared<Tokenizer>();
-        tok->load_vocabulary();
+        tok->load_vocabulary(resolve_resource_path("tokenizer.json"));
 
         auto next = std::make_shared<ForwardRunner>(ctx, tok, resolved);
         // The KV cache is sized inside initialize(), so a context change can only take effect
@@ -580,6 +580,8 @@ void HTTPServer::handle_client(uintptr_t client_socket) {
             js << std::fixed << std::setprecision(2);
             js << "{\"loaded\":true"
                << ",\"name\":\"" << std::filesystem::path(r->container_path()).stem().string() << "\""
+               << ",\"arch_type\":" << h.arch_type
+               << ",\"arch_name\":\"" << (is_muse_glimmer(h) ? "Muse-Glimmer" : "Gemma 4") << "\""
                << ",\"num_layers\":" << h.num_layers
                << ",\"d_model\":" << h.d_model
                << ",\"d_ff\":" << h.d_ff

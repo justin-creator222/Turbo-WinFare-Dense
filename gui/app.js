@@ -14,8 +14,8 @@ let tierData = null;
 let activeAbortController = null;
 let selectedLayerIndex = 0;
 
-// Gemma 4 31B Dense Architecture Constants
-const TOTAL_LAYERS = 60;
+// Architecture Constants (dynamic per model)
+let TOTAL_LAYERS = 60;
 // Overwritten from /api/model_info's global_layer_mask once a model is loaded.
 let GLOBAL_LAYERS = [5, 11, 17, 23, 29, 35, 41, 47, 53, 59];
 const LAYER_SIZE_MB = 269.45;
@@ -62,12 +62,16 @@ function fetchModelInfo() {
         .then(data => {
             if (data && data.loaded) {
                 modelInfo = data;
+                if (data.num_layers) {
+                    TOTAL_LAYERS = data.num_layers;
+                }
                 if (Array.isArray(data.streamed_layers)) {
                     streamedLayerSet = new Set(data.streamed_layers);
                 }
                 if (Array.isArray(data.global_layers) && data.global_layers.length) {
                     GLOBAL_LAYERS = data.global_layers;
                 }
+                init60LayerGrid();
                 renderModelMetadata(data);
                 const resident = TOTAL_LAYERS - streamedLayerSet.size;
                 update60LayerState(resident);
@@ -102,9 +106,11 @@ function renderModelMetadata(info) {
     const metaSoftcap = document.getElementById('meta-softcap');
     const hudGpu = document.getElementById('hud-gpu');
 
-    if (metaId) metaId.innerText = info.name || 'gemma-4-31b-dense';
-    if (metaArch) metaArch.innerText = `${info.num_layers || 60} Dense Layers • ${(info.d_model || 5376).toLocaleString()} Dim`;
-    if (metaFfn) metaFfn.innerText = `${(info.d_ff || 21504).toLocaleString()} Dim (GeGLU)`;
+    const isMuse = (info.arch_type === 1 || (info.arch_name && info.arch_name.includes('Muse')));
+    const ffnAct = isMuse ? 'SwiGLU' : 'GeGLU';
+    if (metaId) metaId.innerText = info.name || (isMuse ? 'muse-glimmer-30b' : 'gemma-4-31b-dense');
+    if (metaArch) metaArch.innerText = `${info.num_layers || (isMuse ? 52 : 60)} Dense Layers • ${(info.d_model || (isMuse ? 6656 : 5376)).toLocaleString()} Dim`;
+    if (metaFfn) metaFfn.innerText = `${(info.d_ff || (isMuse ? 19968 : 21504)).toLocaleString()} Dim (${ffnAct})`;
     // The GQA ratio and the global-layer count were literals ("GQA 2:1", "10 Global Layers"),
     // which are the 31B's numbers and wrong for any other container the engine can load.
     const q = info.num_q_heads || 32, kv = info.num_kv_heads || 16;
@@ -231,21 +237,38 @@ function showLayerDetails(idx) {
     const size = document.getElementById('ld-size');
     const ffn = document.getElementById('ld-ffn');
 
-    if (badge) badge.innerText = `Transformer Layer ${idx} / 59`;
-    if (title) title.innerText = isGlobal ? `Global Full Attention Layer (Layer ${idx})` : `Sliding Window Attention Layer (Layer ${idx})`;
-    if (span) span.innerText = isGlobal ? `4,096 Tokens (Full Context Scope)` : `1,024 Tokens (Sliding Window)`;
+    const isMuse = (modelInfo && (modelInfo.arch_type === 1 || (modelInfo.arch_name && modelInfo.arch_name.includes('Muse'))));
+
+    if (badge) badge.innerText = `Transformer Layer ${idx} / ${TOTAL_LAYERS - 1}`;
+    if (title) title.innerText = isMuse
+        ? (isGlobal ? `Full Attention Layer (Layer ${idx})` : `Sliding Window Attention Layer (Layer ${idx})`)
+        : (isGlobal ? `Global Full Attention Layer (Layer ${idx})` : `Sliding Window Attention Layer (Layer ${idx})`);
+    if (span) span.innerText = isMuse
+        ? (isGlobal ? `Full Context Scope (θ = 0)` : `2,048 Tokens (Sliding Window)`)
+        : (isGlobal ? `4,096 Tokens (Full Context Scope)` : `1,024 Tokens (Sliding Window)`);
 
     if (residency) {
         residency.innerText = isPinned ? `Heap 0 Device-Local (Permanent VRAM)` : `Heap 1 Host-Visible (4-Slot Ring DMA)`;
         residency.style.color = isPinned ? `var(--accent-green)` : `var(--accent-amber)`;
     }
 
-    if (heads) heads.innerText = isGlobal ? `32 Query • 4 KV Heads (GQA 8:1)` : `32 Query • 16 KV Heads (GQA 2:1)`;
-    if (headdim) headdim.innerText = isGlobal ? `512 Dimension (Global)` : `256 Dimension (SWA)`;
-    if (rope) rope.innerText = isGlobal ? `θ = 1,000,000 (Partial RoPE 0.25)` : `θ = 10,000 (Full 128 Rotary Pairs)`;
-    if (scalar) scalar.innerText = (0.0894427 + (idx * 0.0001)).toFixed(6) + " (BF16 Bounded)";
+    if (heads) heads.innerText = isMuse
+        ? `32 Query • 2 KV Heads (GQA 16:1)`
+        : (isGlobal ? `32 Query • 4 KV Heads (GQA 8:1)` : `32 Query • 16 KV Heads (GQA 2:1)`);
+    if (headdim) headdim.innerText = isMuse
+        ? `128 Dimension (Head Dim)`
+        : (isGlobal ? `512 Dimension (Global)` : `256 Dimension (SWA)`);
+    if (rope) rope.innerText = isMuse
+        ? (isGlobal ? `None (θ = 0, No RoPE)` : `θ = 500,000 (Full 64 Rotary Pairs)`)
+        : (isGlobal ? `θ = 1,000,000 (Partial RoPE 0.25)` : `θ = 10,000 (Full 128 Rotary Pairs)`);
+    if (scalar) scalar.innerText = isMuse
+        ? `None (1.0 Unity Scale)`
+        : ((0.0894427 + (idx * 0.0001)).toFixed(6) + " (BF16 Bounded)");
     if (size) size.innerText = `${LAYER_SIZE_MB.toFixed(2)} MB (INT4 G64 + BF16)`;
-    if (ffn) ffn.innerText = `21,504 Dim (GeGLU Gate & Up Fused)`;
+    if (ffn) {
+        const d_ff = (modelInfo && modelInfo.d_ff) ? modelInfo.d_ff : (isMuse ? 19968 : 21504);
+        ffn.innerText = `${d_ff.toLocaleString()} Dim (${isMuse ? 'SwiGLU' : 'GeGLU Gate & Up Fused'})`;
+    }
 }
 
 function openLayerInspectorModal() {

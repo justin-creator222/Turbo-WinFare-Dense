@@ -148,6 +148,16 @@ float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanh(kSqrt2OverPi * (x + kCubic * x * x * x)));
 }
 
+// silu (Swish) -- activation for Muse-Glimmer / SwiGLU models
+float silu(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+// sigmoid -- gating activation for gated attention
+float sigmoid_act(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
 // One wave's dot product of an affine-quantized 4-bit row against an FP32 vector.
 // Each lane walks a strided subset of the groups; the caller reduces with WaveActiveSum.
 float gemv_int4_row_lane(ByteAddressBuffer W, uint w_base,

@@ -67,6 +67,22 @@ int main() {
     }
 
     validate_header(header, cur_offset);
+    assert(model_architecture(header) == ModelArch::GEMMA4);
+    assert(!is_muse_glimmer(header));
+
+    // Test 2b: Muse-Glimmer architecture flags
+    {
+        G4DenseHeader muse_hdr = header;
+        muse_hdr.arch_type = static_cast<uint32_t>(ModelArch::MUSE_GLIMMER);
+        muse_hdr.attn_out_dim = 4096;
+        muse_hdr.qk_scale_factor = 3.87f;
+        muse_hdr.output_multiplier = 0.196116f;
+        validate_header(muse_hdr, cur_offset);
+        assert(is_muse_glimmer(muse_hdr));
+        assert(model_architecture(muse_hdr) == ModelArch::MUSE_GLIMMER);
+        assert(model_attn_out_dim(muse_hdr) == 4096);
+    }
+
     std::cout << "[test_format] valid header validation passed." << std::endl;
 
     // Test 3: Bad magic rejection
@@ -117,9 +133,46 @@ int main() {
     }
     assert(caught_overflow);
 
-    // Test 7: Verify all contract headers compile and link
+    // Test 7: Verify G4MtpHeader size and validation
+    assert(sizeof(G4MtpHeader) == 4096);
+    {
+        G4MtpHeader mtp{};
+        mtp.magic = G4MtpHeader::EXPECTED_MAGIC;
+        mtp.version = G4MtpHeader::EXPECTED_VERSION;
+        mtp.quant_type = 1;
+        mtp.num_layers = 4;
+        mtp.backbone_hidden_size = 5376;
+        mtp.hidden_size = 1024;
+        mtp.intermediate_size = 8192;
+        mtp.vocab_size = 262144;
+        mtp.embed_offset = 4096;
+        mtp.pre_proj_offset = 8192;
+        mtp.post_proj_offset = 12288;
+        mtp.norm_offset = 16384;
+        for (uint32_t i = 0; i < 4; ++i) {
+            mtp.layer_offsets[i] = 20480 + i * 4096;
+            mtp.layer_sizes[i] = 4096;
+        }
+        validate_mtp_header(mtp, 20480 + 4 * 4096);
+        std::cout << "[test_format] synthetic G4MtpHeader validation passed." << std::endl;
+
+        // Verify real file if present
+        std::ifstream real_mtp("models/gemma-4-31b-assistant.g4mtp", std::ios::binary | std::ios::ate);
+        if (real_mtp.is_open()) {
+            uint64_t fsize = static_cast<uint64_t>(real_mtp.tellg());
+            real_mtp.seekg(0);
+            G4MtpHeader real_hdr{};
+            real_mtp.read(reinterpret_cast<char*>(&real_hdr), sizeof(real_hdr));
+            validate_mtp_header(real_hdr, fsize);
+            std::cout << "[test_format] real models/gemma-4-31b-assistant.g4mtp validated ("
+                      << (fsize / (1024*1024)) << " MiB)." << std::endl;
+        }
+    }
+
+    // Test 8: Verify all contract headers compile and link
     std::cout << "[test_format] contract header compilation verified." << std::endl;
 
     std::cout << "[test_format] ALL FORMAT & CONTRACT TESTS PASSED." << std::endl;
     return 0;
 }
+

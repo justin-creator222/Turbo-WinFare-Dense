@@ -311,6 +311,8 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
         const uint8_t* layer_ptr = base_ptr + header_.layer_offsets[l];
         bool is_global = (header_.global_layer_mask & (1ULL << l)) != 0;
 
+        const bool is_muse = is_muse_glimmer(header_);
+
         // Full-attention layers carry their own head_dim and kv-head count (512 / 4 on the
         // 31B vs 256 / 16 sliding). These were 31B literals here and in runner.cpp; both now
         // read the container header through the same resolver so they cannot drift apart.
@@ -324,23 +326,9 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
         const uint16_t* raw_post_attn_norm = raw_in_norm + d_model;
         const uint16_t* raw_pre_ffn_norm = raw_post_attn_norm + d_model;
         const uint16_t* raw_post_ffn_norm = raw_pre_ffn_norm + d_model;
-        const uint16_t* raw_q_norm = raw_post_ffn_norm + d_model;
-        const uint16_t* raw_k_norm = raw_q_norm + layer_head_dim;
-        const uint16_t* raw_layer_scalar = raw_k_norm + layer_head_dim;
-        // BF16, not FP16: see the note in runner.cpp. A depth-scaled residual factor
-        // (~0.0894 = 1/sqrt(2*60)), not a norm weight.
-        // NOTE: layer_scalar is present in the checkpoint (BF16, ~0.0894 at layer 0, falling
-        // with depth) but is NOT applied to the residual stream. Applying it -- as the sibling
-        // project's 26B MoE decoder tail did -- attenuates every layer's contribution ~11x,
-        // twice per layer, over 60 layers: an independent NumPy reference built from the
-        // checkpoint gives layer-0 output rms 3.00 where the scaled engine gave 1.48 against an
-        // embedding rms of 1.40, i.e. the layers were near no-ops and the logits were dominated
-        // by the embedding. That is exactly the observed failure (generic subword fragments).
-        //
-        // Kept read for diagnostics; its correct use in this architecture is not established.
-        float layer_scalar_val = bf16_to_f32(*raw_layer_scalar);
-        const uint8_t* weights_start = reinterpret_cast<const uint8_t*>(raw_layer_scalar + 1);
 
+        float layer_scalar_val = 1.0f;
+        const uint8_t* weights_start = nullptr;
         std::vector<float> in_norm_f32(d_model), post_attn_norm_f32(d_model);
         std::vector<float> pre_ffn_norm_f32(d_model), post_ffn_norm_f32(d_model);
         std::vector<float> q_norm_f32(layer_head_dim), k_norm_f32(layer_head_dim);
@@ -351,24 +339,32 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
             pre_ffn_norm_f32[i] = bf16_to_f32(raw_pre_ffn_norm[i]);
             post_ffn_norm_f32[i] = bf16_to_f32(raw_post_ffn_norm[i]);
         }
-        for (uint32_t i = 0; i < layer_head_dim; ++i) {
-            q_norm_f32[i] = bf16_to_f32(raw_q_norm[i]);
-            k_norm_f32[i] = bf16_to_f32(raw_k_norm[i]);
+
+        if (is_muse) {
+            weights_start = reinterpret_cast<const uint8_t*>(raw_post_ffn_norm + d_model);
+        } else {
+            const uint16_t* raw_q_norm = raw_post_ffn_norm + d_model;
+            const uint16_t* raw_k_norm = raw_q_norm + layer_head_dim;
+            const uint16_t* raw_layer_scalar = raw_k_norm + layer_head_dim;
+            layer_scalar_val = bf16_to_f32(*raw_layer_scalar);
+            weights_start = reinterpret_cast<const uint8_t*>(raw_layer_scalar + 1);
+
+            for (uint32_t i = 0; i < layer_head_dim; ++i) {
+                q_norm_f32[i] = bf16_to_f32(raw_q_norm[i]);
+                k_norm_f32[i] = bf16_to_f32(raw_k_norm[i]);
+            }
         }
 
         // Dequantize Attention & FFN weights
         uint32_t q_rows = layer_q_heads * layer_head_dim;
         uint32_t kv_rows = layer_kv_heads * layer_head_dim;
+        uint32_t attn_out_dim = (is_muse && model_attn_out_dim(header_)) ? model_attn_out_dim(header_) : (layer_q_heads * layer_head_dim);
         uint32_t o_rows = d_model;
-        uint32_t o_cols = layer_q_heads * layer_head_dim;
+        uint32_t o_cols = is_muse ? attn_out_dim : (layer_q_heads * layer_head_dim);
 
         const uint8_t* p = weights_start;
 
         auto parse_quant_block = [&](uint32_t rows, uint32_t cols, std::vector<float>& mat_out) {
-            // Skip the container's 16-byte alignment pad before each packed-weight block. This
-            // is the third place the layer layout is spelled out (with the runner's setup_proj
-            // and the converter); they must agree or the oracle silently grades against the
-            // wrong bytes -- which is exactly what happened when only the runner was updated.
             const size_t pad = (16u - (static_cast<size_t>(p - layer_ptr) & 15u)) & 15u;
             p += pad;
 
@@ -384,10 +380,13 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
             p += w_bytes + s_bytes + b_bytes;
         };
 
-        std::vector<float> W_q, W_k, W_v, W_o, W_gate, W_up, W_down;
+        std::vector<float> W_q, W_k, W_v, W_attn_gate, W_o, W_gate, W_up, W_down;
         parse_quant_block(q_rows, d_model, W_q);
         parse_quant_block(kv_rows, d_model, W_k);
-        if (!is_global) {
+        if (is_muse) {
+            parse_quant_block(kv_rows, d_model, W_v);
+            parse_quant_block(attn_out_dim, d_model, W_attn_gate);
+        } else if (!is_global) {
             parse_quant_block(kv_rows, d_model, W_v);
         }
         parse_quant_block(o_rows, o_cols, W_o);
@@ -402,10 +401,15 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
         std::vector<float> q_buf(q_rows);
         std::vector<float> k_buf(kv_rows);
         std::vector<float> v_buf(kv_rows);
+        std::vector<float> attn_gate_buf;
 
         gemv(W_q.data(), norm_buf.data(), q_rows, d_model, q_buf.data());
         gemv(W_k.data(), norm_buf.data(), kv_rows, d_model, k_buf.data());
-        if (!is_global) {
+        if (is_muse) {
+            gemv(W_v.data(), norm_buf.data(), kv_rows, d_model, v_buf.data());
+            attn_gate_buf.resize(attn_out_dim);
+            gemv(W_attn_gate.data(), norm_buf.data(), attn_out_dim, d_model, attn_gate_buf.data());
+        } else if (!is_global) {
             gemv(W_v.data(), norm_buf.data(), kv_rows, d_model, v_buf.data());
         }
 
@@ -414,62 +418,75 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
         uint32_t half_dim = layer_head_dim / 2;
         uint32_t rotated_pairs = is_global ? 64 : half_dim;
 
-        for (uint32_t h = 0; h < layer_q_heads; ++h) {
-            float* q_head = q_buf.data() + h * layer_head_dim;
-            rms_norm(q_head, q_norm_f32.data(), layer_head_dim, 1e-6f, q_head);
-
-            for (uint32_t p = 0; p < rotated_pairs; ++p) {
-                float freq = 1.0f / std::pow(rope_theta, static_cast<float>(2 * p) / static_cast<float>(layer_head_dim));
-                float angle = position * freq;
-                float cos_a = std::cos(angle);
-                float sin_a = std::sin(angle);
-                float x0 = q_head[p];
-                float x1 = q_head[p + half_dim];
-                q_head[p] = x0 * cos_a - x1 * sin_a;
-                q_head[p + half_dim] = x0 * sin_a + x1 * cos_a;
+        if (is_muse) {
+            // Muse-Glimmer: no q_norm or k_norm. Apply RoPE if rope_theta > 0 (skipped on global layers).
+            if (rope_theta > 0.0f) {
+                for (uint32_t h = 0; h < layer_q_heads; ++h) {
+                    float* q_head = q_buf.data() + h * layer_head_dim;
+                    for (uint32_t p = 0; p < half_dim; ++p) {
+                        float freq = 1.0f / std::pow(rope_theta, static_cast<float>(2 * p) / static_cast<float>(layer_head_dim));
+                        float angle = position * freq;
+                        float cos_a = std::cos(angle);
+                        float sin_a = std::sin(angle);
+                        float x0 = q_head[p];
+                        float x1 = q_head[p + half_dim];
+                        q_head[p] = x0 * cos_a - x1 * sin_a;
+                        q_head[p + half_dim] = x0 * sin_a + x1 * cos_a;
+                    }
+                }
+                for (uint32_t h = 0; h < layer_kv_heads; ++h) {
+                    float* k_head = k_buf.data() + h * layer_head_dim;
+                    for (uint32_t p = 0; p < half_dim; ++p) {
+                        float freq = 1.0f / std::pow(rope_theta, static_cast<float>(2 * p) / static_cast<float>(layer_head_dim));
+                        float angle = position * freq;
+                        float cos_a = std::cos(angle);
+                        float sin_a = std::sin(angle);
+                        float x0 = k_head[p];
+                        float x1 = k_head[p + half_dim];
+                        k_head[p] = x0 * cos_a - x1 * sin_a;
+                        k_head[p + half_dim] = x0 * sin_a + x1 * cos_a;
+                    }
+                }
             }
-        }
+        } else {
+            // Gemma 4: Q/K RMSNorm and v_norm
+            for (uint32_t h = 0; h < layer_q_heads; ++h) {
+                float* q_head = q_buf.data() + h * layer_head_dim;
+                rms_norm(q_head, q_norm_f32.data(), layer_head_dim, 1e-6f, q_head);
 
-        for (uint32_t h = 0; h < layer_kv_heads; ++h) {
-            float* k_head = k_buf.data() + h * layer_head_dim;
-            float* v_head = v_buf.data() + h * layer_head_dim;
-
-            // Upstream (Gemma4TextAttention.forward, modular_gemma4.py):
-            //
-            //   key_states   = k_proj(x)
-            //   value_states = v_proj(x) if v_proj is not None else key_states   <-- BEFORE k_norm
-            //   key_states   = k_norm(key_states)
-            //   key_states   = apply_rotary_pos_emb(key_states, ...)
-            //   value_states = v_norm(value_states)                             <-- EVERY layer
-            //
-            // Two things follow, and the engine originally got both wrong.
-            //
-            // 1. On full-attention layers there is no v_proj (attention_k_eq_v), so V aliases
-            //    the RAW k_proj output. Python rebinds `key_states` when k_norm returns a new
-            //    tensor, so V never sees k_norm. (A round-4 change applied k_norm here; wrong.)
-            //
-            // 2. v_norm is `Gemma4RMSNorm(head_dim, with_scale=False)` -- an unweighted
-            //    RMSNorm -- and it is applied unconditionally, on the 50 sliding layers as
-            //    well. `is_kv_shared_layer` is false for every layer here because this config
-            //    sets num_kv_shared_layers = 0, so there is no branch that skips it. The
-            //    engine normalized V only on the 10 global layers and fed the 50 sliding
-            //    layers a raw, unnormalized v_proj output.
-            if (is_global) {
-                rms_norm_no_scale(k_head, layer_head_dim, 1e-6f, v_head);
-            } else {
-                rms_norm_no_scale(v_head, layer_head_dim, 1e-6f, v_head);
+                for (uint32_t p = 0; p < rotated_pairs; ++p) {
+                    float freq = 1.0f / std::pow(rope_theta, static_cast<float>(2 * p) / static_cast<float>(layer_head_dim));
+                    float angle = position * freq;
+                    float cos_a = std::cos(angle);
+                    float sin_a = std::sin(angle);
+                    float x0 = q_head[p];
+                    float x1 = q_head[p + half_dim];
+                    q_head[p] = x0 * cos_a - x1 * sin_a;
+                    q_head[p + half_dim] = x0 * sin_a + x1 * cos_a;
+                }
             }
-            rms_norm(k_head, k_norm_f32.data(), layer_head_dim, 1e-6f, k_head);
 
-            for (uint32_t p = 0; p < rotated_pairs; ++p) {
-                float freq = 1.0f / std::pow(rope_theta, static_cast<float>(2 * p) / static_cast<float>(layer_head_dim));
-                float angle = position * freq;
-                float cos_a = std::cos(angle);
-                float sin_a = std::sin(angle);
-                float x0 = k_head[p];
-                float x1 = k_head[p + half_dim];
-                k_head[p] = x0 * cos_a - x1 * sin_a;
-                k_head[p + half_dim] = x0 * sin_a + x1 * cos_a;
+            for (uint32_t h = 0; h < layer_kv_heads; ++h) {
+                float* k_head = k_buf.data() + h * layer_head_dim;
+                float* v_head = v_buf.data() + h * layer_head_dim;
+
+                if (is_global) {
+                    rms_norm_no_scale(k_head, layer_head_dim, 1e-6f, v_head);
+                } else {
+                    rms_norm_no_scale(v_head, layer_head_dim, 1e-6f, v_head);
+                }
+                rms_norm(k_head, k_norm_f32.data(), layer_head_dim, 1e-6f, k_head);
+
+                for (uint32_t p = 0; p < rotated_pairs; ++p) {
+                    float freq = 1.0f / std::pow(rope_theta, static_cast<float>(2 * p) / static_cast<float>(layer_head_dim));
+                    float angle = position * freq;
+                    float cos_a = std::cos(angle);
+                    float sin_a = std::sin(angle);
+                    float x0 = k_head[p];
+                    float x1 = k_head[p + half_dim];
+                    k_head[p] = x0 * cos_a - x1 * sin_a;
+                    k_head[p + half_dim] = x0 * sin_a + x1 * cos_a;
+                }
             }
         }
 
@@ -488,11 +505,9 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
         std::vector<float> head_out(layer_q_heads * layer_head_dim, 0.0f);
         uint32_t q_per_kv = layer_q_heads / layer_kv_heads;
 
-        // Gemma 4 sets self.scaling = 1.0 (modular_gemma4.py), not head_dim^-0.5. An earlier
-        // round changed this to head_dim^-0.5 on the reasoning that q_norm (a constant 1.8779)
-        // could not be absorbing the factor. That reasoning was wrong: upstream simply does not
-        // scale here.
-        const float attn_scale = 1.0f;
+        const float attn_scale = is_muse
+            ? (model_qk_scale_factor(header_) / std::sqrt(static_cast<float>(layer_head_dim)))
+            : 1.0f;
 
         for (uint32_t h = 0; h < layer_q_heads; ++h) {
             uint32_t kv_h = h / q_per_kv;
@@ -532,6 +547,15 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
             }
         }
 
+        // Muse Attention Out Gating
+        if (is_muse) {
+            for (uint32_t i = 0; i < attn_out_dim; ++i) {
+                float g = attn_gate_buf[i];
+                float sig = 1.0f / (1.0f + std::exp(-g));
+                head_out[i] *= sig;
+            }
+        }
+
         // 6. Out Projection & Post-Attention Residual
         gemv(W_o.data(), head_out.data(), o_rows, o_cols, attn_out.data());
         rms_norm(attn_out.data(), post_attn_norm_f32.data(), d_model, 1e-6f, attn_out.data());
@@ -539,22 +563,33 @@ std::vector<float> CpuReferenceRunner::forward_single_token(uint32_t token, uint
             hidden[i] += attn_out[i];
         }
 
-        // 7. FFN: Pre-FFN Norm + Gate/Up GEMVs + GeGLU + Down GEMV + Post-FFN Norm + Residual
+        // 7. FFN: Pre-FFN Norm + Gate/Up GEMVs + SwiGLU/GeGLU + Down GEMV + Post-FFN Norm + Residual
         rms_norm(hidden.data(), pre_ffn_norm_f32.data(), d_model, 1e-6f, norm_buf.data());
         gemv(W_gate.data(), norm_buf.data(), d_ff, d_model, gate_buf.data());
         gemv(W_up.data(), norm_buf.data(), d_ff, d_model, up_buf.data());
 
-        for (uint32_t i = 0; i < d_ff; ++i) {
-            gate_buf[i] = gelu_tanh(gate_buf[i]) * up_buf[i];
+        if (is_muse) {
+            for (uint32_t i = 0; i < d_ff; ++i) {
+                float g = gate_buf[i];
+                float silu = g / (1.0f + std::exp(-g));
+                gate_buf[i] = silu * up_buf[i];
+            }
+        } else {
+            for (uint32_t i = 0; i < d_ff; ++i) {
+                gate_buf[i] = gelu_tanh(gate_buf[i]) * up_buf[i];
+            }
         }
 
         gemv(W_down.data(), gate_buf.data(), d_model, d_ff, ffn_out.data());
         rms_norm(ffn_out.data(), post_ffn_norm_f32.data(), d_model, 1e-6f, ffn_out.data());
-        for (uint32_t i = 0; i < d_model; ++i) {
-            // Layer end: hidden_states *= layer_scalar (modular_gemma4.py). The per-layer-input
-            // block that would sit between this add and that multiply is absent when
-            // hidden_size_per_layer_input == 0, as on the 31B, so folding it here is exact.
-            hidden[i] = (hidden[i] + ffn_out[i]) * layer_scalar_val;
+        if (is_muse) {
+            for (uint32_t i = 0; i < d_model; ++i) {
+                hidden[i] += ffn_out[i];
+            }
+        } else {
+            for (uint32_t i = 0; i < d_model; ++i) {
+                hidden[i] = (hidden[i] + ffn_out[i]) * layer_scalar_val;
+            }
         }
 
         if (dump_tensors) {

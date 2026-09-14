@@ -40,6 +40,7 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     const uint rotated    = gp2.x;
     const float position  = float(gp2.y);
     const float theta     = asfloat(gp2.z);
+    const bool skip_norm  = (gp2.w != 0u);
 
     const uint head = gid.x % num_heads;
     const uint slot = gid.x / num_heads;          // which position in the batch
@@ -47,31 +48,38 @@ void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     const uint base_in  = in_off  + slot * gp3.x + head * head_dim * 4;
     const uint base_out = out_off + slot * gp3.y + head * head_dim * 4;
 
-    // --- RMSNorm over this head's slice ---
-    float acc = 0.0f;
-    for (uint i = tid; i < head_dim; i += QKV_THREADS) {
-        const float v = f32_load(g_in0, base_in + i * 4);
-        acc += v * v;
-    }
-    const uint lane_count = WaveGetLaneCount();
-    const uint num_waves = QKV_THREADS / lane_count;
-    acc = WaveActiveSum(acc);
-    if (WaveIsFirstLane()) s_partial[tid / lane_count] = acc;
-    GroupMemoryBarrierWithGroupSync();
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint w = 0; w < num_waves; ++w) total += s_partial[w];
-        s_partial[0] = rsqrt(total / float(head_dim) + eps);
-    }
-    GroupMemoryBarrierWithGroupSync();
-    const float inv = s_partial[0];
+    if (!skip_norm) {
+        // --- RMSNorm over this head's slice ---
+        float acc = 0.0f;
+        for (uint i = tid; i < head_dim; i += QKV_THREADS) {
+            const float v = f32_load(g_in0, base_in + i * 4);
+            acc += v * v;
+        }
+        const uint lane_count = WaveGetLaneCount();
+        const uint num_waves = QKV_THREADS / lane_count;
+        acc = WaveActiveSum(acc);
+        if (WaveIsFirstLane()) s_partial[tid / lane_count] = acc;
+        GroupMemoryBarrierWithGroupSync();
+        if (tid == 0) {
+            float total = 0.0f;
+            for (uint w = 0; w < num_waves; ++w) total += s_partial[w];
+            s_partial[0] = rsqrt(total / float(head_dim) + eps);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const float inv = s_partial[0];
 
-    for (uint i = tid; i < head_dim; i += QKV_THREADS) {
-        float v = f32_load(g_in0, base_in + i * 4) * inv;
-        if (has_weight) v *= bf16_load(g_in1, w_off + i * 2);
-        s_vec[i] = v;
+        for (uint i = tid; i < head_dim; i += QKV_THREADS) {
+            float v = f32_load(g_in0, base_in + i * 4) * inv;
+            if (has_weight) v *= bf16_load(g_in1, w_off + i * 2);
+            s_vec[i] = v;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    } else {
+        for (uint i = tid; i < head_dim; i += QKV_THREADS) {
+            s_vec[i] = f32_load(g_in0, base_in + i * 4);
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
-    GroupMemoryBarrierWithGroupSync();
 
     // --- NeoX rotary: pairs are (i, i + head_dim/2) ---
     // `rotated` is head_dim/2 on sliding-window layers but only 64 of 256 pairs on

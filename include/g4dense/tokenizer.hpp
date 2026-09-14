@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <cstdint>
 
+#include "g4dense/format.hpp"
+
 namespace g4dense {
 
 // Appends the valid UTF-8 prefix of `in` to `out`, substituting U+FFFD for bytes that cannot
@@ -69,9 +71,13 @@ public:
     uint32_t vocab_size() const { return vocab_size_; }
     bool is_loaded() const { return loaded_; }
 
+    void set_architecture(ModelArch arch);
+    ModelArch architecture() const { return arch_; }
+
     const std::vector<uint32_t>& stop_token_ids() const { return stop_token_ids_; }
 
 private:
+    ModelArch arch_{ModelArch::GEMMA4};
     uint32_t bos_id_{2};
     uint32_t eos_id_{1};
     uint32_t pad_id_{0};

@@ -77,6 +77,9 @@ ForwardRunner::~ForwardRunner() {
         vk_ctx_->free_buffer(buf_q_);
         vk_ctx_->free_buffer(buf_k_);
         vk_ctx_->free_buffer(buf_v_);
+        if (buf_attn_gate_.buffer != VK_NULL_HANDLE) {
+            vk_ctx_->free_buffer(buf_attn_gate_);
+        }
         vk_ctx_->free_buffer(buf_attn_out_);
         vk_ctx_->free_buffer(buf_proj_out_);
         vk_ctx_->free_buffer(buf_gate_);
@@ -258,6 +261,10 @@ void ForwardRunner::initialize() {
                   << std::endl;
     }
 
+    if (tokenizer_) {
+        tokenizer_->set_architecture(model_architecture(header_));
+    }
+
     switch_memory_tier(active_tier_id_);
 }
 
@@ -276,31 +283,44 @@ void ForwardRunner::compute_layer_offsets() {
         LayerOffsetsGPU& lo = layer_gpu_offsets_[l];
         uint32_t cur = 0;
 
-        // Must mirror tools/convert_hf_to_g4dense.py exactly. A KV-sharing layer carries no
-        // k_norm (it has no k_proj), and a PLE model appends one more norm.
-        lo.kv_shared = is_kv_shared_layer(header_, l);
-        lo.kv_donor = kv_donor_layer(header_, l);
-
-        lo.in_norm_off = cur; cur += d_model * 2;
-        lo.post_attn_norm_off = cur; cur += d_model * 2;
-        lo.pre_ffn_norm_off = cur; cur += d_model * 2;
-        lo.post_ffn_norm_off = cur; cur += d_model * 2;
-        lo.q_norm_off = cur; cur += head_dim * 2;
-        if (!lo.kv_shared) { lo.k_norm_off = cur; cur += head_dim * 2; }
-        lo.layer_scalar_off = cur; cur += 2;
-        if (header_.ple_dim) { lo.post_ple_norm_off = cur; cur += d_model * 2; }
-
-        // Read layer scalar value
-        if (mapped_data_ && header_.layer_offsets[l] > 0) {
-            const uint8_t* layer_ptr = mapped_data_ + header_.layer_offsets[l];
-            uint16_t ls_bf16 = *reinterpret_cast<const uint16_t*>(layer_ptr + lo.layer_scalar_off);
-            // layer_scalar is genuinely BF16 -- it is NOT a LayerNorm weight despite sitting
-            // beside them in the container. BF16 gives 0.089355 for layer 0 (essentially
-            // 1/sqrt(2*num_layers)); FP16 gives 1.4287, a 16x over-scale applied to the whole
-            // residual stream in EVERY layer, which compounds catastrophically over 60.
-            lo.layer_scalar = bf16_to_f32(ls_bf16);
+        if (is_muse_glimmer(header_)) {
+            lo.kv_shared = false;
+            lo.kv_donor = l;
+            lo.in_norm_off = cur; cur += d_model * 2;
+            lo.post_attn_norm_off = cur; cur += d_model * 2;
+            lo.pre_ffn_norm_off = cur; cur += d_model * 2;
+            lo.post_ffn_norm_off = cur; cur += d_model * 2;
+            lo.q_norm_off = 0;
+            lo.k_norm_off = 0;
+            lo.layer_scalar_off = 0;
+            lo.layer_scalar = 1.0f;
         } else {
-            lo.layer_scalar = 1.0f / std::sqrt(2.0f * static_cast<float>(header_.num_layers));
+            // Must mirror tools/convert_hf_to_g4dense.py exactly. A KV-sharing layer carries no
+            // k_norm (it has no k_proj), and a PLE model appends one more norm.
+            lo.kv_shared = is_kv_shared_layer(header_, l);
+            lo.kv_donor = kv_donor_layer(header_, l);
+
+            lo.in_norm_off = cur; cur += d_model * 2;
+            lo.post_attn_norm_off = cur; cur += d_model * 2;
+            lo.pre_ffn_norm_off = cur; cur += d_model * 2;
+            lo.post_ffn_norm_off = cur; cur += d_model * 2;
+            lo.q_norm_off = cur; cur += head_dim * 2;
+            if (!lo.kv_shared) { lo.k_norm_off = cur; cur += head_dim * 2; }
+            lo.layer_scalar_off = cur; cur += 2;
+            if (header_.ple_dim) { lo.post_ple_norm_off = cur; cur += d_model * 2; }
+
+            // Read layer scalar value
+            if (mapped_data_ && header_.layer_offsets[l] > 0) {
+                const uint8_t* layer_ptr = mapped_data_ + header_.layer_offsets[l];
+                uint16_t ls_bf16 = *reinterpret_cast<const uint16_t*>(layer_ptr + lo.layer_scalar_off);
+                // layer_scalar is genuinely BF16 -- it is NOT a LayerNorm weight despite sitting
+                // beside them in the container. BF16 gives 0.089355 for layer 0 (essentially
+                // 1/sqrt(2*num_layers)); FP16 gives 1.4287, a 16x over-scale applied to the whole
+                // residual stream in EVERY layer, which compounds catastrophically over 60.
+                lo.layer_scalar = bf16_to_f32(ls_bf16);
+            } else {
+                lo.layer_scalar = 1.0f / std::sqrt(2.0f * static_cast<float>(header_.num_layers));
+            }
         }
 
         auto setup_proj = [&](LayerOffsetsGPU::ProjOffsets& p, uint32_t rows, uint32_t in_dim) {
@@ -321,16 +341,24 @@ void ForwardRunner::compute_layer_offsets() {
         };
 
         setup_proj(lo.q_proj, q_heads * head_dim, d_model);
-        if (!lo.kv_shared) {
+        if (is_muse_glimmer(header_)) {
             setup_proj(lo.k_proj, kv_heads * head_dim, d_model);
-            // Full-attention layers omit v_proj only when attention_k_eq_v is set, which the
-            // 31B does and E2B does not -- so this keys off the tensor actually being present,
-            // which for the 31B is exactly the global layers.
-            if (!is_global || header_.ple_dim != 0) {
-                setup_proj(lo.v_proj, kv_heads * head_dim, d_model);
+            setup_proj(lo.v_proj, kv_heads * head_dim, d_model);
+            uint32_t attn_out_dim = model_attn_out_dim(header_) ? model_attn_out_dim(header_) : (q_heads * head_dim);
+            setup_proj(lo.attn_gate, attn_out_dim, d_model);
+            setup_proj(lo.o_proj, d_model, attn_out_dim);
+        } else {
+            if (!lo.kv_shared) {
+                setup_proj(lo.k_proj, kv_heads * head_dim, d_model);
+                // Full-attention layers omit v_proj only when attention_k_eq_v is set, which the
+                // 31B does and E2B does not -- so this keys off the tensor actually being present,
+                // which for the 31B is exactly the global layers.
+                if (!is_global || header_.ple_dim != 0) {
+                    setup_proj(lo.v_proj, kv_heads * head_dim, d_model);
+                }
             }
+            setup_proj(lo.o_proj, d_model, q_heads * head_dim);
         }
-        setup_proj(lo.o_proj, d_model, q_heads * head_dim);
         setup_proj(lo.gate_proj, d_ff, d_model);
         setup_proj(lo.up_proj, d_ff, d_model);
         setup_proj(lo.down_proj, d_model, d_ff);
@@ -381,6 +409,9 @@ void ForwardRunner::allocate_gpu_resources() {
     buf_q_ = vk_ctx_->allocate_buffer(max_q_dim * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
     buf_k_ = vk_ctx_->allocate_buffer(max_kv_dim * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
     buf_v_ = vk_ctx_->allocate_buffer(max_kv_dim * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    if (is_muse_glimmer(header_)) {
+        buf_attn_gate_ = vk_ctx_->allocate_buffer(max_q_dim * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
+    }
     buf_attn_out_ = vk_ctx_->allocate_buffer(max_q_dim * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
     buf_proj_out_ = vk_ctx_->allocate_buffer(d_model * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
     buf_gate_ = vk_ctx_->allocate_buffer(d_ff * 4 * B, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, MemoryResidency::HostVisibleMapped);
@@ -788,16 +819,38 @@ void ForwardRunner::load_resident_layers() {
 }
 
 bool ForwardRunner::load_draft_model(const std::string& path) {
-    if (!draft_runtime_) return false;
     if (!std::filesystem::exists(path)) {
         std::cout << "[ForwardRunner] no draft model at " << path
                   << "; speculative decoding disabled." << std::endl;
         return false;
     }
+
+    bool is_mtp = false;
+    {
+        std::ifstream f(path, std::ios::binary);
+        if (f.is_open()) {
+            uint32_t magic = 0;
+            f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            if (magic == G4MtpHeader::EXPECTED_MAGIC) {
+                is_mtp = true;
+            }
+        }
+    }
+
     try {
-        draft_runtime_->load_model(path, vk_ctx_, tokenizer_);
-        std::cout << "[ForwardRunner] draft model loaded for speculative decoding: "
-                  << path << std::endl;
+        if (is_mtp) {
+            mtp_runner_ = std::make_unique<MtpRunner>();
+            mtp_runner_->load_model(path, vk_ctx_);
+            std::cout << "[ForwardRunner] MTP assistant loaded for speculative decoding: "
+                      << path << " (GPU memory: " << (mtp_runner_->total_gpu_bytes() / (1024 * 1024))
+                      << " MB)" << std::endl;
+        } else {
+            if (!draft_runtime_) draft_runtime_ = std::make_unique<DraftRuntime>();
+            draft_runtime_->load_model(path, vk_ctx_, tokenizer_);
+            std::cout << "[ForwardRunner] draft model loaded for speculative decoding: "
+                      << path << std::endl;
+        }
+
         TelemetryCollector::instance().record_model_state(
             static_cast<uint32_t>(header_.num_layers - streamed_layers_.size()),
             static_cast<uint32_t>(streamed_layers_.size()),
@@ -807,6 +860,8 @@ bool ForwardRunner::load_draft_model(const std::string& path) {
     } catch (const std::exception& ex) {
         std::cout << "[ForwardRunner] draft model failed to load (" << ex.what()
                   << "); continuing without speculation." << std::endl;
+        mtp_runner_.reset();
+        draft_runtime_.reset();
         return false;
     }
 }
@@ -1184,7 +1239,11 @@ void ForwardRunner::forward_batch(const uint32_t* token_ids, uint32_t batch,
 
         // A KV-sharing layer has no k_proj/v_proj at all: it reads the cache its donor built.
         dispatch_gemv(lo.q_proj, buf_norm_.buffer, buf_q_.buffer);
-        if (!lo.kv_shared) {
+        if (is_muse_glimmer(header_)) {
+            dispatch_gemv(lo.k_proj, buf_norm_.buffer, buf_k_.buffer);
+            dispatch_gemv(lo.v_proj, buf_norm_.buffer, buf_v_.buffer);
+            dispatch_gemv(lo.attn_gate, buf_norm_.buffer, buf_attn_gate_.buffer);
+        } else if (!lo.kv_shared) {
             dispatch_gemv(lo.k_proj, buf_norm_.buffer, buf_k_.buffer);
             if (lo.v_proj.rows != 0) {
                 dispatch_gemv(lo.v_proj, buf_norm_.buffer, buf_v_.buffer);
@@ -1195,7 +1254,75 @@ void ForwardRunner::forward_batch(const uint32_t* token_ids, uint32_t batch,
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &mem_bar, 0, nullptr, 0, nullptr);
 
-        if (!lo.kv_shared) {
+        if (is_muse_glimmer(header_)) {
+            // Muse-Glimmer: no Q/K/V norms.
+            // RoPE is applied only if rope_theta > 0 (skipped on global layers where rope_theta == 0).
+            if (rope_theta > 0.0f) {
+                // Q RoPE
+                {
+                    VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::QKVEpilogue);
+                    pipeline_mgr_->update_storage_buffer(ds, 0, buf_q_.buffer, 0, q_heads * head_dim * 4 * batch);
+                    pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
+                    pipeline_mgr_->update_storage_buffer(ds, 6, buf_q_.buffer, 0, q_heads * head_dim * 4 * batch);
+
+                    uint32_t pc[16]{0};
+                    pc[0] = head_dim;
+                    pc[1] = q_heads;
+                    pc[2] = 0;
+                    pc[3] = 0;
+                    float eps = 1e-6f;
+                    std::memcpy(&pc[4], &eps, 4);
+                    pc[5] = 0;
+                    pc[6] = 0; // has_weight = 0
+                    pc[7] = 1; // do_rope = 1
+                    pc[8] = rotated_pairs;
+                    pc[9] = position;
+                    std::memcpy(&pc[10], &rope_theta, 4);
+                    pc[11] = 1; // skip_norm = 1
+
+                    pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::QKVEpilogue);
+                    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                            pipeline_mgr_->get_pipeline_layout(ComputeKernel::QKVEpilogue),
+                                            0, 1, &ds, 0, nullptr);
+                    pc[12] = q_heads * head_dim * 4;
+                    pc[13] = q_heads * head_dim * 4;
+                    pipeline_mgr_->push_constants(cmd_, ComputeKernel::QKVEpilogue, pc, sizeof(pc));
+                    pipeline_mgr_->dispatch(cmd_, q_heads * batch, 1, 1);
+                }
+
+                // K RoPE
+                {
+                    VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::QKVEpilogue);
+                    pipeline_mgr_->update_storage_buffer(ds, 0, buf_k_.buffer, 0, kv_heads * head_dim * 4 * batch);
+                    pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
+                    pipeline_mgr_->update_storage_buffer(ds, 6, buf_k_.buffer, 0, kv_heads * head_dim * 4 * batch);
+
+                    uint32_t pc[16]{0};
+                    pc[0] = head_dim;
+                    pc[1] = kv_heads;
+                    pc[2] = 0;
+                    pc[3] = 0;
+                    float eps = 1e-6f;
+                    std::memcpy(&pc[4], &eps, 4);
+                    pc[5] = 0;
+                    pc[6] = 0; // has_weight = 0
+                    pc[7] = 1; // do_rope = 1
+                    pc[8] = rotated_pairs;
+                    pc[9] = position;
+                    std::memcpy(&pc[10], &rope_theta, 4);
+                    pc[11] = 1; // skip_norm = 1
+
+                    pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::QKVEpilogue);
+                    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                            pipeline_mgr_->get_pipeline_layout(ComputeKernel::QKVEpilogue),
+                                            0, 1, &ds, 0, nullptr);
+                    pc[12] = kv_heads * head_dim * 4;
+                    pc[13] = kv_heads * head_dim * 4;
+                    pipeline_mgr_->push_constants(cmd_, ComputeKernel::QKVEpilogue, pc, sizeof(pc));
+                    pipeline_mgr_->dispatch(cmd_, kv_heads * batch, 1, 1);
+                }
+            }
+        } else if (!lo.kv_shared) {
             // V norm. Upstream (Gemma4TextAttention.forward, modular_gemma4.py):
             //
             //   value_states = v_proj(x) if v_proj is not None else key_states
@@ -1251,69 +1378,69 @@ void ForwardRunner::forward_batch(const uint32_t* token_ids, uint32_t batch,
             // below overwrites buf_k_ with k_norm + RoPE.
             vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 1, &mem_bar, 0, nullptr, 0, nullptr);
-        }
 
-        // C. Q/K Epilogue (RMSNorm + RoPE)
-        // Q Norm & RoPE
-        {
-            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::QKVEpilogue);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_q_.buffer, 0, q_heads * head_dim * 4 * batch);
-            pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_q_.buffer, 0, q_heads * head_dim * 4 * batch);
+            // C. Q/K Epilogue (RMSNorm + RoPE)
+            // Q Norm & RoPE
+            {
+                VkDescriptorSet ds_q = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::QKVEpilogue);
+                pipeline_mgr_->update_storage_buffer(ds_q, 0, buf_q_.buffer, 0, q_heads * head_dim * 4 * batch);
+                pipeline_mgr_->update_storage_buffer(ds_q, 1, layer_buf, 0, layer_buf_size);
+                pipeline_mgr_->update_storage_buffer(ds_q, 6, buf_q_.buffer, 0, q_heads * head_dim * 4 * batch);
 
-            uint32_t pc[16]{0};   // gp0..gp3: the batched kernels read gp3, so it must be pushed
-            pc[0] = head_dim;
-            pc[1] = q_heads;
-            pc[2] = 0; // in_off (gp0.z)
-            pc[3] = 0; // out_off (gp0.w)
-            float eps = 1e-6f;
-            std::memcpy(&pc[4], &eps, 4); // eps_bits (gp1.x)
-            pc[5] = lo.q_norm_off;        // w_off (gp1.y)
-            pc[6] = 1;                    // has_weight (gp1.z)
-            pc[7] = 1;                    // do_rope (gp1.w)
-            pc[8] = rotated_pairs;        // rotated_pairs (gp2.x)
-            pc[9] = position;             // position (gp2.y)
-            std::memcpy(&pc[10], &rope_theta, 4); // theta_bits (gp2.z)
+                uint32_t pc_q[16]{0};
+                pc_q[0] = head_dim;
+                pc_q[1] = q_heads;
+                pc_q[2] = 0;
+                pc_q[3] = 0;
+                float eps_q = 1e-6f;
+                std::memcpy(&pc_q[4], &eps_q, 4);
+                pc_q[5] = lo.q_norm_off;
+                pc_q[6] = 1;
+                pc_q[7] = 1;
+                pc_q[8] = rotated_pairs;
+                pc_q[9] = position;
+                std::memcpy(&pc_q[10], &rope_theta, 4);
 
-            pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::QKVEpilogue);
-            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    pipeline_mgr_->get_pipeline_layout(ComputeKernel::QKVEpilogue),
-                                    0, 1, &ds, 0, nullptr);
-            pc[12] = q_heads * head_dim * 4;    // gp3.x: input stride per position
-            pc[13] = q_heads * head_dim * 4;    // gp3.y: output stride per position
-            pipeline_mgr_->push_constants(cmd_, ComputeKernel::QKVEpilogue, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, q_heads * batch, 1, 1);
-        }
+                pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::QKVEpilogue);
+                vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        pipeline_mgr_->get_pipeline_layout(ComputeKernel::QKVEpilogue),
+                                        0, 1, &ds_q, 0, nullptr);
+                pc_q[12] = q_heads * head_dim * 4;
+                pc_q[13] = q_heads * head_dim * 4;
+                pipeline_mgr_->push_constants(cmd_, ComputeKernel::QKVEpilogue, pc_q, sizeof(pc_q));
+                pipeline_mgr_->dispatch(cmd_, q_heads * batch, 1, 1);
+            }
 
-        // K Norm & RoPE -- absent on KV-sharing layers, which have no k_norm either.
-        if (!lo.kv_shared) {
-            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::QKVEpilogue);
-            pipeline_mgr_->update_storage_buffer(ds, 0, buf_k_.buffer, 0, kv_heads * head_dim * 4 * batch);
-            pipeline_mgr_->update_storage_buffer(ds, 1, layer_buf, 0, layer_buf_size);
-            pipeline_mgr_->update_storage_buffer(ds, 6, buf_k_.buffer, 0, kv_heads * head_dim * 4 * batch);
+            // K Norm & RoPE
+            {
+                VkDescriptorSet ds_k = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::QKVEpilogue);
+                pipeline_mgr_->update_storage_buffer(ds_k, 0, buf_k_.buffer, 0, kv_heads * head_dim * 4 * batch);
+                pipeline_mgr_->update_storage_buffer(ds_k, 1, layer_buf, 0, layer_buf_size);
+                pipeline_mgr_->update_storage_buffer(ds_k, 6, buf_k_.buffer, 0, kv_heads * head_dim * 4 * batch);
 
-            uint32_t pc[16]{0};   // gp0..gp3: the batched kernels read gp3, so it must be pushed
-            pc[0] = head_dim;
-            pc[1] = kv_heads;
-            pc[2] = 0; // in_off (gp0.z)
-            pc[3] = 0; // out_off (gp0.w)
-            float eps = 1e-6f;
-            std::memcpy(&pc[4], &eps, 4); // eps_bits (gp1.x)
-            pc[5] = lo.k_norm_off;        // w_off (gp1.y)
-            pc[6] = 1;                    // has_weight (gp1.z)
-            pc[7] = 1;                    // do_rope (gp1.w)
-            pc[8] = rotated_pairs;        // rotated_pairs (gp2.x)
-            pc[9] = position;             // position (gp2.y)
-            std::memcpy(&pc[10], &rope_theta, 4); // theta_bits (gp2.z)
+                uint32_t pc_k[16]{0};
+                pc_k[0] = head_dim;
+                pc_k[1] = kv_heads;
+                pc_k[2] = 0;
+                pc_k[3] = 0;
+                float eps_k = 1e-6f;
+                std::memcpy(&pc_k[4], &eps_k, 4);
+                pc_k[5] = lo.k_norm_off;
+                pc_k[6] = 1;
+                pc_k[7] = 1;
+                pc_k[8] = rotated_pairs;
+                pc_k[9] = position;
+                std::memcpy(&pc_k[10], &rope_theta, 4);
 
-            pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::QKVEpilogue);
-            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    pipeline_mgr_->get_pipeline_layout(ComputeKernel::QKVEpilogue),
-                                    0, 1, &ds, 0, nullptr);
-            pc[12] = kv_heads * head_dim * 4;   // gp3.x: input stride per position
-            pc[13] = kv_heads * head_dim * 4;   // gp3.y: output stride per position
-            pipeline_mgr_->push_constants(cmd_, ComputeKernel::QKVEpilogue, pc, sizeof(pc));
-            pipeline_mgr_->dispatch(cmd_, kv_heads * batch, 1, 1);
+                pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::QKVEpilogue);
+                vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        pipeline_mgr_->get_pipeline_layout(ComputeKernel::QKVEpilogue),
+                                        0, 1, &ds_k, 0, nullptr);
+                pc_k[12] = kv_heads * head_dim * 4;
+                pc_k[13] = kv_heads * head_dim * 4;
+                pipeline_mgr_->push_constants(cmd_, ComputeKernel::QKVEpilogue, pc_k, sizeof(pc_k));
+                pipeline_mgr_->dispatch(cmd_, kv_heads * batch, 1, 1);
+            }
         }
 
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -1388,7 +1515,10 @@ void ForwardRunner::forward_batch(const uint32_t* token_ids, uint32_t batch,
             // Verified against transformers/models/gemma4/modular_gemma4.py. Passed as a push
             // constant rather than baked into the kernel so it stays a property of the model,
             // and so the parity test can prove the kernel honours a non-unit value.
-            float attn_scale = 1.0f;
+            // Muse-Glimmer uses standard 1/sqrt(head_dim) * qk_scale_factor.
+            float attn_scale = is_muse_glimmer(header_)
+                ? (model_qk_scale_factor(header_) / std::sqrt(static_cast<float>(head_dim)))
+                : 1.0f;
             std::memcpy(&pc[10], &attn_scale, 4);
 
             pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::Attention);
@@ -1407,6 +1537,28 @@ void ForwardRunner::forward_batch(const uint32_t* token_ids, uint32_t batch,
 
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &mem_bar, 0, nullptr, 0, nullptr);
+
+        // AttnGate for Muse-Glimmer: buf_attn_out_ = buf_attn_out_ * sigmoid(buf_attn_gate_)
+        if (is_muse_glimmer(header_)) {
+            const uint32_t attn_out_dim = model_attn_out_dim(header_) ? model_attn_out_dim(header_) : (q_heads * head_dim);
+            VkDescriptorSet ds_gate = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::AttnGate);
+            pipeline_mgr_->update_storage_buffer(ds_gate, 0, buf_attn_out_.buffer, 0, static_cast<uint64_t>(attn_out_dim) * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds_gate, 1, buf_attn_gate_.buffer, 0, static_cast<uint64_t>(attn_out_dim) * 4 * batch);
+            pipeline_mgr_->update_storage_buffer(ds_gate, 6, buf_attn_out_.buffer, 0, static_cast<uint64_t>(attn_out_dim) * 4 * batch);
+
+            uint32_t pc[8]{0};
+            pc[0] = attn_out_dim * batch;
+
+            pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::AttnGate);
+            vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipeline_mgr_->get_pipeline_layout(ComputeKernel::AttnGate),
+                                    0, 1, &ds_gate, 0, nullptr);
+            pipeline_mgr_->push_constants(cmd_, ComputeKernel::AttnGate, pc, sizeof(pc));
+            pipeline_mgr_->dispatch(cmd_, (attn_out_dim * batch + 255) / 256, 1, 1);
+
+            vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &mem_bar, 0, nullptr, 0, nullptr);
+        }
 
         // F. O_Proj: attn_out -> proj_out
         dispatch_gemv(lo.o_proj, buf_attn_out_.buffer, buf_proj_out_.buffer);
@@ -1506,9 +1658,10 @@ void ForwardRunner::forward_batch(const uint32_t* token_ids, uint32_t batch,
         vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &mem_bar, 0, nullptr, 0, nullptr);
 
-        // K. GeGLU
+        // K. Activation: SwiGLU for Muse-Glimmer, GeGLU for Gemma 4
         {
-            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(ComputeKernel::GeGLU);
+            const ComputeKernel act_kernel = is_muse_glimmer(header_) ? ComputeKernel::SwiGLU : ComputeKernel::GeGLU;
+            VkDescriptorSet ds = pipeline_mgr_->allocate_descriptor_set(act_kernel);
             pipeline_mgr_->update_storage_buffer(ds, 0, buf_gate_.buffer, 0, lo.gate_proj.rows * 4 * batch);
             pipeline_mgr_->update_storage_buffer(ds, 1, buf_up_.buffer, 0, lo.gate_proj.rows * 4 * batch);
             pipeline_mgr_->update_storage_buffer(ds, 6, buf_gate_.buffer, 0, lo.gate_proj.rows * 4 * batch);
@@ -1516,11 +1669,11 @@ void ForwardRunner::forward_batch(const uint32_t* token_ids, uint32_t batch,
             uint32_t pc[8]{0};
             pc[0] = lo.gate_proj.rows * batch;
 
-            pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::GeGLU);
+            pipeline_mgr_->bind_kernel(cmd_, act_kernel);
             vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                    pipeline_mgr_->get_pipeline_layout(ComputeKernel::GeGLU),
+                                    pipeline_mgr_->get_pipeline_layout(act_kernel),
                                     0, 1, &ds, 0, nullptr);
-            pipeline_mgr_->push_constants(cmd_, ComputeKernel::GeGLU, pc, sizeof(pc));
+            pipeline_mgr_->push_constants(cmd_, act_kernel, pc, sizeof(pc));
             pipeline_mgr_->dispatch(cmd_, (lo.gate_proj.rows * batch + 255) / 256, 1, 1);
         }
 
@@ -1578,7 +1731,8 @@ void ForwardRunner::forward_batch(const uint32_t* token_ids, uint32_t batch,
             // once at the END of the decoder layer. Folding it into this add is exact ONLY
             // when the per-layer-input block is absent -- on a PLE model that block sits
             // between the two, so there the scale moves to its residual add instead.
-            const float ffn_out_scale = header_.ple_dim ? 1.0f : layer_scalar;
+            // Muse-Glimmer has no layer_scalar (1.0f).
+            const float ffn_out_scale = (is_muse_glimmer(header_) || header_.ple_dim) ? 1.0f : layer_scalar;
             std::memcpy(&pc[2], &ffn_out_scale, 4);
 
             pipeline_mgr_->bind_kernel(cmd_, ComputeKernel::ResidualAccum);
@@ -1944,7 +2098,7 @@ void ForwardRunner::generate(const std::string& prompt,
 
     for (auto& t : prompt_tokens) {
         if (t >= header_.vocab_size) {
-            if (header_.vocab_size < 262144) {
+            if (header_.vocab_size <= 4096) {
                 t = t % header_.vocab_size;
             } else {
                 is_generating_ = false;
@@ -1997,7 +2151,9 @@ void ForwardRunner::generate(const std::string& prompt,
     // Rejected drafts leave stale entries in both KV caches past the accepted length. They are
     // never read -- attention only looks at [first, current_position) -- and the next pass
     // overwrites those ring slots, so there is no rollback step.
-    if (options.speculative_enabled && draft_runtime_ && draft_runtime_->is_loaded() &&
+    const bool has_drafter = (mtp_runner_ && mtp_runner_->is_loaded()) ||
+                             (draft_runtime_ && draft_runtime_->is_loaded());
+    if (options.speculative_enabled && has_drafter &&
         speculator_ && options.draft_k > 0) {
         const uint32_t vocab_size = header_.vocab_size;
         const uint32_t K = std::min<uint32_t>(options.draft_k, kGemmMaxBatch);
@@ -2006,6 +2162,12 @@ void ForwardRunner::generate(const std::string& prompt,
         std::vector<uint32_t> batch_tokens;
         batch_tokens.reserve(K);
         int emitted = 0;
+
+        // Current target hidden state for MTP drafting
+        std::vector<float> curr_target_h(header_.d_model, 0.0f);
+        if (last_hidden_state_mapped(0)) {
+            std::memcpy(curr_target_h.data(), last_hidden_state_mapped(0), header_.d_model * sizeof(float));
+        }
 
         // The adaptive gate: stop drafting when the drafter is not earning its keep.
         //
@@ -2057,6 +2219,9 @@ void ForwardRunner::generate(const std::string& prompt,
             if (!drafting) {
                 forward_batch(&pending, 1, static_cast<uint32_t>(history.size() - 1),
                               verify.data(), true);
+                if (last_hidden_state_mapped(0)) {
+                    std::memcpy(curr_target_h.data(), last_hidden_state_mapped(0), header_.d_model * sizeof(float));
+                }
                 const uint32_t next = sample_token(
                     verify.data(), vocab_size, options.sampling,
                     seed_for(options.sampling, static_cast<uint32_t>(history.size())));
@@ -2071,7 +2236,19 @@ void ForwardRunner::generate(const std::string& prompt,
                 continue;
             }
 
-            DraftResult dr = draft_runtime_->generate_draft_tokens(history, K - 1, options.sampling);
+            DraftResult dr;
+            if (mtp_runner_ && mtp_runner_->is_loaded()) {
+                dr = mtp_runner_->generate_draft_tokens(
+                    curr_target_h.data(),
+                    pending,
+                    static_cast<uint32_t>(history.size()),
+                    K - 1,
+                    options.sampling,
+                    [this](uint32_t tok, float* out) { get_token_embedding(tok, out); },
+                    kv_cache_.get());
+            } else if (draft_runtime_ && draft_runtime_->is_loaded()) {
+                dr = draft_runtime_->generate_draft_tokens(history, K - 1, options.sampling);
+            }
             if (dr.draft_tokens.empty()) break;
 
             batch_tokens.clear();
@@ -2105,7 +2282,11 @@ void ForwardRunner::generate(const std::string& prompt,
                 if (on_token && !on_token(t, tokenizer_->decode_single(t))) { stop = true; break; }
                 if (is_stop(t)) { stop = true; break; }
             }
-            draft_runtime_->accept(history.size() - 1);
+            if (draft_runtime_) draft_runtime_->accept(history.size() - 1);
+            if (last_hidden_state_mapped(ev.num_accepted)) {
+                std::memcpy(curr_target_h.data(), last_hidden_state_mapped(ev.num_accepted),
+                            header_.d_model * sizeof(float));
+            }
 
             const double lat = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - step_start).count();
@@ -2167,6 +2348,39 @@ void ForwardRunner::generate(const std::string& prompt,
 
 TelemetrySnapshot ForwardRunner::get_latest_telemetry() const {
     return TelemetryCollector::instance().snapshot();
+}
+
+const float* ForwardRunner::last_hidden_state_mapped(uint32_t batch_index) const {
+    if (!buf_norm_.mapped_ptr) return nullptr;
+    const size_t offset = static_cast<size_t>(batch_index) * header_.d_model;
+    return static_cast<const float*>(buf_norm_.mapped_ptr) + offset;
+}
+
+void ForwardRunner::get_token_embedding(uint32_t token_id, float* out_embedding) const {
+    if (!mapped_data_ || header_.embed_offset == 0 || !out_embedding) return;
+    const uint32_t vocab_size = header_.vocab_size;
+    const uint32_t d_model = header_.d_model;
+    const float scale = std::sqrt(static_cast<float>(d_model));
+    const uint32_t packed_cols = d_model / 8;
+    const uint32_t groups_per_row = d_model / 64;
+    const uint8_t* embed_ptr = mapped_data_ + header_.embed_offset;
+    const uint32_t* embed_w = reinterpret_cast<const uint32_t*>(embed_ptr);
+    const uint16_t* embed_s = reinterpret_cast<const uint16_t*>(embed_ptr + static_cast<size_t>(vocab_size) * packed_cols * sizeof(uint32_t));
+    const uint16_t* embed_b = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(embed_s) + static_cast<size_t>(vocab_size) * groups_per_row * sizeof(uint16_t));
+
+    const uint32_t safe_token = token_id % vocab_size;
+    const uint32_t* token_packed = embed_w + safe_token * packed_cols;
+    const uint16_t* token_scales = embed_s + safe_token * groups_per_row;
+    const uint16_t* token_biases = embed_b + safe_token * groups_per_row;
+    for (uint32_t c = 0; c < d_model; ++c) {
+        uint32_t w_idx = c / 8;
+        uint32_t n_idx = c % 8;
+        uint8_t q_val = (token_packed[w_idx] >> (n_idx * 4)) & 0x0F;
+        uint32_t g = c / 64;
+        float s = bf16_to_f32(token_scales[g]);
+        float b = bf16_to_f32(token_biases[g]);
+        out_embedding[c] = (static_cast<float>(q_val) * s + b) * scale;
+    }
 }
 
 } // namespace g4dense

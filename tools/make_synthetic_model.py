@@ -70,9 +70,10 @@ def quantize_affine_int4_g64(weights: np.ndarray, group_size: int = 64):
     return packed.tobytes(), to_bf16_bytes(scales_flat), to_bf16_bytes(biases_flat)
 
 
-def make_synthetic_model(out_path: str, seed: int = 42):
+def make_synthetic_model(out_path: str, seed: int = 42, arch: str = "gemma"):
     np.random.seed(seed)
 
+    is_muse = (arch.lower() in ["muse", "muse_glimmer"])
     num_layers = 4
     d_model = 256
     d_ff = 512
@@ -80,26 +81,24 @@ def make_synthetic_model(out_path: str, seed: int = 42):
     num_kv_heads = 2
     head_dim = 64
     vocab_size = 1024
-    sliding_window = 512
+    sliding_window = 256 if is_muse else 512
     quant_group_size = 64
-    global_layer_mask = 0
+    global_layer_mask = (1 << 3) if is_muse else 0
+    final_logit_softcapping = 20.0 if is_muse else 30.0
+    rope_theta_local = 500000.0 if is_muse else 10000.0
+    rope_theta_global = 0.0 if is_muse else 1000000.0
+    attn_out_dim = num_q_heads * head_dim if is_muse else d_model
+    qk_scale_factor = 3.87 if is_muse else 1.0
+    output_multiplier = 0.196116 if is_muse else 1.0
+    arch_type = 1 if is_muse else 0
+    tied_embeddings = 0 if is_muse else 1
 
     def to_bf16_bytes(arr: np.ndarray) -> bytes:
-        """Quantization scales and biases. These really are BF16 in the real container."""
         f32_u32 = arr.astype(np.float32).view(np.uint32)
         bf16_u16 = (f32_u32 >> 16).astype(np.uint16)
         return bf16_u16.tobytes()
 
     def to_norm_bytes(arr: np.ndarray) -> bytes:
-        """LayerNorm-family weights: input/post_attn/pre_ffn/post_ffn norms, q_norm, k_norm,
-        the final model norm, and the per-layer scalar.
-
-        BF16, same as the scales -- every non-quantized tensor in the real MLX container is
-        BF16, exactly as its safetensors header says. A previous round wrote these as IEEE
-        FP16 here to match a reader that had been changed to decode norms as FP16; both were
-        wrong, and the fixture has to match the real container or it stops being a valid
-        stand-in.
-        """
         return to_bf16_bytes(arr)
 
     # Generate Embeddings [vocab_size, d_model] + Final RMSNorm [d_model]
@@ -108,6 +107,14 @@ def make_synthetic_model(out_path: str, seed: int = 42):
     norm_final = np.ones(d_model, dtype=np.float32)
     embed_bytes = embed_packed + embed_scales + embed_biases + to_norm_bytes(norm_final)
     embed_bytes = pad_to_alignment(embed_bytes)
+
+    # Generate LM Head if untied (Muse-Glimmer)
+    lm_head_bytes = b""
+    w_lm_head = None
+    if not tied_embeddings:
+        w_lm_head = np.random.randn(vocab_size, d_model).astype(np.float32) * 0.02
+        lm_packed, lm_scales, lm_biases = quantize_affine_int4_g64(w_lm_head, quant_group_size)
+        lm_head_bytes = pad_to_alignment(lm_packed + lm_scales + lm_biases)
 
     # Generate Layers 0..3
     layer_data_list = []
@@ -118,7 +125,8 @@ def make_synthetic_model(out_path: str, seed: int = 42):
         w_q = np.random.randn(num_q_heads * head_dim, d_model).astype(np.float32) * 0.02
         w_k = np.random.randn(num_kv_heads * head_dim, d_model).astype(np.float32) * 0.02
         w_v = np.random.randn(num_kv_heads * head_dim, d_model).astype(np.float32) * 0.02
-        w_o = np.random.randn(d_model, num_q_heads * head_dim).astype(np.float32) * 0.02
+        w_attn_gate = np.random.randn(attn_out_dim, d_model).astype(np.float32) * 0.02 if is_muse else None
+        w_o = np.random.randn(d_model, attn_out_dim).astype(np.float32) * 0.02
 
         # FFN Projections
         w_gate = np.random.randn(d_ff, d_model).astype(np.float32) * 0.02
@@ -130,25 +138,27 @@ def make_synthetic_model(out_path: str, seed: int = 42):
         norm_post_attn = np.ones(d_model, dtype=np.float32)
         norm_pre_ffn = np.ones(d_model, dtype=np.float32)
         norm_post_ffn = np.ones(d_model, dtype=np.float32)
-        norm_q = np.ones(head_dim, dtype=np.float32)
-        norm_k = np.ones(head_dim, dtype=np.float32)
-        layer_scalar = np.array([1.0 / np.sqrt(2.0 * num_layers)], dtype=np.float32)
+        norm_q = np.ones(head_dim, dtype=np.float32) if not is_muse else None
+        norm_k = np.ones(head_dim, dtype=np.float32) if not is_muse else None
+        layer_scalar = np.array([1.0 / np.sqrt(2.0 * num_layers)], dtype=np.float32) if not is_muse else None
 
         # Assemble Layer Payload
         ldata = bytearray()
-        # Norms + Layer Scalar
         ldata += to_norm_bytes(norm_in)
         ldata += to_norm_bytes(norm_post_attn)
         ldata += to_norm_bytes(norm_pre_ffn)
         ldata += to_norm_bytes(norm_post_ffn)
-        ldata += to_norm_bytes(norm_q)
-        ldata += to_norm_bytes(norm_k)
-        ldata += to_bf16_bytes(layer_scalar)   # genuinely BF16, not a norm weight
+        if not is_muse:
+            ldata += to_norm_bytes(norm_q)
+            ldata += to_norm_bytes(norm_k)
+            ldata += to_bf16_bytes(layer_scalar)
 
-        # Q, K, V, O, Gate, Up, Down
-        for w in [w_q, w_k, w_v, w_o, w_gate, w_up, w_down]:
-            # 16-byte align each packed-weight block, matching convert_hf_to_g4dense.py and the
-            # runner's setup_proj. The gemv loads weights four words at a time.
+        projs = [w_q, w_k, w_v]
+        if is_muse:
+            projs.append(w_attn_gate)
+        projs.extend([w_o, w_gate, w_up, w_down])
+
+        for w in projs:
             while len(ldata) % 16 != 0:
                 ldata += b"\x00"
             p, s, b = quantize_affine_int4_g64(w, quant_group_size)
@@ -156,13 +166,19 @@ def make_synthetic_model(out_path: str, seed: int = 42):
 
         layer_bytes = pad_to_alignment(bytes(ldata))
         layer_data_list.append(layer_bytes)
-        layer_weights.append({
+        lw = {
             "w_q": w_q, "w_k": w_k, "w_v": w_v, "w_o": w_o,
             "w_gate": w_gate, "w_up": w_up, "w_down": w_down,
             "norm_in": norm_in, "norm_post_attn": norm_post_attn,
-            "norm_pre_ffn": norm_pre_ffn, "norm_post_ffn": norm_post_ffn,
-            "norm_q": norm_q, "norm_k": norm_k
-        })
+            "norm_pre_ffn": norm_pre_ffn, "norm_post_ffn": norm_post_ffn
+        }
+        if is_muse:
+            lw["w_attn_gate"] = w_attn_gate
+        else:
+            lw["norm_q"] = norm_q
+            lw["norm_k"] = norm_k
+            lw["layer_scalar"] = layer_scalar
+        layer_weights.append(lw)
 
     # Assemble complete container
     payload = bytearray()
@@ -170,10 +186,18 @@ def make_synthetic_model(out_path: str, seed: int = 42):
     embed_size = len(embed_bytes)
     payload += embed_bytes
 
+    if tied_embeddings:
+        lm_head_offset = embed_offset
+        lm_head_size = embed_size
+    else:
+        lm_head_offset = embed_offset + embed_size
+        lm_head_size = len(lm_head_bytes)
+        payload += lm_head_bytes
+
     layer_offsets = [0] * 60
     layer_sizes = [0] * 60
 
-    cur_offset = HEADER_SIZE + len(embed_bytes)
+    cur_offset = HEADER_SIZE + len(payload)
     for l in range(num_layers):
         layer_offsets[l] = cur_offset
         layer_sizes[l] = len(layer_data_list[l])
@@ -184,7 +208,9 @@ def make_synthetic_model(out_path: str, seed: int = 42):
     sha256_hash = hashlib.sha256(payload_bytes).digest()
 
     # Build Header (4096 bytes)
-    header_fmt = "<IIIIIIIIIIIIIIQffffQQQQ60Q60Q32s2992s"
+    header_fmt = "<IIIIIIIIIIIIIIQffffQQQQ60Q60Q32sIIIIIIQQ60IIIff2696s"
+    layer_d_ff = [d_ff] * num_layers + [0] * (60 - num_layers)
+
     header_bytes = struct.pack(
         header_fmt,
         MAGIC,
@@ -200,20 +226,28 @@ def make_synthetic_model(out_path: str, seed: int = 42):
         sliding_window,
         quant_group_size,
         1,  # scale_dtype = BF16
-        1,  # tied_embeddings
+        tied_embeddings,
         global_layer_mask,
-        10000.0,    # rope_theta_local
-        1000000.0,  # rope_theta_global
+        rope_theta_local,
+        rope_theta_global,
         1.0,        # rope_scaling
-        30.0,       # final_logit_softcapping
+        final_logit_softcapping,
         embed_offset,
         embed_size,
-        embed_offset, # lm_head_offset tied
-        embed_size,   # lm_head_size tied
+        lm_head_offset,
+        lm_head_size,
         *layer_offsets,
         *layer_sizes,
         sha256_hash,
-        b'\x00' * 2992
+        head_dim,   # global_head_dim
+        num_kv_heads, # global_kv_heads
+        0, 0, 0, 0, 0, 0,  # PLE fields
+        *layer_d_ff,
+        arch_type,
+        attn_out_dim,
+        qk_scale_factor,
+        output_multiplier,
+        b'\x00' * 2696
     )
 
     assert len(header_bytes) == HEADER_SIZE, f"Header size {len(header_bytes)} != 4096"
@@ -223,9 +257,10 @@ def make_synthetic_model(out_path: str, seed: int = 42):
         f.write(header_bytes)
         f.write(payload_bytes)
 
-    print(f"Wrote synthetic model: {out_path} ({len(header_bytes) + len(payload_bytes):,} bytes)")
+    print(f"Wrote synthetic {arch} model: {out_path} ({len(header_bytes) + len(payload_bytes):,} bytes)")
     return {
         "w_embed": w_embed,
+        "w_lm_head": w_lm_head,
         "layers": layer_weights
     }
 
@@ -237,13 +272,14 @@ def verify_synthetic_model(file_path: str):
         if len(header_bytes) != HEADER_SIZE:
             raise RuntimeError(f"Header too short: {len(header_bytes)}")
 
-        header_fmt = "<IIIIIIIIIIIIIIQffffQQQQ60Q60Q32s2992s"
+        header_fmt = "<IIIIIIIIIIIIIIQffffQQQQ60Q60Q32sIIIIIIQQ60IIIff2696s"
         unpacked = struct.unpack(header_fmt, header_bytes)
 
         magic, version, qtype, num_layers, d_model, d_ff, q_heads, kv_heads, head_dim, vocab_size, sw, gsize, s_dtype, tied, mask, r_local, r_global, r_scale, softcap, e_off, e_sz, lm_off, lm_sz = unpacked[:23]
         layer_offsets = unpacked[23:83]
         layer_sizes = unpacked[83:143]
         declared_sha = unpacked[143]
+        arch_type = unpacked[212]
 
         if magic != MAGIC: raise RuntimeError(f"Bad magic 0x{magic:x}")
         if version != VERSION: raise RuntimeError(f"Bad version {version}")
@@ -254,13 +290,14 @@ def verify_synthetic_model(file_path: str):
         if declared_sha != calc_sha:
             raise RuntimeError(f"SHA-256 mismatch! declared={declared_sha.hex()}, calc={calc_sha.hex()}")
 
-    print(f"VERIFICATION SUCCESSFUL: {file_path} is structurally valid G4Dense v{VERSION} container.")
+    print(f"VERIFICATION SUCCESSFUL: {file_path} is structurally valid container (arch={arch_type}).")
     return True
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="tests/fixtures/tiny.g4dense", help="output path")
+    ap.add_argument("--arch", default="gemma", choices=["gemma", "muse_glimmer", "muse"], help="model architecture")
     ap.add_argument("--seed", type=int, default=42, help="random seed")
     ap.add_argument("--verify", action="store_true", help="verify existing file")
     args = ap.parse_args()
@@ -269,7 +306,7 @@ def main():
         ok = verify_synthetic_model(args.out)
         return 0 if ok else 1
 
-    make_synthetic_model(args.out, args.seed)
+    make_synthetic_model(args.out, args.seed, arch=args.arch)
     if not verify_synthetic_model(args.out):
         return 1
     return 0

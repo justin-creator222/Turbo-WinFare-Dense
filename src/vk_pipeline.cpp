@@ -20,6 +20,8 @@ const char* get_kernel_spv_name(ComputeKernel kernel) {
         case ComputeKernel::QKVEpilogue:    return "QKVEpilogue.spv";
         case ComputeKernel::Attention:      return "Attention.spv";
         case ComputeKernel::GeGLU:          return "GeGLU.spv";
+        case ComputeKernel::SwiGLU:         return "SwiGLU.spv";
+        case ComputeKernel::AttnGate:       return "AttnGate.spv";
         case ComputeKernel::ResidualAccum:  return "ResidualAccum.spv";
         case ComputeKernel::Softcap:        return "Softcap.spv";
         case ComputeKernel::LMHeadGreedy:   return "LMHeadGreedy.spv";

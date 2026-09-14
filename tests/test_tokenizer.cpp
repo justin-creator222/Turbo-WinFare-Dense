@@ -95,6 +95,26 @@ int main() {
     }
     fs::remove(mini);
 
+    // Test 4c: Muse-Glimmer architecture chat template and special tokens.
+    {
+        g4dense::Tokenizer muse_tok;
+        muse_tok.set_architecture(g4dense::ModelArch::MUSE_GLIMMER);
+        assert(muse_tok.architecture() == g4dense::ModelArch::MUSE_GLIMMER);
+        assert(muse_tok.bos_id() == 200000);
+        assert(muse_tok.eos_id() == 200001);
+        assert(muse_tok.vocab_size() == 202048);
+        const auto& stops = muse_tok.stop_token_ids();
+        assert(stops.size() == 2);
+        assert(stops[0] == 200001 && stops[1] == 200008);
+
+        std::vector<g4dense::Tokenizer::ChatMessage> msgs{{"user", "Hello world"}};
+        const std::string rendered = muse_tok.apply_chat_template(msgs);
+        const std::string expected =
+            "<|start|>user\n<|message|>Hello world<|eot|>\n<|start|>assistant\n<|message|>";
+        assert(rendered == expected);
+        std::cout << "  [PASS] Muse-Glimmer architecture special IDs and chat template verified.\n";
+    }
+
     // Test 5: Incremental Detokenizer & Stop Matcher
     {
         g4dense::StreamingStopMatcher m({"<eos>"});
