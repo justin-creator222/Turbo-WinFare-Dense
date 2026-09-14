@@ -37,8 +37,9 @@ CONFIGS = [
     {"name": "42 Layers", "layers": 42},
     {"name": "43 Layers (Auto MTP Default)", "layers": 43},
     {"name": "44 Layers", "layers": 44},
-    {"name": "45 Layers (Driver Ceiling)", "layers": 45},
-    {"name": "46 Layers (OOM Boundary)", "layers": 46},
+    {"name": "45 Layers", "layers": 45},
+    {"name": "46 Layers (Max Coexistence)", "layers": 46},
+    {"name": "47 Layers (Driver OOM Boundary)", "layers": 47},
 ]
 
 PROMPTS = [
@@ -76,10 +77,10 @@ def run_test(config, prompt_info):
         "--draft-k", "5",
     ]
 
-    print(f"\n========================================================")
-    print(f"Running: {config['name']} | Prompt: {prompt_info['id']}")
-    print(f"Command: {' '.join(cmd)}")
-    print(f"========================================================")
+    print(f"\n========================================================", flush=True)
+    print(f"Running: {config['name']} | Prompt: {prompt_info['id']}", flush=True)
+    print(f"Command: {' '.join(cmd)}", flush=True)
+    print(f"========================================================", flush=True)
 
     t0 = time.time()
     try:
@@ -96,7 +97,7 @@ def run_test(config, prompt_info):
         output = proc.stdout
         exit_code = proc.returncode
     except subprocess.TimeoutExpired as e:
-        print(f"ERROR: Process timed out after 180 seconds")
+        print(f"ERROR: Process timed out after 180 seconds", flush=True)
         return {
             "config": config,
             "prompt_id": prompt_info["id"],
@@ -104,7 +105,7 @@ def run_test(config, prompt_info):
             "error": "Process timed out after 180s",
         }
     except Exception as e:
-        print(f"ERROR: Process execution failed: {e}")
+        print(f"ERROR: Process execution failed: {e}", flush=True)
         return {
             "config": config,
             "prompt_id": prompt_info["id"],
@@ -113,7 +114,7 @@ def run_test(config, prompt_info):
         }
 
     # Parse stdout
-    print(output)
+    print(output, flush=True)
 
     # Extract metrics
     res = {
@@ -213,19 +214,19 @@ def main():
         sys.exit(1)
 
     all_results = []
-    print("Starting Gemma 4 31B MTP Multi-Layer Configuration Benchmark Suite...")
+    print("Starting Gemma 4 31B MTP Multi-Layer Configuration Benchmark Suite...", flush=True)
 
     for config in CONFIGS:
         for prompt_info in PROMPTS:
             res = run_test(config, prompt_info)
             all_results.append(res)
+            # Save intermediate results progressively
+            with open(RESULTS_JSON, "w", encoding="utf-8") as f:
+                json.dump(all_results, f, indent=2)
             # Short cooldown to allow driver memory to fully reset
             time.sleep(1)
 
-    # Save to JSON
-    with open(RESULTS_JSON, "w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"\nAll benchmark results saved to {RESULTS_JSON}")
+    print(f"\nAll benchmark results saved to {RESULTS_JSON}", flush=True)
 
 if __name__ == "__main__":
     main()
